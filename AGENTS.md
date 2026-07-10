@@ -18,7 +18,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 按 `.agents/skills/long-read/SKILL.md` 执行，不跳过任何步骤：
 
-1. **抓取正文**：`scripts/wx_fast.py <url>`（httpx 直连优先，反爬回退 Camoufox）
+1. **抓取正文**：`wechat-article-to-markdown` skill 直接抓取（最快路径，不要用其他方式）
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
 3. **三段式精读摘要**：评分 → 一句话 → 骨架 → 值得记住
 4. **ljg 深度链路**：根据内容自动选择 1-3 条
@@ -27,8 +27,8 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 ## 关键目录
 
 - `.agents/skills/long-read/` — long-read Skill 定义
-- `scripts/wx_fast.py` — 微信文章快速抓取
-- `scripts/wx_fetch.py` — 微信文章抓取（备用）
+- `wechat-article-to-markdown` skill — 微信文章抓取（默认唯一路径）
+- `scripts/wx_fast.py` — 微信文章抓取（备用，httpx 直连）
 - `output/` — 已生成文档
 - `outputs/` — 历史输出
 
@@ -36,7 +36,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 ```bash
 # 抓取微信文章
-python3 scripts/wx_fast.py "<mp.weixin.qq.com URL>"
+wechat-article-to-markdown "<mp.weixin.qq.com URL>"
 
 # 创建飞书文档（long-read 输出用）
 lark-cli docs +create --title "<标题>" --content @.wx_doc.md --doc-format markdown --parent-position my_library
