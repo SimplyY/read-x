@@ -4,6 +4,7 @@
 
 ## 核心资产
 
-（暂无飞书链接）
+
 
 - [GitHub](https://github.com/SimplyY/read-x)
+- [精读索引](https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd)

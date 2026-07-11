@@ -6,13 +6,13 @@ group_name: "read-x"
 repo_path: "/Users/yuwei/code/read-x"
 repo_url: null
 group_info_path: "/Users/yuwei/code/read-x/GROUP_INFO.md"
-updated_at: "2026-07-11T02:28:33.459Z"
+updated_at: "2026-07-11T15:29:50.074Z"
 icon: "📖"
 name_zh: "read-x"
 summary: "阅读系统：微信读书管理与长文精读的结构化输出"
 detail: "阅读系统：微信读书管理与长文精读的结构化输出。长文链接/粘贴自动提取、结构化拆解、精读摘要输出"
 tags: "long-read"
-entry_url: "https://github.com/SimplyY/read-x"
+entry_url: "https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd"
 priority: 3
 ---
 
@@ -24,6 +24,7 @@ priority: 3
 ## 绑定信息
 - 飞书群：read-x
 - 工作目录：/Users/yuwei/code/read-x
+- 链接：精读索引 → https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd
 - 链接：GitHub → https://github.com/SimplyY/read-x
 - 默认机器人：Codex / Code X bot
 
@@ -31,11 +32,12 @@ priority: 3
 long-read：长文链接/粘贴自动提取、结构化拆解、精读摘要输出
 
 ## 数据源
+- 精读索引：https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd
 - GitHub：https://github.com/SimplyY/read-x
-- README.md：（暂无飞书链接）
+- README.md：[精读索引](https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd)
 
 ## 状态
 - 工作目录：可访问
-- 链接数：1
+- 链接数：2
 - Skill 扫描：正常
-- 最近更新时间：2026-07-11T02:28:33.459Z
+- 最近更新时间：2026-07-11T15:29:50.074Z
