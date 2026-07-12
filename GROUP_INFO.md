@@ -29,7 +29,7 @@ priority: 3
 - 默认机器人：Codex / Code X bot
 
 ## 可用 Skill
-long-read：长文链接/粘贴自动提取、结构化拆解、精读摘要输出
+long-read：长文链接/粘贴自动提取、结构化拆解、精读摘要输出；link-card：链接抓取、质量判断、卡片输出与分派
 
 ## 数据源
 - 精读索引：https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd
