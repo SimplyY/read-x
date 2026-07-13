@@ -336,7 +336,7 @@ dispatch_intent: "long-read"
 - **不堆砌**——优先选 1-2 条，内容重要且复杂时可选 3 条
 - **不确定时不调**——纯摘要已经足够
 
-> ⚠️ **选中 ljg-card 时，跳过上方判断规则，直接跳到下方「ljg-card 执行硬约束」。ljg-card 的唯一产出是 PNG 图片，不是文字描述。**
+> ⚠️ **选中 ljg-card 时，跳过上方判断规则，直接跳到下方「ljg-card 执行硬约束」。ljg-card 的唯一产出是 PNG 图片，不是文字描述。图片上传到飞书云空间后嵌入飞书文档，不直接发到群里。**
 
 ### ⚠️ ljg-card 执行硬约束（最高优先级，违反即不合格）
 
@@ -358,16 +358,21 @@ dispatch_intent: "long-read"
    - 必须在 ljg-card skill 根目录下执行（capture.js 依赖相对路径的 node_modules/playwright）
    - 如果 playwright 报错，先执行 `cd /Users/yuwei/.codex/skills/ljg-card && npm install`
 7. **验证文件存在**：`ls -la ~/Downloads/{name}.png` 确认文件大小 > 0
-8. **发图片到群里**：
+8. **上传图片到飞书云空间**：
    ```bash
-   lark-cli im +messages-send --as bot --chat-id <chat_id> --msg-type image --content ~/Downloads/{name}.png
+   lark-cli drive +upload --as bot --file ~/Downloads/{name}.png
    ```
-9. **在飞书文档中引用**：文档里 ljg-card 那节写「📊 信息图已发到群里」，附带图片文件名，不重复嵌入图片内容
+   记录返回结果中的 `file_token`，用于后续在文档中嵌入图片。
+9. **在飞书文档中嵌入图片**：在 `.wx_doc.md` 中 ljg-card 那节，用 Markdown 图片语法嵌入已上传的图片：
+   ```markdown
+   ![信息图](https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/v2/cover/{file_token})
+   ```
+   将 `{file_token}` 替换为步骤 8 返回的实际值。创建飞书文档时会自动渲染图片。
 
 #### 禁止事项
 
 - 禁止只写文字描述（如「这里应该有一张信息图」）替代实际生成
-- 禁止在飞书文档里用文字描述替代 PNG——文档里只需写「信息图已发到群里」
+- 禁止在飞书文档里用文字描述替代 PNG——文档里必须嵌入图片
 - 禁止跳过 taste.md 直接生成——不经品味校准的图是废图
 
 #### 验证门（选了 ljg-card 后必须自检）
@@ -380,9 +385,9 @@ dispatch_intent: "long-read"
 - [ ] 是否已生成 HTML 文件到 `/tmp/ljg_cast_*.html`？
 - [ ] 是否已在 ljg-card skill 根目录执行 `capture.js`？
 - [ ] 是否已确认 `~/Downloads/{name}.png` 存在且大小 > 0？
-- [ ] 是否已用 `lark-cli im +messages-send --as bot --msg-type image` 发送图片到群？
+- [ ] 是否已用 `lark-cli drive +upload --as bot` 上传图片到云空间并记录 file_token？
 
-**如果任何一项未完成，不要进入 [3] 输出路由。** ljg-card 没有「部分完成」——要么生成 PNG 发群，要么标记失败并说明原因。
+**如果任何一项未完成，不要进入 [3] 输出路由。** ljg-card 没有「部分完成」——要么生成 PNG 上传云空间并嵌入文档，要么标记失败并说明原因。
 
 
 ### Skill 搭配策略
@@ -404,7 +409,7 @@ dispatch_intent: "long-read"
 | 无 ljg 产出 + 总长度 ≤ 15 行 | 群内直接回复（markdown） |
 | 无 ljg 产出 + 总长度 > 15 行 | 生成飞书文档 → 立即回群发完成卡片 |
 | 有 ljg 产出（不含 ljg-card） | 生成飞书文档 → 立即回群发完成卡片 |
-| 有 ljg-card 产出 | 先生成 PNG 发群 → 再生成飞书文档 → 回群发完成卡片 |
+| 有 ljg-card 产出 | 先生成 PNG 上传云空间嵌入文档 → 再生成飞书文档 → 回群发完成卡片 |
 
 **⚠️ 飞书 bridge 环境强制规则：创建完飞书文档后，必须在同一轮里自动发送完成消息回群，绝不等用户催。**
 
@@ -429,22 +434,23 @@ dispatch_intent: "long-read"
 6. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`）
 7. 文档内容：三段式摘要在前，各 ljg 产出分节在后，末尾附原文章链接
 
-#### 路径 C：ljg-card 生成 PNG 图片 + 飞书文档 + 回群发卡片
 
-当 ljg 链路中包含 ljg-card 时，必须先完成图片生成和发送，再创建飞书文档：
 
-1. **按 ljg-card 执行硬约束步骤 1-8 生成 PNG 并发送到群**（图片已发，文档只需引用）
-2. 写完精读内容 + 其他 ljg 产出到 `.wx_doc.md`（ljg-card 那节写「📊 信息图已发到群里」）
+当 ljg 链路中包含 ljg-card 时，必须先完成图片生成并上传到云空间，再嵌入文档、创建飞书文档：
+
+1. **按 ljg-card 执行硬约束步骤 1-9 生成 PNG 并上传到云空间**（图片已上传，文档中嵌入 Markdown 图片引用）
+2. 写完精读内容 + 其他 ljg 产出到 `.wx_doc.md`（ljg-card 那节以 Markdown 图片语法嵌入信息图）
 3. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建文档
-4. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`（卡片中注明「📊 信息图已发到群里」）
+4. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
 5. 用 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到 read-x 群
 6. **立即**执行 `./scripts/send-to-ready.sh /tmp/link_card.json` 转发到 read-y
 7. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）
 
 **⚠️ 路径 C 的关键约束**：
-- PNG 图片必须在创建飞书文档之前完成并发送——图片是 ljg-card 的唯一产出，不是文档附件
+- PNG 图片必须在创建飞书文档之前完成并上传到云空间——图片是 ljg-card 的唯一产出，以 Markdown 图片语法嵌入文档，不直接发到群里
 - 如果 PNG 生成失败，标记 ljg-card 为「生成失败」，继续走路径 B 处理其他 ljg 产出
-- 飞书文档和群卡片中不要重复描述图片内容——写「📊 信息图已发到群里」即可
+- 飞书文档中通过 Markdown 图片语法嵌入图片，群卡片中不需要注明图片信息
+
 
 **转发约束**：
 - 转发脚本 `scripts/send-to-ready.sh` 已内置签名计算、格式转换、重试、大小检查，不需额外处理
@@ -464,11 +470,11 @@ dispatch_intent: "long-read"
 - **冷抓取 Xs，总耗时约 Xs**
 ```
 
-**含 ljg-card 时**（PNG 图片已先发到群里）：
+**含 ljg-card 时**（图片已嵌入飞书文档）：
 ```
 **精读完成 ✅**
 
-📊 信息图已发到群里
+📊 信息图已嵌入飞书文档
 📄 <飞书文档链接>
 
 - **评分：质量 9.5/10（完成度 8.5 + 深度 8.5 + 逻辑 8.0 + 信息密度 8.0 → 基础 8.3 + 来源加权 +1.2 = 9.5）· 有用度 ★★★★★**——一句话说明为什么是这个分
