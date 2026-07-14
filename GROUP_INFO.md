@@ -6,10 +6,10 @@ group_name: "read-x"
 repo_path: "/Users/yuwei/code/read-x"
 repo_url: null
 group_info_path: "/Users/yuwei/code/read-x/GROUP_INFO.md"
-updated_at: "2026-07-13T00:01:24.868Z"
+updated_at: "2026-07-14T00:01:06.123Z"
 icon: "📖"
 name_zh: "read-x"
-summary: "阅读系统：微信读书管理与长文精读的结构化输出"
+summary: "阅读系统：微信公众号管理与长文精读的结构化输出"
 detail: "阅读系统：微信读书管理与长文精读的结构化输出。长文链接/粘贴自动提取、结构化拆解、精读摘要输出"
 tags: "long-read"
 entry_url: "https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd"
@@ -19,7 +19,7 @@ priority: 3
 # Group Info: read-x
 
 ## 群定位
-阅读系统：微信读书管理与长文精读的结构化输出
+阅读系统：微信公众号管理与长文精读的结构化输出
 
 ## 绑定信息
 - 飞书群：read-x
@@ -42,4 +42,4 @@ priority: 3
 - 工作目录：可访问
 - 链接数：2
 - Skill 扫描：正常
-- 最近更新时间：2026-07-13T00:01:24.868Z
+- 最近更新时间：2026-07-14T00:01:06.123Z
