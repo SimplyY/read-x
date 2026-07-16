@@ -490,8 +490,8 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 1. 以 user 身份执行 `lark-cli wiki +node-create --space-id 7663095985141796115 --obj-type docx --title "[精读] 《原文标题》" --format json`，从真实返回值取 `node_token`、`obj_token` 和 `obj_type=docx`；缺失、为空或类型不匹配时停止，不能猜测 token。
 2. 用 `lark-cli docs +update --as user --doc <obj_token> --command overwrite --doc-format markdown --content @.wx_doc.md --format json` 写入精读正文；结果必须是 `success`，否则不发送链接。
-3. 用 `lark-cli wiki +node-get --as user --node-token <node_token> --space-id 7663095985141796115 --format json` 获取最终页面 URL；没有 URL 时停止，不能自行拼接域名或 URL。
-4. 使用无 cookie 的浏览器访问最终页面；只有未跳转登录页且能读取固定页面内容时，才构建并发送含页面链接的群卡片。浏览器不可用、跳转登录或页面内容缺失均视为发布失败。
+3. 从 `wiki +node-create` 的真实返回值取最终页面 `url`；没有 URL 时停止，不能自行拼接域名或 URL。
+4. 使用无 cookie 的浏览器访问最终页面；只有未跳转登录页且能读取本篇精读标题时，才构建并发送含页面链接的群卡片。浏览器不可用、跳转登录或标题缺失均视为发布失败。
 
 普通 `docx` 的 `drive permission.public patch` 回读为 `anyone_readable` 仍可能跳转登录页，不能作为匿名公开的替代验证。含 `ljg-card` 时，仍先完成图片嵌入；无 cookie 验收必须确认嵌入图片可加载，否则按发布失败处理。
 
