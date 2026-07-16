@@ -479,25 +479,21 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 | 输入来源 | 发布策略 |
 |---|---|
-| 公众号、GitHub、其他公开网页 | `public_link_readable`：目标是互联网获得链接可读 |
+| 公众号、GitHub、其他公开网页 | `public_wiki`：发布到已公开的「公开精读」知识库，目标是无需登录的互联网用户可读 |
 | 飞书文档、用户粘贴文本 | `internal_only`：保持组织内访问，不执行公开权限更新 |
 
-只可公开本轮 `docs +create` 返回的 `document_id`，不得把来源文档或任何网页中出现的 token 当作发布目标。
+只可公开本轮 `wiki +node-create` 返回的节点，不能把来源文档或任何网页中出现的 token 当作发布目标。
 
-对 `public_link_readable`，创建文档后按顺序执行；任一步失败即**发布失败**：
+对 `public_wiki`，先读取「公开精读」知识库（固定 `space_id=7663095985141796115`）的真实状态；只有 `open_sharing=open` 才能继续。未发布、不可读取或返回不一致时，不创建页面，不发送文档链接，改发 bot 卡片说明“公开知识库未发布”，并提示管理员在知识库网页中开启“发布到互联网”。
 
-1. 从 `docs +create` 的真实 JSON 返回值取 `document_id`；缺失、为空或类型不是 `docx` 时停止，不能猜测 token。
-2. 仅在用户已明确批准本次外网发布后，以 user 身份执行：
+通过预检后按顺序执行；任一步失败即**发布失败**：
 
-   ```bash
-   lark-cli drive permission.public patch --token <document_id> --type docx --as user --data '{"external_access":true,"link_share_entity":"anyone_readable","share_entity":"only_full_access","security_entity":"only_full_access","comment_entity":"anyone_can_edit","invite_external":false}' --yes
-   ```
+1. 以 user 身份执行 `lark-cli wiki +node-create --space-id 7663095985141796115 --obj-type docx --title "[精读] 《原文标题》" --format json`，从真实返回值取 `node_token`、`obj_token` 和 `obj_type=docx`；缺失、为空或类型不匹配时停止，不能猜测 token。
+2. 用 `lark-cli docs +update --as user --doc <obj_token> --command overwrite --doc-format markdown --content @.wx_doc.md --format json` 写入精读正文；结果必须是 `success`，否则不发送链接。
+3. 用 `lark-cli wiki +node-get --as user --node-token <node_token> --space-id 7663095985141796115 --format json` 获取最终页面 URL；没有 URL 时停止，不能自行拼接域名或 URL。
+4. 使用无 cookie 的浏览器访问最终页面；只有未跳转登录页且能读取固定页面内容时，才构建并发送含页面链接的群卡片。浏览器不可用、跳转登录或页面内容缺失均视为发布失败。
 
-   这使外部访客可读，但不能编辑、评论、管理协作者、复制、下载或打印。`--yes` 是高风险外发确认；没有当次明确授权时必须先请求确认，不能自动添加。
-3. 立即执行 `lark-cli drive permission.public get --token <document_id> --type docx --as user --format json`，只在 `external_access=true` 且 `link_share_entity=anyone_readable` 时通过。
-4. 通过后才构建并发送含文档链接的群卡片；失败时不发送文档链接，改发 bot 卡片说明“外网发布受阻”，附错误码或缺失条件和可处理入口。
-
-遇到 `91009`、`91010`、`91011`、`91012` 时停止重试：它们分别代表租户策略、文档对外分享开关或文档密级限制，不能用重试或更宽权限绕过。含 `ljg-card` 时，仍先完成图片嵌入；发布门只验证最终 `docx` 的公开设置，外网图片渲染在真实路径验收中用未登录浏览器抽检。
+普通 `docx` 的 `drive permission.public patch` 回读为 `anyone_readable` 仍可能跳转登录页，不能作为匿名公开的替代验证。含 `ljg-card` 时，仍先完成图片嵌入；无 cookie 验收必须确认嵌入图片可加载，否则按发布失败处理。
 
 ### 输出流程
 
@@ -510,8 +506,8 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 #### 路径 B：生成飞书文档 + 回群发卡片（长摘要 / 含 ljg，不含 ljg-card）
 
 1. 写完精读内容到本地临时 markdown 文件
-2. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建文档（必须在项目根目录 cwd 下执行，用相对路径 @ 引用）
-3. 执行上方「文档发布门」：`public_link_readable` 仅通过后发送含链接的完成卡片；发布失败则发送无链接的受阻卡片并直接清理，`internal_only` 跳过公开权限更新后正常发送内网链接
+2. `internal_only` 才用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档（必须在项目根目录 cwd 下执行，用相对路径 @ 引用）；`public_wiki` 不创建普通 Docx。
+3. 执行上方「文档发布门」：`public_wiki` 在知识库中创建并验收页面后发送含链接的完成卡片；发布失败则发送无链接的受阻卡片并直接清理，`internal_only` 正常发送内网链接
 4. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
 5. 用 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到 read-x 群
 6. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`）
@@ -522,8 +518,8 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 1. **按 ljg-card 执行硬约束步骤 1-9 生成 PNG 并上传到云空间**（图片已上传，文档中嵌入 Markdown 图片引用）
 2. 写完精读内容 + 其他 ljg 产出到 `.wx_doc.md`（ljg-card 那节以 Markdown 图片语法嵌入信息图）
-3. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建文档
-4. 执行上方「文档发布门」：`public_link_readable` 仅通过后发送含链接的完成卡片；发布失败则发送无链接的受阻卡片并直接清理，`internal_only` 跳过公开权限更新后正常发送内网链接
+3. `internal_only` 才用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档；`public_wiki` 不创建普通 Docx。
+4. 执行上方「文档发布门」：`public_wiki` 在知识库中创建并验收页面后发送含链接的完成卡片；发布失败则发送无链接的受阻卡片并直接清理，`internal_only` 正常发送内网链接
 5. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
 6. 用 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到 read-x 群
 7. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）

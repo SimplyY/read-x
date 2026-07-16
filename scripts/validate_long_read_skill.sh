@@ -10,16 +10,17 @@ require() {
   }
 }
 
-require '| 公众号、GitHub、其他公开网页 | `public_link_readable`'
+require '| 公众号、GitHub、其他公开网页 | `public_wiki`'
 require '| 飞书文档、用户粘贴文本 | `internal_only`'
-require '只可公开本轮 `docs +create` 返回的 `document_id`'
-require '"link_share_entity":"anyone_readable"'
-require '"share_entity":"only_full_access"'
-require '"security_entity":"only_full_access"'
-require '"comment_entity":"anyone_can_edit"'
-require '"invite_external":false'
-require 'permission.public get --token <document_id> --type docx --as user --format json'
-require '失败时不发送文档链接'
+require '固定 `space_id=7663095985141796115`'
+require '`open_sharing=open`'
+require 'lark-cli wiki +node-create --space-id 7663095985141796115'
+require 'lark-cli docs +update --as user --doc <obj_token> --command overwrite'
+require '使用无 cookie 的浏览器访问最终页面'
+require '不创建页面，不发送文档链接'
+require '`public_wiki` 不创建普通 Docx'
 
 test "$(grep -Fc '执行上方「文档发布门」' "$skill")" -eq 2
+! grep -Fq 'drive permission.public' "$skill"
+! grep -Fq 'public_link_readable' "$skill"
 echo 'long-read publication rules: ok'
