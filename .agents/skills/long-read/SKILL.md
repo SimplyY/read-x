@@ -495,6 +495,8 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 普通 `docx` 的 `drive permission.public patch` 回读为 `anyone_readable` 仍可能跳转登录页，不能作为匿名公开的替代验证。含 `ljg-card` 时，仍先完成图片嵌入；无 cookie 验收必须确认嵌入图片可加载，否则按发布失败处理。
 
+完整验收矩阵、风险与回滚见 `docs/long-read-publication-acceptance.md`。尤其要确认页面没有停止继承知识库的公开权限；这类页面即使知识库已发布到互联网也不会对外可见。
+
 ### 输出流程
 
 #### 路径 A：群内直接回复（短摘要，无 ljg，≤15 行）
