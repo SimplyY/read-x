@@ -411,6 +411,8 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 **ljg-card 的价值是视觉输出。只写文字描述 = 没执行 ljg-card。**
 
+**text-only bridge 边界**：PNG 只是交付文件，不是模型输入。禁止调用 `view_image`、Browser/Computer 截图或其他会把像素返回模型的工具；只允许用 `capture.js` 在本地生成 PNG，并通过 HTML/DOM、文件尺寸和 mtime 做文本验收。
+
 选中 ljg-card 时，必须在写飞书文档内容之前完成以下步骤：
 
 #### 执行步骤（必须逐条执行，不可跳过）
