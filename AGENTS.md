@@ -41,7 +41,7 @@ link-card 流程：
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
 3. **三段式精读摘要**：评分 → 一句话 → 骨架 → 值得记住
 4. **ljg 深度链路**：根据内容自动选择 1-3 条
-5. **输出**：含 ljg 产出时必须生成飞书文档 → 回群发卡片（link-card 格式）
+5. **输出**：含 ljg 产出时必须生成飞书文档 → 私聊发卡片给用户本人（link-card 格式）
    - ⚠️ **如果 ljg 链路含 ljg-card，必须在 long-read [2] 节完成 PNG 图片生成并上传到飞书云空间，以 Markdown 图片语法嵌入文档**，然后才创建飞书文档。
 
 ## 关键目录
@@ -62,17 +62,17 @@ wechat-article-to-markdown "<mp.weixin.qq.com URL>"
 # 创建飞书文档（long-read 输出用）
 lark-cli docs +create --title "<标题>" --content @.wx_doc.md --doc-format markdown --parent-position my_library
 
-# 回群发卡片（link-card 标准命令）
-lark-cli im +messages-send --as bot --chat-id <chat_id> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json
+# 私聊发卡片给用户本人（link-card 标准命令）
+lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json
 ```
 
 ## 输出路由（硬性）
 
 字数与原文长度 + 内容质量成正比。800 字是极高质量长文的上限，不是默认目标。
 
-- 高质量 → **必须生成飞书文档 → 回群发卡片（200-400 字摘要通知，核心内容在文档里）**
-- 中等质量 → 群内直接发卡片（300-500 字，与原文长度成正比）
-- 低质量 → 群内直接发卡片（50-150 字，一句话 + 原文链接）
+- 高质量 → **必须生成飞书文档 → 私聊发卡片给用户本人（200-400 字摘要通知，核心内容在文档里）**
+- 中等质量 → 私聊发卡片给用户本人（300-500 字，与原文长度成正比）
+- 低质量 → 私聊发卡片给用户本人（50-150 字，一句话 + 原文链接）
 - 所有卡片 `--as bot`，不以 user 身份发送
 
 ## 安全边界
@@ -87,7 +87,7 @@ lark-cli im +messages-send --as bot --chat-id <chat_id> --msg-type interactive -
 - 禁止因链接来源（即刻/公众号/网页）而区别对待分析深度
 - 禁止卡片以 user 身份发送（必须 `--as bot`）
 - 禁止跳过 long-read 流程中的任何步骤
-- 禁止生成飞书文档后不回群通知
+- 禁止生成飞书文档后不私聊通知用户
 - 禁止对高质量内容走轻量摘要
 
 ## 验证方式
@@ -99,4 +99,4 @@ lark-cli im +messages-send --as bot --chat-id <chat_id> --msg-type interactive -
 - [ ] 中低质量：摘要已生成
 - [ ] 卡片 JSON 格式正确（schema 2.0，markdown 标签）
 - [ ] 卡片以 `--as bot` 发送
-- [ ] 回群卡片已发送
+- [ ] 私聊卡片已发送
