@@ -8,7 +8,7 @@ dispatch_intent: "link-card"
 
 # link-card: 链接卡片回复
 
-群内收到任何链接，先抓取内容、做内容质量判断，然后决定走深度分析还是轻量摘要，最后用卡片形式私聊发给用户本人（不发到原群）。**所有卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
+群内收到任何链接，先抓取内容、做内容质量判断，然后决定走深度分析还是轻量摘要，最后用卡片形式发到原群 + 私聊发给用户本人（两边都发）。**所有卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
 
 ## 第一性原理
 
@@ -113,7 +113,7 @@ else:
 
 **字数参考**：通常 100-800 字，但长文也可能是中等质量（水文）。
 
-**执行**：抓取 → 提取核心观点（1-3 条）→ 提取金句（必选，见下方金句规则）→ 卡片输出（私聊发给用户本人，不生成飞书文档）
+**执行**：抓取 → 提取核心观点（1-3 条）→ 提取金句（必选，见下方金句规则）→ 卡片输出（群里 + 私聊各发一份，不生成飞书文档）
 
 ### 低质量 → 一句话卡片
 
@@ -142,9 +142,9 @@ else:
 
 ### 高质量内容卡片（long-read 完成后）
 
-**短摘要 ≤15 行无 ljg**：私聊发卡片给用户本人，body 放三段式摘要内容。
+**短摘要 ≤15 行无 ljg**：群里 + 私聊各发一份卡片，body 放三段式摘要内容。
 
-**长摘要 / 含 ljg**：生成飞书文档 → 私聊发卡片给用户本人。
+**长摘要 / 含 ljg**：生成飞书文档 → 群里 + 私聊各发一份卡片。
 
 > ⚠️ 当 ljg 链路含 ljg-card 时，long-read 必须先生成 PNG 图片上传到飞书云空间，以 Markdown 图片语法嵌入文档，再创建飞书文档。卡片中不需要注明图片信息。
 
@@ -230,9 +230,18 @@ else:
 
 ## 发送卡片命令
 
-所有卡片统一私聊发给用户本人，用 `--user-id <bridge_context.senderId>`（不发到原群）：
+所有卡片两边都发：群里发一份（`--chat-id <bridge_context.chatId>`）+ 私聊发一份（`--user-id <bridge_context.senderId>`）。p2p 场景只发一次（chatId 即私聊会话，避免重复）：
 
 ```bash
+# 群里发（仅 group 场景）
+lark-cli im +messages-send \
+  --as bot \
+  --chat-id <bridge_context.chatId> \
+  --msg-type interactive \
+  --content "$(cat /tmp/link_card.json)" \
+  --format json
+
+# 私聊发
 lark-cli im +messages-send \
   --as bot \
   --user-id <bridge_context.senderId> \
@@ -246,6 +255,7 @@ lark-cli im +messages-send \
 - `--msg-type interactive`：必须，表示交互卡片
 - `--content`：JSON 字符串，直接传入或用文件
 - 卡片 JSON 写到临时文件 `/tmp/link_card.json`，发送后清理
+- group 两边发，p2p 只发一次
 
 ---
 

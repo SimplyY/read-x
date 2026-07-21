@@ -166,7 +166,20 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 从画像中提取：核心关注主题、内在积分牌、世界模型、不感兴趣的噪声类型。快照与最新内容冲突时，**以最新为准**。
 
-在正文和标题可用后，调用 `$find-next 核心上下文` 并按其协议选择 `core-context/` 中的静态文件。它只用于“对我有用分”、阅读优先级和带着什么问题读；纯客观摘要不注入，不替代用户画像，也不改变原文事实判断。
+**⚠️ ywnext 核心上下文调用（硬检查点，违反即不合格）**
+
+在正文和标题可用后，**必须**调用 `$ywnext 核心上下文` 并按其协议按需选择 `core-context/` 中的静态文件（`full.md` / `weighted.md` / `core.md` 之一，按文章主题与用户画像相关度选择；不取全量 `full-full.md`，它是 ywnext 内部素材）。
+
+按需使用是正确设计：文章与用户主线相关度高时取信息更全的 `full.md`，相关度中等取 `weighted.md`，只需校准判断角度取 `core.md`；不要求每次都用 `full.md`。
+
+它只用于“对我有用分”、阅读优先级和带着什么问题读；纯客观摘要不注入，不替代用户画像，也不改变原文事实判断。
+
+**验证门（进入 [1] 评分前必须自检，未通过不得继续）**：
+- [ ] 是否已调用 `$ywnext 核心上下文`？
+- [ ] 是否按协议按需选择了 `core-context/` 中的静态文件（`full` / `weighted` / `core` 之一，非全量）？
+- [ ] 卡片输出时是否注明「已调用 ywnext 核心上下文（按需：xxx）」？
+
+未调用 ywnext 核心上下文不得进入 [1] 评分。
 
 **兜底画像快照**（上次提炼：2026-W27）：
 
@@ -390,7 +403,7 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 - **不堆砌**--优先选 1-2 条（但当质量分 ≥9.0 时，3 条是硬性要求，不是可选）
 - **不确定时不调**--纯摘要已经足够（仅适用于质量分 <8.0 的可选区间；≥8.0 分时 ljg 条数是强制的，不得以「不确定」为由跳过）
 
-> ⚠️ **选中 ljg-card 时，跳过上方判断规则，直接跳到下方「ljg-card 执行硬约束」。ljg-card 的唯一产出是 PNG 图片，不是文字描述。图片上传到飞书云空间后嵌入飞书文档，不直接发到群里。**
+> ⚠️ **选中 ljg-card 时，跳过上方判断规则，直接跳到下方「ljg-card 执行硬约束」。ljg-card 的唯一产出是 PNG 图片，不是文字描述。图片作为原生图片块插入飞书文档，不直接发到群里。**
 
 ### ⚠️ ljg-card 执行硬约束（最高优先级，违反即不合格）
 
@@ -414,16 +427,15 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
    - 必须在 ljg-card skill 根目录下执行（capture.js 依赖相对路径的 node_modules/playwright）
    - 如果 playwright 报错，先执行 `cd /Users/yuwei/.codex/skills/ljg-card && npm install`
 7. **验证文件存在**：`ls -la ~/Downloads/{name}.png` 确认文件大小 > 0
-8. **上传图片到飞书云空间**：
+8. **在飞书文档中插入图片块**（建文档后执行，见 [3] 路径 C 步骤 4）：用 `docs +media-insert` 把 PNG 作为原生图片块插入文档。**禁止用 `drive +upload` + internal-api-drive-stream URL 嵌入 markdown**--那条路径 doc 导入服务鉴权稳定返回 401，已确认不可用。
    ```bash
-   lark-cli drive +upload --as bot --file ~/Downloads/{name}.png
+   cd ~/Downloads && lark-cli docs +media-insert --doc <文档URL或doc_id> --file ./{name}.png --type image --align center --caption "📊 信息图：{一句话标题}"
    ```
-   记录返回结果中的 `file_token`，用于后续在文档中嵌入图片。
-9. **在飞书文档中嵌入图片**：在 `.wx_doc.md` 中 ljg-card 那节，用 Markdown 图片语法嵌入已上传的图片：
-   ```markdown
-   ![信息图](https://internal-api-drive-stream.feishu.cn/space/api/box/stream/download/v2/cover/{file_token})
-   ```
-   将 `{file_token}` 替换为步骤 8 返回的实际值。创建飞书文档时会自动渲染图片。
+   - `--file` 必须相对路径，先 `cd` 到图片所在目录
+   - 默认 append 到文档末尾；caption 带「📊 信息图」前缀作章节标识，ljg-card 产出就是文档末尾这张图
+   - **不要用 `--selection-with-ellipsis`**--当前 lark-cli 1.0.65 下报 `invalid token`（code -32602），不可用；定位章节靠文档结构（ljg-card 放最后）+ caption
+   - 返回 `ok: true` + `block_id` 即成功；图片通过 docx image block API 绑定（建块->上传->绑定 token），绕开 401
+   - 这一步在 `docs +create` 建完文档之后执行，不是之前
 
 #### 禁止事项
 
@@ -441,7 +453,7 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 - [ ] 是否已生成 HTML 文件到 `/tmp/ljg_cast_*.html`？
 - [ ] 是否已在 ljg-card skill 根目录执行 `capture.js`？
 - [ ] 是否已确认 `~/Downloads/{name}.png` 存在且大小 > 0？
-- [ ] 是否已用 `lark-cli drive +upload --as bot` 上传图片到云空间并记录 file_token？
+- [ ] 是否已在建文档后用 `lark-cli docs +media-insert` 把 PNG 作为图片块插入文档（返回 ok:true）？
 
 **如果任何一项未完成，不要进入 [3] 输出路由。** ljg-card 没有「部分完成」——要么生成 PNG 上传云空间并嵌入文档，要么标记失败并说明原因。
 
@@ -458,6 +470,7 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 
 ### ljg 链路完成自检（进入 [3] 前）
 
+- [ ] ywnext 核心上下文已调用（[0.7] 硬检查点），卡片已注明调用情况
 - [ ] 评分是完整拆解格式（非裸数字），ljg 条数符合映射表，≥8.0 分含 ljg-card
 - [ ] ljg-card 已完成（PNG 上传云空间并嵌入文档）或已标记失败
 
@@ -468,13 +481,13 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 | 条件 | 输出方式 |
 |------|---------|
 | 无 ljg 产出 + 总长度 ≤ 15 行 | 群内直接回复（markdown） |
-| 无 ljg 产出 + 总长度 > 15 行 | 生成飞书文档 → 立即私聊发完成卡片给用户本人 |
-| 有 ljg 产出（不含 ljg-card） | 生成飞书文档 → 立即私聊发完成卡片给用户本人 |
-| 有 ljg-card 产出 | 先生成 PNG 上传云空间嵌入文档 → 再生成飞书文档 → 私聊发完成卡片给用户本人 |
+| 无 ljg 产出 + 总长度 > 15 行 | 生成飞书文档 → 立即群里 + 私聊各发一份完成卡片 |
+| 有 ljg 产出（不含 ljg-card） | 生成飞书文档 → 立即群里 + 私聊各发一份完成卡片 |
+| 有 ljg-card 产出 | 先生成 PNG -> 建飞书文档 -> `docs +media-insert` 插图片块 -> 群里 + 私聊各发一份完成卡片 |
 
-**⚠️ 飞书 bridge 环境强制规则：创建完飞书文档后，必须在同一轮里自动私聊发送完成卡片给用户本人（`--user-id <bridge_context.senderId>`），绝不等用户催。**
+**⚠️ 飞书 bridge 环境强制规则：创建完飞书文档后，必须在同一轮里自动把完成卡片发到原群（`--chat-id <bridge_context.chatId>`）+ 私聊发给用户本人（`--user-id <bridge_context.senderId>`），绝不等用户催。p2p 场景只发一次。**
 
-**⚠️ 会话重置强制规则：精读输出完成（卡片已私聊发送或群内已回复）后，必须以 user 身份发送 `/new` 重置会话**——避免上下文无限累积导致模型推理卡死。详见下方「会话重置」小节。
+**⚠️ 会话重置强制规则：精读输出完成（卡片已发送）后，必须以 user 身份发送 `/new` 重置会话**——避免上下文无限累积导致模型推理卡死。详见下方「会话重置」小节。
 
 ### 输出流程
 
@@ -484,35 +497,38 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 2. 将摘要内容按 link-card 卡片模板构建卡片 JSON，写入 `/tmp/link_card.json`
 3. 清理 `/tmp/link_card.json`
 
-#### 路径 B：生成飞书文档 + 私聊发卡片给用户本人（长摘要 / 含 ljg，不含 ljg-card）
+#### 路径 B：生成飞书文档 + 群里 + 私聊各发一份卡片（长摘要 / 含 ljg，不含 ljg-card）
 
 **飞书文档排版要求（硬约束）**：生成飞书文档时充分利用飞书原生排版能力增强可读性：多用 `-`/`1.` 列表少用长段落；结构化对比/数据用表格（≤4 列，手机可读）；金句/来源说明用 `>` 引用块；输出精简抓重点不铺陈。详见 [1]「飞书排版增强」约束。
 
 1. 写完精读内容到本地临时 markdown 文件
 2. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档（必须在项目根目录 cwd 下执行，用相对路径 @ 引用），取返回的文档链接
 3. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
-4. 用 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发送给用户本人（不发到原群）
+4. 两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发给用户本人。p2p 场景只发一次。
 5. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`）
 6. 文档内容：三段式摘要在前，各 ljg 产出分节在后，末尾附原文章链接
 
 
-当 ljg 链路中包含 ljg-card 时，必须先完成图片生成并上传到云空间，再嵌入文档、创建飞书文档：
+当 ljg 链路中包含 ljg-card 时，先生成 PNG，建文档后用 `docs +media-insert` 插入图片块：
 
-1. **按 ljg-card 执行硬约束步骤 1-9 生成 PNG 并上传到云空间**（图片已上传，文档中嵌入 Markdown 图片引用）
-2. 写完精读内容 + 其他 ljg 产出到 `.wx_doc.md`（ljg-card 那节以 Markdown 图片语法嵌入信息图；排版要求同路径 B：多用列表/表格，少长段落，精简抓重点）
-3. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档，取返回的文档链接
-4. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
-5. 用 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发送给用户本人（不发到原群）
-6. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）
+1. **按 ljg-card 执行硬约束步骤 1-7 生成 PNG**（步骤 8 在建文档后执行）
+2. 写完精读内容 + 其他 ljg 产出到 `.wx_doc.md`（**不要写 `## 📊 信息图` 章节，也不要用 markdown 图片语法**--ljg-card 产出靠步骤 4 的 media-insert 把图片 append 到文档末尾，caption 自带「📊 信息图」标识；排版要求同路径 B）
+3. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档，取返回的文档链接/doc_id
+4. **插入图片块**（即 ljg-card 执行硬约束步骤 8）：`cd ~/Downloads && lark-cli docs +media-insert --doc <doc_id> --file ./{name}.png --type image --align center --caption "📊 信息图：{标题}"`，返回 `ok:true` 即成功（默认 append 到文档末尾；不要用 `--selection-with-ellipsis`，当前版本报 invalid token）
+5. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
+6. 两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发给用户本人。p2p 场景只发一次。
+7. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）
 
 **⚠️ 路径 C 的关键约束**：
-- PNG 图片必须在创建飞书文档之前完成并上传到云空间——图片是 ljg-card 的唯一产出，以 Markdown 图片语法嵌入文档，不直接发到群里
+- 图片用 `docs +media-insert` 作为原生图片块插入，**禁止用 `drive +upload` + internal-api-drive-stream URL 嵌入 markdown**--那条路径 401 稳定复现
+- PNG 必须在建文档前生成完毕；图片插入在建文档后执行
 - 如果 PNG 生成失败，标记 ljg-card 为「生成失败」，继续走路径 B 处理其他 ljg 产出
-- 飞书文档中通过 Markdown 图片语法嵌入图片，私聊卡片中不需要注明图片信息
+- 完成卡片中不需要注明图片信息（图片已在文档里）
+- 如果 media-insert 失败，文档文字部分仍完整（未预写空章节），标记 ljg-card 失败即可，不需额外清理文档
 
 ### 会话重置（所有路径必做，最后一步）
 
-精读输出完成（卡片已私聊发送 / 群内已回复）后，必须立即以用户身份发送 `/new` 重置会话，避免上下文无限累积导致模型推理卡死：
+精读输出完成（卡片已发送）后，必须立即以用户身份发送 `/new` 重置会话，避免上下文无限累积导致模型推理卡死：
 
 ```bash
 lark-cli im +messages-send --as user --chat-id <bridge_context.chatId> --text "/new" --yes
@@ -525,7 +541,7 @@ lark-cli im +messages-send --as user --chat-id <bridge_context.chatId> --text "/
 **代价**：重置后这篇精读的上下文 agent 不再记得，用户想追问需引用飞书文档（产出已存档）。这是用户明确选择的取舍——每篇都清，优先避免卡死。
 
 
-私聊完成卡片格式（markdown，控制在 10 行以内）：
+完成卡片格式（markdown，控制在 10 行以内）：
 
 **不含 ljg-card 时**：
 ```
