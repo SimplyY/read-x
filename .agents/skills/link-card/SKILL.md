@@ -239,7 +239,7 @@ lark-cli im +messages-send \
   --chat-id <bridge_context.chatId> \
   --msg-type interactive \
   --content "$(cat /tmp/link_card.json)" \
-  --format json
+  --jq '.data.message_id'
 
 # 私聊发
 lark-cli im +messages-send \
@@ -247,7 +247,7 @@ lark-cli im +messages-send \
   --user-id <bridge_context.senderId> \
   --msg-type interactive \
   --content "$(cat /tmp/link_card.json)" \
-  --format json
+  --jq '.data.message_id'
 ```
 
 **关键约束：**
@@ -256,6 +256,9 @@ lark-cli im +messages-send \
 - `--content`：JSON 字符串，直接传入或用文件
 - 卡片 JSON 写到临时文件 `/tmp/link_card.json`，发送后清理
 - group 两边发，p2p 只发一次
+- **JSON 结构化生成（硬约束）**：卡片 JSON 必须用 `python3` 的 `json.dump` 结构化构建后写入 `/tmp/link_card.json`，禁止手拼字符串拼 JSON--手拼括号配对易错（如末尾多/少 `]`），坏 JSON 传给 `--content` 会让整张卡发不出
+- **发送前校验（硬约束）**：发送前必须跑 `python3 -c "import json;json.load(open('/tmp/link_card.json'))"` 校验合法性；校验失败则停止、修好 JSON 再发，绝不带病发送
+- **发送后确认（硬约束）**：每条 `messages-send` 必须用 `--jq '.data.message_id'` 取回 message_id 确认成功；禁止用 `tail`/截断输出判断是否发出--截断会丢 message_id，误判后重发会产生重复卡片
 
 ---
 

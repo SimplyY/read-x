@@ -504,7 +504,7 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 1. 写完精读内容到本地临时 markdown 文件
 2. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档（必须在项目根目录 cwd 下执行，用相对路径 @ 引用），取返回的文档链接
 3. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
-4. 两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发给用户本人。p2p 场景只发一次。
+4. 先校验 JSON 合法性（`python3 -c "import json;json.load(open('/tmp/link_card.json'))"`，失败则停止修复），再两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --jq '.data.message_id'` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --jq '.data.message_id'` 私聊发给用户本人。p2p 场景只发一次。
 5. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`）
 6. 文档内容：三段式摘要在前，各 ljg 产出分节在后，末尾附原文章链接
 
@@ -516,7 +516,7 @@ description: "长文精读：收到微信公众号/飞书文档/网页链接或�
 3. 用 `lark-cli docs +create --title "[精读] 《原文标题》" --content @.wx_doc.md --doc-format markdown --parent-position my_library` 创建内网文档，取返回的文档链接/doc_id
 4. **插入图片块**（即 ljg-card 执行硬约束步骤 8）：`cd ~/Downloads && lark-cli docs +media-insert --doc <doc_id> --file ./{name}.png --type image --align center --caption "📊 信息图：{标题}"`，返回 `ok:true` 即成功（默认 append 到文档末尾；不要用 `--selection-with-ellipsis`，当前版本报 invalid token）
 5. 按 link-card 卡片模板构建完成卡片 JSON，写入 `/tmp/link_card.json`
-6. 两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --format json` 私聊发给用户本人。p2p 场景只发一次。
+6. 先校验 JSON 合法性（`python3 -c "import json;json.load(open('/tmp/link_card.json'))"`，失败则停止修复），再两边发卡片：先 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --jq '.data.message_id'` 发到原群，再 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --msg-type interactive --content "$(cat /tmp/link_card.json)" --jq '.data.message_id'` 私聊发给用户本人。p2p 场景只发一次。
 7. 清理临时文件（`.wx_tmp.md`、`.wx_doc.md`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）
 
 **⚠️ 路径 C 的关键约束**：

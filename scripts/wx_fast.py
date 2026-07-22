@@ -4,11 +4,16 @@
 - 反爬/验证码时自动回退 Camoufox 浏览器（~9s）
 - 两条路径都跳过图片下载
 """
-import sys, re, argparse, asyncio
+import sys, re, argparse, asyncio, os
 from pathlib import Path
 
 TOOL_SITE = "/Users/yuwei/.local/share/uv/tools/wechat-article-to-markdown/lib/python3.10/site-packages"
 sys.path.insert(0, TOOL_SITE)
+
+# WeChat articles are direct-connect; drop proxy env vars so httpx does not
+# pick up socks5 ALL_PROXY while socksio is missing in this venv.
+for _k in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
+    os.environ.pop(_k, None)
 
 import httpx
 from bs4 import BeautifulSoup
