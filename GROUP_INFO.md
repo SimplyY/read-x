@@ -6,7 +6,7 @@ group_name: "read-x"
 repo_path: "/Users/yuwei/code/read-x"
 repo_url: null
 group_info_path: "/Users/yuwei/code/read-x/GROUP_INFO.md"
-updated_at: "2026-07-22T00:03:14.021Z"
+updated_at: "2026-07-23T00:01:33.000Z"
 icon: "📖"
 name_zh: "read-x"
 summary: "阅读系统：微信公众号管理与长文精读的结构化输出"
@@ -42,4 +42,4 @@ priority: 3
 - 工作目录：可访问
 - 链接数：2
 - Skill 扫描：正常
-- 最近更新时间：2026-07-22T00:03:14.021Z
+- 最近更新时间：2026-07-23T00:01:33.000Z
