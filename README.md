@@ -1,13 +1,46 @@
 # read-x
 
-飞书长文精读系统：链接自动抓取 → 内容质量评分 → 分层精读 → 飞书文档输出。收到任何链接即触发，以飞书交互卡片（bot 身份）回复。
+飞书长文精读系统：链接自动抓取 -> 内容质量评分 -> 分层精读 -> 飞书文档输出。收到任何链接即触发，以飞书交互卡片（bot 身份）回复。
+
+## 使用
+
+依赖 [Codex CLI](https://github.com/openai/codex)、lark-channel-bridge（飞书桥接）和 `lark-cli`（飞书应用）。
+
+**1. 克隆**
+
+```bash
+git clone https://github.com/SimplyY/read-x.git
+cd read-x
+```
+
+**2. 安装 ljg-skills**
+
+`long-read` 调度 7 个文字 Skill，用 [skills CLI](https://github.com/vercel-labs/skills) 装到全局：
+
+```bash
+bunx skills add lijigang/ljg-skills -g -a codex \
+  --skill ljg-think --skill ljg-learn --skill ljg-roundtable \
+  --skill ljg-qa --skill ljg-writes --skill ljg-word --skill ljg-card -y
+```
+
+`ljg-card` 需 Playwright：`cd ~/.agents/skills/ljg-card && bun install && bunx playwright install chromium`
+
+**3. 触发**
+
+配置飞书应用与 bridge 后，在飞书发文章链接（公众号 / 网页 / 飞书文档），自动抓取评分精读，卡片回复，高质量内容生成飞书文档。
+
+## 核心资产
+
+- [`ljg-skills`](https://github.com/lijigang/ljg-skills)
+- [skills CLI](https://github.com/vercel-labs/skills)
+- [GitHub](https://github.com/SimplyY/read-x)
 
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wechat-article-to-markdown`）、即刻、通用网页、飞书文档、纯文本
 - **内容质量评分**：`content-scoring` 六维度评分引擎，同一正文只评一次
 - **分层处理**：按分数路由为一句话卡片 / 轻量精读 / 深度精读
-- **长文精读**：`long-read` 编排器，Evidence → X 光解码 → 文字深度链路 → Docx XML → 飞书文档
+- **长文精读**：`long-read` 编排器，Evidence -> X 光解码 -> 文字深度链路 -> Docx XML -> 飞书文档
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
 ## 数据流
@@ -24,10 +57,10 @@ content-scoring（评分，final_score）
 │ 一句话卡片       │ 轻量精读卡片        │ long-read 全流程       │
 └─────────────────┴───────────────────┴──────────────────────┘
                                               ↓
-                            Evidence → article-decode（隔离）
+                            Evidence -> article-decode（隔离）
                                      + 文字 ljg（隔离）
-                                     → Docx XML → 飞书文档
-                                     → 原群卡片通知
+                                     -> Docx XML -> 飞书文档
+                                     -> 原群卡片通知
                             （≥ 8.0 额外 ljg-card 私聊）
 ```
 
@@ -37,9 +70,9 @@ content-scoring（评分，final_score）
 
 | Skill | 职责 |
 |-------|------|
-| `link-card` | **入口编排器**。抓取 → 调 content-scoring → 路由 → 卡片输出 |
+| `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
 | `content-scoring` | **评分引擎**。六维度评分，`scripts/content_scoring.py` 算 final_score；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence → article-decode（隔离）+ 文字 ljg（隔离）→ 拼接飞书文档 |
+| `long-read` | **深度编排器**。Evidence -> article-decode（隔离）+ 文字 ljg（隔离）-> 拼接飞书文档 |
 | `article-decode` | **X 光解码**。隔离运行，产出 Evidence 与解码骨架 |
 
 调用关系：
@@ -80,7 +113,7 @@ content-scoring（评分，final_score）
 精读文档结论先行，使用 Docx XML 原生排版：
 
 1. 顶部：评分表 + 核心结论高亮块
-2. 主文：核心 → 基石/边缘/暗流 → 与作者对话 → 最值得深读之处
+2. 主文：核心 -> 基石/边缘/暗流 -> 与作者对话 -> 最值得深读之处
 3. 附录：导言 + 各文字 ljg 完整原稿
 4. 文末：Evidence 金句 + 原文链接
 
@@ -92,5 +125,5 @@ content-scoring（评分，final_score）
 
 ## 相关
 
-- [ljg-skills](https://github.com/lijigang/ljg-skills) — 外部文字 Skill 仓库
-- [skills CLI](https://github.com/vercel-labs/skills) — Skill 安装工具
+- [ljg-skills](https://github.com/lijigang/ljg-skills) - 外部文字 Skill 仓库
+- [skills CLI](https://github.com/vercel-labs/skills) - Skill 安装工具
