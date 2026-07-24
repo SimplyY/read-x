@@ -42,12 +42,12 @@ link-card 抓取正文
 
 | 维度 | 权重 | 评什么 |
 |------|------|--------|
-| 长期价值 long_term_value | 2.444 | 长期趋势、规律、结构 |
+| 长期价值 long_term_value | 2.5 | 长期趋势、规律、结构 |
 | 事实可靠 factual_reliability | 2.0 | 事实可核验，事实与观点分离 |
-| 洞察深度 insight_depth | 2.222 | 因果、反馈、二阶影响、系统演化 |
-| 智慧迁移 wisdom_transfer | 1.667 | 可沉淀为模型、原则、方法 |
-| 信息效率 information_efficiency | 1.111 | 单位阅读时间的认知增量 |
-| 结构表达 structure_expression | 0.556 | 论证与结构是否清晰 |
+| 洞察深度 insight_depth | 2.5 | 因果、反馈、二阶影响、系统演化 |
+| 智慧迁移 wisdom_transfer | 2.5 | 可沉淀为模型、原则、方法 |
+| 信息效率 information_efficiency | 1 | 单位阅读时间的认知增量 |
+| 结构表达 structure_expression | 1 | 论证与结构是否清晰 |
 
 各维度 0~10 等级锚点见 `references/anchors.md`。
 
@@ -57,15 +57,15 @@ link-card 抓取正文
 |----|------|--------|
 | 个人匹配 personal_match | 0.5 | 推进读者关注的 AI Agent、投资、教育、长期主义、系统思考 |
 | 时机与行动 timing_action | 0.3 | 对应当前研究、决策或实践 |
-| 稀缺与意外 scarcity_surprise | 0.2 | 一手事实、反常洞察、跨领域连接 |
+| 稀缺与意外 scarcity_surprise | 0.3 | 一手事实、反常洞察、跨领域连接 |
 
-加分总分按 `base_score` 分档设上限，防止低质内容靠加分翻盘：
+加分总分按 `base_score` 分档设上限：
 
 | base_score | 加分上限 |
 |------------|----------|
-| `<6.0` | 0.2 |
-| `6.0~6.9` | 0.4 |
-| `7.0~7.9` | 0.7 |
+| `<6.0` | 0.5 |
+| `6.0~6.9` | 0.6 |
+| `7.0~7.9` | 0.8 |
 | `≥8.0` | 1.0 |
 
 ## 6. 风险扣分
@@ -74,9 +74,9 @@ link-card 抓取正文
 
 | 项 | 通常 | 硬上限 |
 |----|------|--------|
-| 信息过时 outdated | 0.2~0.8 | 1.2（核心失效） |
-| 无证据断言 unsupported_assertion | 0.3~0.6 | 1.2（核心论点无支撑） |
-| 标题党 clickbait | 0.2~0.5 | 0.8（严重错配） |
+| 信息过时 outdated | 0.2~0.3 | 1（核心失效） |
+| 无证据断言 unsupported_assertion | 0.3~0.5 | 1（核心论点无支撑） |
+| 标题党 clickbait | 0.2~0.3 | 0.5（严重错配） |
 
 `final_score = clamp(round(base_score + context_bonus - risk_penalty, 1), 0, 10)`
 

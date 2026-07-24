@@ -91,13 +91,8 @@ lark-cli docs +create \
 文档成功后按 link-card 流程构建并校验 CardKit JSON，再执行：
 
 ```bash
-# group 场景：原群
+# 原群（group 场景发群；p2p 场景即私聊会话，同一命令只发一次）
 lark-cli im +messages-send --as bot --chat-id <chatId> \
-  --msg-type interactive --content "$(cat /tmp/link_card.json)" \
-  --jq '.data.message_id'
-
-# 私聊；p2p 场景只执行这一条既有会话对应的发送
-lark-cli im +messages-send --as bot --user-id <senderId> \
   --msg-type interactive --content "$(cat /tmp/link_card.json)" \
   --jq '.data.message_id'
 ```
@@ -129,7 +124,7 @@ lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
 - `article-decode` 失败：保留 Evidence 和一句话客观摘要交付。
 - 单条文字 ljg 失败：跳过该附录，继续交付其他结果。
 - 文档创建失败：回退为高密度卡片。
-- 群或私聊卡片单边失败：记录失败，不重复发送成功的一边。
+- 原群卡片发送失败：记录失败，不重复发送。
 - ljg-card 生成或私聊发送失败：主文档保持成功，不补发到群。
 
 ## 8. 临时文件
