@@ -1,6 +1,15 @@
-.wx_tmp.md
-.wx_doc.md
+# 抓取/分析临时产物
+.wx_*
+
+# Python
 __pycache__/
-.DS_Store
 *.pyc
+
+# 系统
+.DS_Store
+
+# 敏感/私有内容 - 不入库
 .env
+GROUP_INFO.md
+output/
+docs/
