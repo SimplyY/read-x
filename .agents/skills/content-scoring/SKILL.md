@@ -27,6 +27,8 @@ link-card 抓取正文
 
 `long-read` 入口已持有 `scoring_result`，不再自行评分，只用 `final_score` 决定 `ljg_range` 与 `ljg_card`。
 
+**评分卡输出义务**：评分完成后，调用方（link-card）必须立即发一张评分卡（所有路由必发，见 link-card SKILL「评分卡」段）。本脚本只算分、不发卡——保持纯计算、可复现、可单测、防重复评分；发卡是编排层职责，不塞进计算引擎。
+
 ## 3. 防重复评分
 
 - `content_fingerprint = sha256(正文)[:16]`，由 `scripts/content_scoring.py` 计算。
@@ -92,7 +94,7 @@ link-card 抓取正文
 | `6.0~6.9` | 快速阅读 | card | - | - |
 | `0~5.9` | 跳过 | card | - | - |
 
-8.0~8.4 取 1 条 ljg，8.5~8.9 取 1~2 条，≥9.0 取 2~3 条，对齐 `long-read` 既有契约。`≥8.0` 且 `route=long_read` 时 `ljg_card=true`，在主文档交付成功后独立运行，仅私聊 PNG。
+8.0~8.4 取 1 条 ljg，8.5~8.9 取 1~2 条，≥9.0 取 2~3 条，对齐 `long-read` 既有契约。`≥8.0` 且 `route=long_read` 时 `ljg_card=true`，在主文档交付成功后独立运行，发原群 PNG。
 
 ## 8. 输入与输出
 

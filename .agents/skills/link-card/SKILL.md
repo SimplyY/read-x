@@ -34,6 +34,17 @@ dispatch_intent: "link-card"
 
 ---
 
+## 入口约束：一次只处理一个内容
+
+bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_messages` 引用旧内容），**只处理最新一条用户指令**，其余只作上下文：
+
+- 已响应过的旧消息不重复处理
+- bot 进度卡、流式展示卡是过程产物，不是新指令
+- 引用旧消息只作上下文，不重新执行其内容
+- 需处理多个独立内容时，分次发送，一次一个
+
+一次专注一件事，避免并行处理导致混乱、重复劳动和刷屏。
+
 ## 核心流程
 
 ```
@@ -87,11 +98,14 @@ else:
 3. 据 `route` 分派：`route=card` 自处理，`route=long_read` 把 `scoring_result` 传给 long-read；
 4. 只有摘要/片段时 `model_output.provisional=true`，不得冒充完整评分。
 
-### 评分通知（仅 long-read）
+### 评分卡（所有路由必发）
 
-`route=long_read`（`final_score >=7.0`）时，long-read 是长任务，评分完成、启动精读前先发一条轻量进度卡片（`--as bot`），让用户立刻知道分数与档位，再进入 long-read 全流程。`route=card` 直接出结果卡片，不单独通知。
+评分完成后、进入任何深度处理前，**必须先发一张评分卡**（`--as bot`），让用户立刻看到分数、档位、六维度与结论。这是评分流程的固定产物，不靠记忆、不分路由：
 
-进度卡片内容：标题 + `final_score/10 · decision_label` + 一句结论（取 `scoring_result.conclusion`），不展开分析。示例：
+- `route=card`：评分卡即最终卡。评分块（分数+档位+六维度+结论）作为卡片头部，下方接对应档位的摘要/金句/链接，**不再单独发结果卡**，避免两张卡重复。
+- `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
+
+评分卡内容：标题 + 来源 + `final_score/10 · decision_label` + 六维度 + 一句结论（取 `scoring_result.conclusion`）。示例：
 
 ```json
 {
@@ -113,7 +127,7 @@ else:
 
 ### 高质量（>=7.0）-> 走 long-read 全流程
 
-转交时把 `scoring_result` 一并传入。long-read 用 `final_score` 决定文字 ljg 数量（`<8.0` 0~1、`8.0~8.4` 1、`8.5~8.9` 1~2、`>=9.0` 2~3），不再重评。`final_score >=8.0` 的 `ljg-card` 在文档交付后独立运行，仅私聊发送 PNG。
+转交时把 `scoring_result` 一并传入。long-read 用 `final_score` 决定文字 ljg 数量（`<8.0` 0~1、`8.0~8.4` 1、`8.5~8.9` 1~2、`>=9.0` 2~3），不再重评。`final_score >=8.0` 的 `ljg-card` 在文档交付后独立运行，发原群 PNG。
 
 ### 中等质量（6.0~6.9）-> 走轻量精读
 
@@ -147,7 +161,7 @@ else:
 
 **长摘要 / 含 ljg**：生成飞书文档 → 只发原群一份卡片（p2p 场景只发一次）。
 
-> ⚠️ `ljg-card` 不属于文档链路。质量 `>=8.0` 时，先创建并发送主文档卡片，再独立生成 PNG，仅以 bot 身份私聊发送；禁止插入文档或发群。
+> ⚠️ `ljg-card` 不属于文档链路。质量 `>=8.0` 时，先创建并发送主文档卡片，再独立生成 PNG，以 bot 身份发原群；禁止插入文档。
 
 > ⚠️ 精读完成卡是「交付」卡，不重复评分与六维度--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接。
 
@@ -202,7 +216,7 @@ else:
     "elements": [
       {
         "tag": "markdown",
-        "content": "**来源**\n\n一句话摘要\n\n[查看原文](链接)"
+        "content": "**来源**\n\n**评分：{final_score}/10 · {decision_label}**\n**六维度**\n长期价值 {dimensions.long_term_value.level} · 事实可靠 {dimensions.factual_reliability.level} · 洞察深度 {dimensions.insight_depth.level}\n智慧迁移 {dimensions.wisdom_transfer.level} · 信息效率 {dimensions.information_efficiency.level} · 结构表达 {dimensions.structure_expression.level}\n{scoring_result.conclusion}\n\n---\n\n一句话摘要\n\n[查看原文](链接)"
       }
     ]
   }
@@ -245,14 +259,14 @@ lark-cli im +messages-send \
   --jq '.data.message_id'
 ```
 
-> ⚠️ 不再向 `--user-id <senderId>` 私聊重复发送文本卡片。`ljg-card` PNG 的「仅私聊」是例外，保留不变。
+> ⚠️ 不再向 `--user-id <senderId>` 私聊发送任何卡片；所有卡片（含 ljg-card PNG）只发原群。
 
 **关键约束：**
 - `--as bot`：必须，卡片以 bot 身份发送
 - `--msg-type interactive`：必须，表示交互卡片
 - `--content`：JSON 字符串，直接传入或用文件
 - 卡片 JSON 写到临时文件 `/tmp/link_card.json`，发送后清理
-- 文本卡片只发原群一份（p2p 场景即私聊会话，只发一次）；ljg-card PNG 例外，仅私聊
+- 所有卡片（含 ljg-card PNG）只发原群一份（p2p 场景即私聊会话，只发一次）
 - **JSON 结构化生成（硬约束）**：卡片 JSON 必须用 `python3` 的 `json.dump` 结构化构建后写入 `/tmp/link_card.json`，禁止手拼字符串拼 JSON--手拼括号配对易错（如末尾多/少 `]`），坏 JSON 传给 `--content` 会让整张卡发不出
 - **发送前校验（硬约束）**：发送前必须跑 `python3 -c "import json;json.load(open('/tmp/link_card.json'))"` 校验合法性；校验失败则停止、修好 JSON 再发，绝不带病发送
 - **发送后确认（硬约束）**：每条 `messages-send` 必须用 `--jq '.data.message_id'` 取回 message_id 确认成功；禁止用 `tail`/截断输出判断是否发出--截断会丢 message_id，误判后重发会产生重复卡片
@@ -264,7 +278,7 @@ lark-cli im +messages-send \
 1. **卡片总字数**：字数与原文长度 + 内容质量成正比，不为凑字数而展开。800 字是极高质量长文的上限，不是默认目标。
    - 高质量（走 long-read + 飞书文档）：卡片作为摘要通知，200-400 字。核心内容在飞书文档里
    - 中等质量：300-500 字，与原文长度成正比。即刻短帖（原文 <500 字）→ 300-400 字；公众号中篇（原文 1000-3000 字）→ 400-500 字
-   - 低质量：50-150 字，一句话 + 原文链接
+   - 低质量：50-150 字（评分块不计入），一句话摘要 + 原文链接
 2. **标题截断**：header title 最多 40 字（中文字符），超出用 `...` 截断
 3. **逻辑自洽优先**：卡片内容必须能独立构成完整论述。读者只看卡片不看原文，也能理解核心论点和推理链条。不能因为压缩而丢失因果逻辑
 4. **分段控制**：body 的 markdown 中，单段 100-200 字为宜；超过 200 字自然拆段。不要用「一句话一段」的碎片化写法
@@ -279,7 +293,7 @@ lark-cli im +messages-send \
 |---------|---------|------|
 | 高质量（long-read + 飞书文档） | 200-400 字 | 卡片是摘要通知，核心内容在飞书文档里。不含详细评分（已在评分卡），聚焦核心结论、暗流、ljg 链路引导 |
 | 中等质量 | 300-500 字 | 与原文长度成正比。短帖 300-400 字，中篇 400-500 字 |
-| 低质量 | 50-150 字 | 一句话摘要 + 原文链接，不需要展开
+| 低质量 | 50-150 字 | 评分块（不计入字数）+ 一句话摘要 + 原文链接
 
 9. **金句规则（无文档卡片必选）**：不生成飞书文档的卡片（中等质量 + 低质量有可提取内容时），必须从原文提取金句。
    - **密度**：每 2000 字原文提取 1-2 个金句。例如 6000 字原文 → 3-6 个金句
@@ -289,7 +303,7 @@ lark-cli im +messages-send \
 10. **评分与六维度展示**：评分与六维度只在评分卡出现一次，不重复。凡带评分的卡片（高质量进度卡、中等质量卡）必须在评分行下紧跟六维度块，取 `scoring_result.dimensions` 各维度的 level（0-10 整数）。格式：`**六维度**` 标题 + 两行，每行三维，用 ` · ` 分隔：
     - 长期价值 `{long_term_value}` · 事实可靠 `{factual_reliability}` · 洞察深度 `{insight_depth}`
     - 智慧迁移 `{wisdom_transfer}` · 信息效率 `{information_efficiency}` · 结构表达 `{structure_expression}`
-    六维度块不计入卡片字数上限。低质量（一句话卡，<6.0）不展示六维度，保持轻量。
+    六维度块不计入卡片字数上限。低质量（<6.0）也展示六维度——评分卡即最终卡，评分块为固定头部，六维度不可省。
     **高质量结果卡（精读完成卡）不重复评分与六维度**：评分细节已在评分卡出现，精读完成卡只留档位一句话（注明「评分详见评分卡」），聚焦交付结论，不展开六维度。
 
 ---
@@ -331,3 +345,4 @@ lark-cli im +messages-send \
 - [ ] 特殊字符（双引号、换行、emoji）→ JSON 正确转义
 - [ ] 标题超 40 字 → 正确截断
 - [ ] 所有卡片 `--as bot`，不出现 user 身份
+- [ ] 评分卡已发（所有路由必发，card 路由评分卡即最终卡）

@@ -105,17 +105,16 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 
 1. 独立读取并运行 `ljg-card` Skill；
 2. 生成 PNG 并验证文件存在且非空；
-3. 从 PNG 所在目录执行，使用相对路径仅私聊发送：
+3. 从 PNG 所在目录执行，使用相对路径发原群：
 
 ```bash
-lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
+lark-cli im +messages-send --as bot --chat-id <chatId> --image ./<name>.png
 ```
 
 禁止：
 
 - 在主文档创建前运行 ljg-card；
 - 把图片插入文档；
-- 向原群发送图片；
 - 图片失败后重发或修改已交付的文档。
 
 ## 7. 降级
@@ -125,7 +124,7 @@ lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
 - 单条文字 ljg 失败：跳过该附录，继续交付其他结果。
 - 文档创建失败：回退为高密度卡片。
 - 原群卡片发送失败：记录失败，不重复发送。
-- ljg-card 生成或私聊发送失败：主文档保持成功，不补发到群。
+- ljg-card 生成或发送失败：主文档保持成功，不重复发送。
 
 ## 8. 临时文件
 

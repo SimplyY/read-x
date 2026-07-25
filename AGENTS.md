@@ -42,7 +42,7 @@ link-card 流程：
 3. **独立解码**：Evidence 完成后，`article-decode` 在隔离上下文中完整运行；不输出骨架或单独 X 光四层
 4. **文字深度链路**：各 ljg 在相互不可见的隔离上下文中运行；由 content-scoring 的 `final_score` 决定数量（`<8.0` 0~1、`8.0~8.4` 1、`8.5~8.9` 1~2、`≥9.0` 2~3）
 5. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；生成飞书文档后只发原群一份卡片（p2p 场景只发一次）
-   - 质量 `≥8.0` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档、不发群，仅以 bot 身份私聊发送
+   - 质量 `≥8.0` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份发原群
 
 ## 关键目录
 
@@ -84,8 +84,9 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 - 顶部：两列评分表（content-scoring 的 `final_score` + `decision_label` + 依据）+ 全文唯一 `light-yellow` 核心结论高亮块
 - 主文：真正的核心 → 基石/边缘/暗流 → 与作者对话 → 最值得深读之处 → 可选的对飞鱼意义（≤50 字）
+- 原文金句 + 原文链接（附录上方）
 - 附录：先 200~500 字导言（ljg 完整原稿的摘要），再各文字 ljg 完整原稿（不限字数）
-- 文末：Evidence 段（原文金句最多 8 条）+ 原文链接
+- 文末：必要事实（若有）
 - 单段可见文本不超过 100 字；并列信息用列表，真实对比或数据才用不超过 4 列的表格
 
 ## 安全边界
@@ -109,7 +110,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] 正文已成功抓取
 - [ ] 内容质量判断已完成（字数、论点、金句、结构、亲历者）
 - [ ] 高质量：Evidence / article-decode / 隔离文字 ljg / XML 飞书文档已完成，主文与附录无重复结论
-- [ ] 质量 ≥8.0：文档已先交付，ljg-card PNG 仅私聊发送
+- [ ] 质量 ≥8.0：文档已先交付，ljg-card PNG 发原群
 - [ ] 中低质量：摘要已生成
 - [ ] 卡片 JSON 格式正确（schema 2.0，markdown 标签）
 - [ ] 卡片以 `--as bot` 发送

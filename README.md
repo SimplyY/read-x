@@ -31,6 +31,8 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 
 ## 核心资产
 
+- [精读索引](https://ywhome.feishu.cn/base/ASdsbB3Gka9OKNsD7YhcJ9rZnjd)
+- [Codex CLI](https://github.com/openai/codex)
 - [`ljg-skills`](https://github.com/lijigang/ljg-skills)
 - [skills CLI](https://github.com/vercel-labs/skills)
 - [GitHub](https://github.com/SimplyY/read-x)
@@ -95,7 +97,7 @@ content-scoring（评分，final_score）
 | 长因果链、逐问推进 | `ljg-qa` |
 | 值得独立成文批评 | `ljg-writes` |
 | 罕见概念或单词 | `ljg-word` |
-| 质量 ≥ 8.0 生成卡片图 | `ljg-card`（私聊发送，不进文档） |
+| 质量 ≥ 8.0 生成卡片图 | `ljg-card`（发原群，不进文档） |
 
 文字数量由 `content-scoring` 的 `final_score` 决定：`< 8.0` 0~1 篇、`8.0~8.4` 1 篇、`8.5~8.9` 1~2 篇、`≥ 9.0` 2~3 篇。
 

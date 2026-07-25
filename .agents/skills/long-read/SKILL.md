@@ -1,6 +1,6 @@
 ---
 name: long-read
-description: "长文精读编排器：收到微信公众号、飞书文档、网页链接、GitHub 仓库或粘贴长文后，建立客观 evidence，消费 content-scoring 的评分结果决定文字深度，再让 article-decode 和选中的文字深度 Skill 在隔离上下文中独立运行，最后去重拼接为高密度 Docx XML 飞书文档。质量不低于 8.0 时，文档交付后再独立生成 ljg-card 并仅私聊发送。"
+description: "长文精读编排器：收到微信公众号、飞书文档、网页链接、GitHub 仓库或粘贴长文后，建立客观 evidence，消费 content-scoring 的评分结果决定文字深度，再让 article-decode 和选中的文字深度 Skill 在隔离上下文中独立运行，最后去重拼接为高密度 Docx XML 飞书文档。质量不低于 8.0 时，文档交付后再独立生成 ljg-card 并发原群。"
 ---
 
 # long-read：长文精读编排器
@@ -16,7 +16,7 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
      -> 0~3 个文字 ljg（各自隔离上下文）
      -> 主 Agent 摘取、去重、排版为 Docx XML
      -> 创建文档并发送原群卡片（p2p 场景只发一次）
-     -> final_score >=8.0 时再运行 ljg-card，仅私聊 PNG
+     -> final_score >=8.0 时再运行 ljg-card，发原群 PNG
 ```
 
 ## 1. 来源与 Evidence
@@ -80,8 +80,9 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 5. 与作者对话；
 6. 最值得深读之处；
 7. 可选「对飞鱼的意义」，有独立增量才写，最多 50 字；
-8. 附录：独立深度分析；
-9. Evidence：原文金句、必要事实、原文链接。
+8. 原文金句 + 原文链接；
+9. 附录：独立深度分析；
+10. 必要事实（若有，文末）。
 
 不输出「骨架」章节，不再输出独立的「X 光四层」。普通文章最多 5 条原文金句；确有足够密度时最多 8 条；允许更少，禁止凑数。
 
@@ -92,8 +93,8 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 1. 用 `.wx_doc.xml` 创建飞书文档；
 2. 原群发送文档卡片，p2p 场景只发一次，全部 `--as bot`；
 3. 确认文档卡片发送成功后，独立运行 `ljg-card`；
-4. PNG 只用 `lark-cli im +messages-send --as bot --user-id <senderId> --image ./图片.png` 私聊；
-5. 不把 PNG 插入文档，不发群；失败不修改、不延迟、不重复发送主文档。
+4. PNG 只用 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image ./图片.png` 发原群；
+5. 不把 PNG 插入文档；失败不修改、不延迟、不重复发送主文档。
 
 具体命令、降级和临时文件清理见 `references/routing.md`。
 
@@ -109,6 +110,6 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 - [ ] 主文与附录是否没有重复结论？
 - [ ] 原文金句是否逐字、总数不超过 8？
 - [ ] 是否只有一个金色高亮块，段落均不超过 100 字？
-- [ ] `ljg-card` 是否在文档通知后运行且仅私聊？
+- [ ] `ljg-card` 是否在文档通知后运行且发原群？
 - [ ] 附录每条 ljg 是否各用一个注明 Skill 名的独立 h2 包裹，原稿内部小标题是否降为 h3 未占用 h2？
 - [ ] 附录每条 ljg 原稿是否做过排版加工（拆段≤100字、加粗、列表/表格、换行），而非原样照搬？
