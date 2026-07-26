@@ -1,89 +1,129 @@
-# content-scoring 输入输出 Schema
+# Content Scoring v3 Schema
 
-## model_output（模型输出，脚本输入）
+数值、权重、等级映射和阈值以 `scoring-policy.json` 为唯一真值。本文件只定义模型与脚本的契约。
 
-模型只输出维度等级与证据、加分、扣分、结论与问题，不输出分数。
+## quality_output v3
+
+正文不完整时只要求 `schema_version`、`source_status` 和可用的结论；其余字段可省略。正文完整时使用完整结构：
 
 ```json
 {
-  "detected_domain": {"primary": "投资/价值投资", "secondary": "系统思考"},
+  "schema_version": "3.0",
+  "source_status": "complete",
+  "detected_domain": {"primary": "AI/Agent 工程", "secondary": "软件工程"},
+  "claim_ledger": [
+    {
+      "id": "C1",
+      "type": "causal",
+      "importance": "core",
+      "claim": "作者提出的主张",
+      "source_quote": "正文中的连续原文",
+      "support": "direct",
+      "uncertainty": null
+    }
+  ],
+  "calibration": {
+    "closest_anchor": "A7",
+    "at_least_seven": true,
+    "comparison": "相对 A7 的具体强弱与证据"
+  },
   "dimensions": {
-    "long_term_value": {"level": 8, "evidence": "一句证据"},
-    "factual_reliability": {"level": 8, "evidence": "..."},
-    "insight_depth": {"level": 6, "evidence": "..."},
-    "wisdom_transfer": {"level": 6, "evidence": "..."},
-    "information_efficiency": {"level": 8, "evidence": "..."},
-    "structure_expression": {"level": 6, "evidence": "..."}
+    "evidence_quality": {
+      "grade": "strong",
+      "claim_ids": ["C1"],
+      "rationale": "达到该等级的依据",
+      "ceiling_reason": "不能更高的原因"
+    },
+    "insight_explanatory": {},
+    "transfer_durability": {},
+    "information_efficiency": {}
   },
-  "context_bonus": {
-    "personal_match": 0.4,
-    "timing_action": 0.2,
-    "scarcity_surprise": 0.1
-  },
-  "risk_penalty": {
-    "outdated": 0.0,
-    "unsupported_assertion": 0.3,
-    "clickbait": 0.0
-  },
-  "confidence": "high",
-  "provisional": false,
-  "conclusion": "一句话核心结论",
-  "questions": ["问题1", "问题2", "问题3"]
+  "domain_confidence": "high",
+  "conclusion": "一句话结论",
+  "questions": ["供深度分析使用的独立问题"]
 }
 ```
 
 约束：
 
-- `detected_domain`：主领域+次领域路径，主领域必填，次领域可空
-- `level`：0~10 整数，六维度必填
-- `context_bonus` 各项 0~单项上限（0.5/0.3/0.2），缺省 0
-- `risk_penalty` 各项 0~硬上限（1.2/1.2/0.8），缺省 0
-- `confidence`：`high` / `medium` / `low`
-- `provisional`：摘要/片段时 `true`，不得冒充完整评分
-- `questions`：1~3 个独立问题，供 long-read 分配 ljg
+- `source_status`：`complete|partial|unknown`。
+- `claim_ledger`：条数由 policy 约束；ID 唯一；`source_quote` 必须是 `source.md` 连续子串。
+- `type`：`empirical|causal|experiential|normative|method`。
+- `importance`：`core|supporting`；`support`：`direct|partial|asserted`。
+- 四个质量维度必须且只能完整出现；等级必须来自 policy。
+- 每维至少引用一条存在的 claim，并填写理由和上限原因。
+- `closest_anchor` 只能为 A1～A7。
+- `domain_confidence`：`high|medium|low`。
 
-## scoring_result（脚本输出）
+## relevance_output v1
 
 ```json
 {
-  "score_version": "2.0",
-  "content_fingerprint": "sha256前16位",
-  "provisional": false,
-  "detected_domain": {"primary": "投资/价值投资", "secondary": "系统思考"},
-  "base_score": 7.1,
-  "context_bonus": {
-    "personal_match": 0.4,
-    "timing_action": 0.2,
-    "scarcity_surprise": 0.1,
-    "total": 0.7,
-    "cap": 0.7,
-    "capped": false
-  },
-  "risk_penalty": {
-    "outdated": 0.0,
-    "unsupported_assertion": 0.3,
-    "clickbait": 0.0,
-    "total": 0.3
-  },
-  "final_score": 7.5,
+  "schema_version": "1.0",
   "dimensions": {
-    "long_term_value": {"level": 8, "label": "长期价值", "evidence": "..."}
+    "current_mainline": {
+      "grade": "strong",
+      "context_sections": ["当前主线"],
+      "rationale": "仅供内部计算的对应依据"
+    },
+    "current_tension": {},
+    "long_term_alignment": {},
+    "current_actionability": {}
   },
   "confidence": "high",
-  "decision": "selective_deep_read",
-  "decision_label": "选择性深读",
-  "route": "long_read",
-  "ljg_range": [0, 1],
-  "ljg_card": false,
-  "conclusion": "...",
-  "questions": ["...", "..."]
+  "conclusion": "相关性结论"
 }
 ```
 
-字段说明：
+约束：
 
-- `route`：`card` 或 `long_read`，消费方据此分派
-- `ljg_range`：仅 `route=long_read` 时给出，`card` 时为 `null`
-- `ljg_card`：`final_score ≥ 8.0` 且 `route=long_read` 时 `true`
-- `content_fingerprint`：传入正文时由脚本计算，否则透传 model_output 的值
-- `score_version`：评分规则变更时递增，配合指纹防重复评分
+- 四个相关性维度必须且只能完整出现；等级必须来自 policy。
+- `context_sections` 非空，只能引用 `当前主线|当前张力|长期校准|暂不做什么`。
+- `confidence=low` 时脚本不采用相关性数字。
+- 该输出不得接收或复述质量分。
+
+## scoring_result v3
+
+```json
+{
+  "score_version": "3.0",
+  "quality_version": "3.0",
+  "relevance_version": "1.0",
+  "content_fingerprint": "sha256",
+  "context_fingerprint": "sha256 或 null",
+  "score_status": "scored|needs_full_text|needs_review",
+  "quality_score": 8.6,
+  "quality_confidence": "high|medium|low",
+  "relevance_score": 8.2,
+  "relevance_confidence": "high|medium|unavailable",
+  "decision_score": 8.6,
+  "quality_label": "完整深读",
+  "priority_label": "高度相关",
+  "route": "card|long_read",
+  "ljg_range": [1, 2],
+  "ljg_card": true,
+  "claims": [],
+  "quality_dimensions": {},
+  "relevance_dimensions": {},
+  "calibration": {},
+  "conclusion": "",
+  "questions": [],
+  "issues": []
+}
+```
+
+`needs_full_text` 与 `needs_review` 时，三个分数为空、`route=card`、深度字段为空或 false。消费者不得自行补分。
+
+指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `full.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
+
+## CLI
+
+```bash
+python3 scripts/content_scoring.py quality_output.json source.md
+python3 scripts/content_scoring.py quality_output.json source.md \
+  --retry-quality-output retry.json \
+  --relevance-output relevance_output.json \
+  --context /Users/yuwei/code/skills/ywnext/runtime/core-context/full.md
+```
+
+`--relevance-output` 与 `--context` 必须同时提供。脚本不负责调用模型、刷新 YWNext 或持久化缓存。

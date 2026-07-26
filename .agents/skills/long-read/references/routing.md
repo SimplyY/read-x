@@ -24,12 +24,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 符合评分数量或用户明确要求时：Evidence -> `article-decode` + 文字 ljg 隔离运行 -> 拼接成文档。
 
-文字数量由 content-scoring 的 `scoring_result.final_score` 决定（见 `content-scoring/SKILL.md`）：
-
-- `<8.0`：0~1；
-- `8.0~8.4`：1；
-- `8.5~8.9`：1~2；
-- `>=9.0`：2~3。
+文字数量直接使用 content-scoring 的 `scoring_result.ljg_range`；是否生成图片直接使用 `scoring_result.ljg_card`。本 Skill 不复制分档，也不使用相关性改变深度。
 
 ## 3. 文字 Skill 选择
 
@@ -91,7 +86,12 @@ lark-cli docs +create \
 文档成功后按 link-card 流程构建并校验 CardKit JSON，再执行：
 
 ```bash
-# 原群（group 场景发群；p2p 场景即私聊会话，同一命令只发一次）
+# 群聊场景私聊触发者
+lark-cli im +messages-send --as bot --user-id <senderId> \
+  --msg-type interactive --content "$(cat /tmp/link_card.json)" \
+  --jq '.data.message_id'
+
+# p2p 场景使用当前私聊 chatId，只发一次
 lark-cli im +messages-send --as bot --chat-id <chatId> \
   --msg-type interactive --content "$(cat /tmp/link_card.json)" \
   --jq '.data.message_id'
@@ -101,14 +101,14 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 
 ### ljg-card 后置任务
 
-质量 `>=8.0` 时：
+`scoring_result.ljg_card=true` 时：
 
 1. 独立读取并运行 `ljg-card` Skill；
 2. 生成 PNG 并验证文件存在且非空；
-3. 从 PNG 所在目录执行，使用相对路径发原群：
+3. 从 PNG 所在目录执行，使用相对路径私聊发给触发者；p2p 使用当前 `chatId`，`senderType=bot` 时回退原群：
 
 ```bash
-lark-cli im +messages-send --as bot --chat-id <chatId> --image ./<name>.png
+lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
 ```
 
 禁止：
@@ -123,7 +123,7 @@ lark-cli im +messages-send --as bot --chat-id <chatId> --image ./<name>.png
 - `article-decode` 失败：保留 Evidence 和一句话客观摘要交付。
 - 单条文字 ljg 失败：跳过该附录，继续交付其他结果。
 - 文档创建失败：回退为高密度卡片。
-- 原群卡片发送失败：记录失败，不重复发送。
+- 卡片发送失败：记录失败，不重复发送。
 - ljg-card 生成或发送失败：主文档保持成功，不重复发送。
 
 ## 8. 临时文件

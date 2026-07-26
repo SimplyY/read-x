@@ -40,8 +40,8 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wechat-article-to-markdown`）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` 六维度评分引擎，同一正文只评一次
-- **分层处理**：按分数路由为一句话卡片 / 轻量精读 / 深度精读
+- **内容质量评分**：`content-scoring` v3 四维质量分 + 隔离相关性分，同一正文质量只评一次
+- **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
 - **长文精读**：`long-read` 编排器，Evidence -> X 光解码 -> 文字深度链路 -> Docx XML -> 飞书文档
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
@@ -52,18 +52,18 @@ bunx skills add lijigang/ljg-skills -g -a codex \
  ↓
 link-card（抓取）
  ↓
-content-scoring（评分，final_score）
+content-scoring（quality / relevance / decision）
  ↓
-┌─────────────────┬───────────────────┬──────────────────────┐
-│ < 6.0           │ 6.0 ~ 7.5         │ ≥ 7.5                 │
-│ 一句话卡片       │ 轻量精读卡片        │ long-read 全流程       │
-└─────────────────┴───────────────────┴──────────────────────┘
+┌──────────────────────┬──────────────────────┐
+│ route=card           │ route=long_read      │
+│ 状态/一句话/轻量卡片   │ long-read 全流程      │
+└──────────────────────┴──────────────────────┘
                                               ↓
                             Evidence -> article-decode（隔离）
                                      + 文字 ljg（隔离）
                                      -> Docx XML -> 飞书文档
-                                     -> 原群卡片通知
-                            （≥ 8.0 额外 ljg-card 私聊）
+                                     -> 私聊卡片通知
+                            （ljg_card=true 时额外私聊 PNG）
 ```
 
 ## Skill 架构
@@ -73,13 +73,13 @@ content-scoring（评分，final_score）
 | Skill | 职责 |
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
-| `content-scoring` | **评分引擎**。六维度评分，`scripts/content_scoring.py` 算 final_score；link-card 与 long-read 共用 |
+| `content-scoring` | **评分引擎**。四维质量、独立相关性与确定性路由；link-card 与 long-read 共用 |
 | `long-read` | **深度编排器**。Evidence -> article-decode（隔离）+ 文字 ljg（隔离）-> 拼接飞书文档 |
 | `article-decode` | **X 光解码**。隔离运行，产出 Evidence 与解码骨架 |
 
 调用关系：
 
-- `link-card` 调 `content-scoring`，按分数决定走卡片还是 `long-read`
+- `link-card` 调 `content-scoring`，按脚本返回的 `route` 走卡片或 `long-read`
 - `long-read` 调 `article-decode`（X 光），再调度外部 `ljg-*` 文字 Skill
 - `content-scoring` 结果传给 `long-read`，long-read 不重评
 
@@ -97,9 +97,9 @@ content-scoring（评分，final_score）
 | 长因果链、逐问推进 | `ljg-qa` |
 | 值得独立成文批评 | `ljg-writes` |
 | 罕见概念或单词 | `ljg-word` |
-| 质量 ≥ 8.0 生成卡片图 | `ljg-card`（发原群，不进文档） |
+| `ljg_card=true` 生成卡片图 | `ljg-card`（私聊触发者，不进文档） |
 
-文字数量由 `content-scoring` 的 `final_score` 决定：`< 8.0` 0~1 篇、`8.0~8.4` 1 篇、`8.5~8.9` 1~2 篇、`≥ 9.0` 2~3 篇。
+文字数量直接消费 `content-scoring` 的 `ljg_range`；相关性只影响边界文章是否进入 long-read，不改变深度。
 
 ## 脚本
 
@@ -107,7 +107,7 @@ content-scoring（评分，final_score）
 |------|------|
 | `scripts/content_scoring.py` | content-scoring 评分计算 |
 | `scripts/wx_fast.py` | 微信文章抓取（备用，httpx 直连） |
-| `scripts/test_content_scoring.py` | 评分单元测试 |
+| `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
 
 ## 飞书文档段落顺序

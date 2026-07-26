@@ -1,299 +1,398 @@
 #!/usr/bin/env python3
-"""content-scoring 计算引擎。
+"""Content Scoring v3 deterministic calculator.
 
-模型只输出六维度 0~10 整数等级及证据、上下文加分、风险扣分；
-本脚本据此计算 base_score / context_bonus / risk_penalty / final_score，
-并给出决策、路由、文字深度数量与正文指纹。
-
-用法:
-  python3 content_scoring.py <model_output.json> [<source.md>]
-  cat model_output.json | python3 content_scoring.py - <source.md>
-  python3 content_scoring.py --self-check
+Usage:
+  python3 scripts/content_scoring.py quality.json source.md \
+    [--retry-quality-output retry.json] \
+    [--relevance-output relevance.json --context context.md]
+  python3 scripts/content_scoring.py --self-check
 """
 from __future__ import annotations
+
+import argparse
 import hashlib
 import json
+import re
 import sys
+import unicodedata
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-SCORE_VERSION = "2.0"
-
-# 六维度权重, 总和 10.0 = 基础分上限; v2.0 等级改 0~10, 权重等比放大 10/9 保校准
-DIMENSION_WEIGHTS = {
-    "long_term_value": 2.444,        # 长期价值
-    "factual_reliability": 2.0,    # 事实可靠
-    "insight_depth": 2.222,          # 洞察深度
-    "wisdom_transfer": 1.667,        # 智慧迁移
-    "information_efficiency": 1.111, # 信息效率
-    "structure_expression": 0.556,   # 结构表达
-}
-DIMENSION_LABELS = {
-    "long_term_value": "长期价值",
-    "factual_reliability": "事实可靠",
-    "insight_depth": "洞察深度",
-    "wisdom_transfer": "智慧迁移",
-    "information_efficiency": "信息效率",
-    "structure_expression": "结构表达",
-}
-# 上下文加分单项上限
-BONUS_CAPS = {"personal_match": 0.5, "timing_action": 0.3, "scarcity_surprise": 0.2}
-# 加分总分上限按 base_score 分档
-BONUS_TOTAL_CAP_BY_BASE = [(8.0, 1.0), (7.0, 0.7), (6.0, 0.4), (0.0, 0.2)]
-# 风险扣分单项硬上限
-PENALTY_CAPS = {"outdated": 1.2, "unsupported_assertion": 1.2, "clickbait": 0.8}
-# 决策档位
-DECISION_BANDS = [
-    (9.0, "rare_intensive_read", "稀缺精读"),
-    (8.0, "full_deep_read", "完整深读"),
-    (7.0, "selective_deep_read", "选择性深读"),
-    (6.0, "quick_read", "快速阅读"),
-    (0.0, "skip", "跳过"),
-]
+POLICY_PATH = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/scoring-policy.json"
 
 
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+def _load_policy():
+    return json.loads(POLICY_PATH.read_text(encoding="utf-8"), parse_float=Decimal)
 
 
-def _round1(x):
-    return round(x + 1e-9, 1)
+POLICY = _load_policy()
+SCORE_VERSION = POLICY["versions"]["score"]
+QUALITY_VERSION = POLICY["versions"]["quality"]
+RELEVANCE_VERSION = POLICY["versions"]["relevance"]
+GRADE_VALUES = {key: Decimal(value) for key, value in POLICY["grade_values"].items()}
+QUALITY_DIMENSIONS = POLICY["quality_dimensions"]
+RELEVANCE_DIMENSIONS = POLICY["relevance_dimensions"]
+CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
+SUPPORT_LEVELS = {"direct", "partial", "asserted"}
+CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
+CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+
+
+def round1(value) -> float:
+    return float(Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(rf"(?<=[{CJK}]) (?=[{CJK}\w])|(?<=\w) (?=[{CJK}])", "", text)
 
 
 def content_fingerprint(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    payload = f"{normalize_text(text)}\n{QUALITY_VERSION}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def compute_base_score(dimensions):
-    """base_score = Σ(等级/10 × 权重), 上限 10.0。等级 0~10。"""
-    total = 0.0
-    for key, weight in DIMENSION_WEIGHTS.items():
-        level = int(_clamp(dimensions.get(key, {}).get("level", 0), 0, 10))
-        total += (level / 10.0) * weight
-    return _round1(_clamp(total, 0.0, 10.0))
+def context_fingerprint(content_fp: str, context_text: str) -> str:
+    payload = f"{content_fp}\n{normalize_text(context_text)}\n{RELEVANCE_VERSION}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def bonus_total_cap(base_score):
-    for threshold, cap in BONUS_TOTAL_CAP_BY_BASE:
-        if base_score >= threshold:
-            return cap
-    return 0.2
+def _weighted_score(dimensions: dict, policy_dimensions: dict) -> float:
+    total = Decimal("0")
+    for key, spec in policy_dimensions.items():
+        total += GRADE_VALUES[dimensions[key]["grade"]] * Decimal(str(spec["weight"]))
+    return round1(total)
 
 
-def compute_bonus(base_score, bonus_in):
-    """加分: 各项 clamp 到单项上限, 总和 clamp 到 base 分档上限。"""
-    bonus_in = bonus_in or {}
-    items, raw_total = {}, 0.0
-    for key, cap in BONUS_CAPS.items():
-        v = _clamp(float(bonus_in.get(key, 0.0) or 0.0), 0.0, cap)
-        items[key] = _round1(v)
-        raw_total += v
-    cap = bonus_total_cap(base_score)
-    return {
-        "personal_match": items["personal_match"],
-        "timing_action": items["timing_action"],
-        "scarcity_surprise": items["scarcity_surprise"],
-        "total": _round1(_clamp(raw_total, 0.0, cap)),
-        "cap": _round1(cap),
-        "capped": raw_total > cap,
-    }
+def _nonempty(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
-def compute_penalty(penalty_in):
-    penalty_in = penalty_in or {}
-    items, total = {}, 0.0
-    for key, cap in PENALTY_CAPS.items():
-        v = _clamp(float(penalty_in.get(key, 0.0) or 0.0), 0.0, cap)
-        items[key] = _round1(v)
-        total += v
-    return {
-        "outdated": items["outdated"],
-        "unsupported_assertion": items["unsupported_assertion"],
-        "clickbait": items["clickbait"],
-        "total": _round1(total),
-    }
-
-
-def decide(final_score):
-    for threshold, key, label in DECISION_BANDS:
-        if final_score >= threshold:
-            return key, label
-    return "skip", "跳过"
-
-
-def route_for(decision_key):
-    return "card" if decision_key in ("skip", "quick_read") else "long_read"
-
-
-def ljg_range(final_score):
-    """文字 ljg 数量区间, 对齐 long-read 既有契约。"""
-    if final_score >= 9.0:
-        return [2, 3]
-    if final_score >= 8.5:
-        return [1, 2]
-    if final_score >= 8.0:
-        return [1, 1]
-    return [0, 1]
-
-
-def _is_int_level(v):
-    """接受 int(非 bool) 或整数值 float; 拒绝 bool/字符串/None。等级 0~10。"""
-    if isinstance(v, bool):
-        return False
-    if isinstance(v, int):
-        return 0 <= v <= 10
-    if isinstance(v, float) and v.is_integer():
-        return 0 <= v <= 10
-    return False
-
-
-def _is_number(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
-
-
-def validate_input(model_output):
-    findings = []
-    if not isinstance(model_output, dict):
-        return ["model_output is not an object"]
-    dims = model_output.get("dimensions")
-    if not isinstance(dims, dict):
-        return ["dimensions missing or not an object"]
-    for k in DIMENSION_WEIGHTS:
-        if k not in dims:
-            findings.append(f"dimensions missing: {k}")
+def _validate_claims(claims, source_text: str) -> list[str]:
+    errors = []
+    if not isinstance(claims, list):
+        return ["claim_ledger must be an array"]
+    limits = POLICY["claims"]
+    minimum = int(limits["short_min"] if len(source_text.strip()) < int(limits["short_text_chars"]) else limits["standard_min"])
+    if not minimum <= len(claims) <= int(limits["max"]):
+        errors.append(f"claim_ledger count must be {minimum}..{limits['max']}")
+    seen = set()
+    for index, claim in enumerate(claims):
+        prefix = f"claim_ledger[{index}]"
+        if not isinstance(claim, dict):
+            errors.append(f"{prefix} must be an object")
             continue
-        lvl = dims[k].get("level")
-        if not _is_int_level(lvl):
-            findings.append(f"dimensions.{k}.level must be int 0..10 (8.0 可, bool 不可)")
-    # context_bonus / risk_penalty: null 视作空对象放行; 非 dict 非空值才报错
-    cb = model_output.get("context_bonus", {})
-    if cb is not None and not isinstance(cb, dict):
-        findings.append("context_bonus must be an object")
-    elif isinstance(cb, dict):
-        for kk in BONUS_CAPS:
-            if kk in cb and not _is_number(cb[kk]):
-                findings.append(f"context_bonus.{kk} must be a number")
-    rp = model_output.get("risk_penalty", {})
-    if rp is not None and not isinstance(rp, dict):
-        findings.append("risk_penalty must be an object")
-    elif isinstance(rp, dict):
-        for kk in PENALTY_CAPS:
-            if kk in rp and not _is_number(rp[kk]):
-                findings.append(f"risk_penalty.{kk} must be a number")
-    return findings
+        claim_id = claim.get("id")
+        if not _nonempty(claim_id):
+            errors.append(f"{prefix}.id must be non-empty and unique")
+        elif claim_id in seen:
+            errors.append(f"{prefix}.id must be non-empty and unique")
+        else:
+            seen.add(claim_id)
+        if claim.get("type") not in CLAIM_TYPES:
+            errors.append(f"{prefix}.type is invalid")
+        if claim.get("importance") not in {"core", "supporting"}:
+            errors.append(f"{prefix}.importance is invalid")
+        if not _nonempty(claim.get("claim")):
+            errors.append(f"{prefix}.claim is required")
+        quote = claim.get("source_quote")
+        if not _nonempty(quote) or quote not in source_text:
+            errors.append(f"{prefix}.source_quote must be an exact source substring")
+        if claim.get("support") not in SUPPORT_LEVELS:
+            errors.append(f"{prefix}.support is invalid")
+        if claim.get("uncertainty") is not None and not isinstance(claim.get("uncertainty"), str):
+            errors.append(f"{prefix}.uncertainty must be string or null")
+    return errors
 
 
-def score(model_output, source_text=None):
-    """输入模型输出 dict, 返回 scoring_result dict。"""
-    findings = validate_input(model_output)
-    if findings:
-        raise ValueError("invalid model_output: " + "; ".join(findings))
-    dimensions = model_output.get("dimensions", {})
-    base = compute_base_score(dimensions)
-    bonus = compute_bonus(base, model_output.get("context_bonus", {}))
-    penalty = compute_penalty(model_output.get("risk_penalty", {}))
-    final = _round1(_clamp(base + bonus["total"] - penalty["total"], 0.0, 10.0))
-    decision_key, decision_label = decide(final)
-    route = route_for(decision_key)
-    fp = content_fingerprint(source_text) if source_text else model_output.get("content_fingerprint")
+def _validate_dimensions(dimensions, expected: dict, claim_ids: set[str], relevance=False) -> list[str]:
+    errors = []
+    if not isinstance(dimensions, dict):
+        return ["dimensions must be an object"]
+    if set(dimensions) != set(expected):
+        errors.append("dimensions must contain exactly the policy keys")
+        return errors
+    for key in expected:
+        item = dimensions[key]
+        if not isinstance(item, dict):
+            errors.append(f"dimensions.{key} must be an object")
+            continue
+        if item.get("grade") not in GRADE_VALUES:
+            errors.append(f"dimensions.{key}.grade is invalid")
+        if not _nonempty(item.get("rationale")):
+            errors.append(f"dimensions.{key}.rationale is required")
+        if relevance:
+            sections = item.get("context_sections")
+            if not isinstance(sections, list) or not sections or any(section not in CONTEXT_SECTIONS for section in sections):
+                errors.append(f"dimensions.{key}.context_sections is invalid")
+        else:
+            ids = item.get("claim_ids")
+            if not isinstance(ids, list) or not ids or any(claim_id not in claim_ids for claim_id in ids):
+                errors.append(f"dimensions.{key}.claim_ids is invalid")
+            if not _nonempty(item.get("ceiling_reason")):
+                errors.append(f"dimensions.{key}.ceiling_reason is required")
+    return errors
+
+
+def _quality_attempt(output: dict, source_text: str) -> dict:
+    if not isinstance(output, dict):
+        raise ValueError("quality output must be an object")
+    if output.get("schema_version") != QUALITY_VERSION:
+        raise ValueError(f"quality schema_version must be {QUALITY_VERSION}")
+    if output.get("source_status") != "complete":
+        raise ValueError("quality attempt requires complete source")
+    claims = output.get("claim_ledger")
+    errors = _validate_claims(claims, source_text)
+    domain = output.get("detected_domain")
+    if not isinstance(domain, dict) or not _nonempty(domain.get("primary")) or not isinstance(domain.get("secondary", ""), str):
+        errors.append("detected_domain requires primary and string secondary")
+    claim_ids = {
+        claim.get("id") for claim in claims
+        if isinstance(claim, dict) and isinstance(claim.get("id"), str)
+    } if isinstance(claims, list) else set()
+    errors += _validate_dimensions(output.get("dimensions"), QUALITY_DIMENSIONS, claim_ids)
+    calibration = output.get("calibration")
+    if not isinstance(calibration, dict):
+        errors.append("calibration must be an object")
+    else:
+        if calibration.get("closest_anchor") not in {f"A{i}" for i in range(1, 8)}:
+            errors.append("calibration.closest_anchor must be A1..A7")
+        if not isinstance(calibration.get("at_least_seven"), bool):
+            errors.append("calibration.at_least_seven must be boolean")
+        if not _nonempty(calibration.get("comparison")):
+            errors.append("calibration.comparison is required")
+    confidence = output.get("domain_confidence")
+    if confidence not in {"high", "medium", "low"}:
+        errors.append("domain_confidence is invalid")
+    if not _nonempty(output.get("conclusion")):
+        errors.append("conclusion is required")
+    questions = output.get("questions", [])
+    if not isinstance(questions, list) or len(questions) > 3 or any(not _nonempty(question) for question in questions):
+        errors.append("questions must contain at most three non-empty strings")
+    if errors:
+        raise ValueError("; ".join(errors))
+    raw = _weighted_score(output["dimensions"], QUALITY_DIMENSIONS)
+    evidence_grade = output["dimensions"]["evidence_quality"]["grade"]
+    cap = POLICY["evidence_caps"].get(evidence_grade)
+    score_value = min(raw, float(cap)) if cap is not None else raw
+    score_value = round1(score_value)
+    retry_reasons = []
+    if confidence == "low":
+        retry_reasons.append("low_domain_confidence")
+    if calibration["at_least_seven"] and score_value < float(POLICY["route"]["long_read_threshold"]):
+        retry_reasons.append("anchor_floor_conflict")
+    return {"score": score_value, "raw": raw, "output": output, "retry_reasons": retry_reasons}
+
+
+def _quality_band(value: float) -> str:
+    for index, band in enumerate(POLICY["quality_bands"]):
+        if value >= float(band["minimum"]):
+            return str(index)
+    raise ValueError("quality policy has no catch-all band")
+
+
+def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) -> dict:
+    output = quality_output if isinstance(quality_output, dict) else {}
+    questions = output.get("questions")
     return {
         "score_version": SCORE_VERSION,
+        "quality_version": QUALITY_VERSION,
+        "relevance_version": RELEVANCE_VERSION,
         "content_fingerprint": fp,
-        "provisional": bool(model_output.get("provisional", False)),
-        "detected_domain": model_output.get("detected_domain"),
-        "base_score": base,
-        "context_bonus": bonus,
-        "risk_penalty": penalty,
-        "final_score": final,
-        "dimensions": {
-            k: {
-                "level": int(_clamp(dimensions.get(k, {}).get("level", 0), 0, 10)),
-                "label": DIMENSION_LABELS[k],
-                "evidence": dimensions.get(k, {}).get("evidence", ""),
-            }
-            for k in DIMENSION_WEIGHTS
-        },
-        "confidence": model_output.get("confidence", "medium"),
-        "decision": decision_key,
-        "decision_label": decision_label,
-        "route": route,
-        "ljg_range": ljg_range(final) if route == "long_read" else None,
-        "ljg_card": final >= 8.0 and route == "long_read",
-        "conclusion": model_output.get("conclusion", ""),
-        "questions": list(model_output.get("questions", []))[:3],
+        "context_fingerprint": None,
+        "score_status": status,
+        "quality_score": None,
+        "quality_confidence": "low",
+        "relevance_score": None,
+        "relevance_confidence": "unavailable",
+        "decision_score": None,
+        "quality_label": status,
+        "priority_label": "相关性不可用",
+        "route": "card",
+        "ljg_range": None,
+        "ljg_card": False,
+        "claims": output.get("claim_ledger") if isinstance(output.get("claim_ledger"), list) else [],
+        "quality_dimensions": output.get("dimensions") if isinstance(output.get("dimensions"), dict) else {},
+        "relevance_dimensions": {},
+        "calibration": output.get("calibration") if isinstance(output.get("calibration"), dict) else {},
+        "conclusion": output.get("conclusion") if isinstance(output.get("conclusion"), str) else "",
+        "questions": questions[:3] if isinstance(questions, list) else [],
+        "issues": issues,
     }
 
 
-def self_check():
-    cases = []
-    hi = {
-        "dimensions": {k: {"level": 10, "evidence": "e"} for k in DIMENSION_WEIGHTS},
-        "context_bonus": {"personal_match": 0.5, "timing_action": 0.3, "scarcity_surprise": 0.2},
-        "risk_penalty": {}, "confidence": "high",
-        "conclusion": "c", "questions": ["q1", "q2", "q3"],
-    }
-    r = score(hi, "src")
-    cases.append(("high quality: base=10.0 bonus capped 1.0 final=10.0 rare+long_read",
-                  r["base_score"] == 10.0 and r["context_bonus"]["total"] == 1.0
-                  and r["final_score"] == 10.0 and r["decision"] == "rare_intensive_read"
-                  and r["route"] == "long_read" and r["ljg_range"] == [2, 3]
-                  and r["ljg_card"] is True, r))
-    mid = {
-        "dimensions": {k: {"level": 6, "evidence": "e"} for k in DIMENSION_WEIGHTS},
-        "context_bonus": {"personal_match": 0.5, "timing_action": 0.3, "scarcity_surprise": 0.2},
-        "risk_penalty": {},
-    }
-    r = score(mid, "src")
-    # base=6/10*10=6.0; base>=6 -> bonus cap 0.4; final=6.4 -> quick_read/card
-    cases.append(("mediocre base>=6 caps bonus to 0.4 -> quick_read/card",
-                  r["base_score"] == 6.0 and r["context_bonus"]["total"] == 0.4
-                  and r["context_bonus"]["capped"] is True
-                  and r["final_score"] == 6.4 and r["decision"] == "quick_read"
-                  and r["route"] == "card" and r["ljg_range"] is None, r))
-    # 无证据断言: 高分被扣分压到 long_read 以下
-    pen = {
-        "dimensions": {k: {"level": 8, "evidence": "e"} for k in DIMENSION_WEIGHTS},
-        "context_bonus": {}, "risk_penalty": {"unsupported_assertion": 1.2},
-    }
-    r = score(pen, "src")
-    # base=8/10*10=8.0; penalty=1.2; final=6.8 -> quick_read/card
-    cases.append(("unsupported assertion penalty drops to quick_read",
-                  r["base_score"] == 8.0 and r["risk_penalty"]["total"] == 1.2
-                  and r["final_score"] == 6.8 and r["decision"] == "quick_read"
-                  and r["route"] == "card", r))
-    # 输入校验: 缺维度
-    bad = {"dimensions": {"long_term_value": {"level": 3}}}
+def _validate_context(context_text: str) -> bool:
+    return all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in CONTEXT_SECTIONS)
+
+
+def _relevance_result(output, context_text: str | None):
+    if output is None or context_text is None or not _validate_context(context_text):
+        return None, "unavailable", {}, ["relevance_context_unavailable"]
+    errors = []
+    if not isinstance(output, dict) or output.get("schema_version") != RELEVANCE_VERSION:
+        errors.append(f"relevance schema_version must be {RELEVANCE_VERSION}")
+    else:
+        if any(key in output for key in ("quality_score", "decision_score")):
+            errors.append("relevance output must not receive quality or decision scores")
+        errors += _validate_dimensions(output.get("dimensions"), RELEVANCE_DIMENSIONS, set(), relevance=True)
+        if output.get("confidence") not in {"high", "medium", "low"}:
+            errors.append("relevance confidence is invalid")
+        if not _nonempty(output.get("conclusion")):
+            errors.append("relevance conclusion is required")
+    confidence = output.get("confidence") if isinstance(output, dict) else None
+    if errors or confidence == "low":
+        return None, "unavailable", {}, errors or ["low_relevance_confidence"]
+    return _weighted_score(output["dimensions"], RELEVANCE_DIMENSIONS), confidence, output["dimensions"], []
+
+
+def _quality_label(score_value: float) -> str:
+    for band in POLICY["quality_bands"]:
+        if score_value >= float(band["minimum"]):
+            return band["label"]
+    raise ValueError("quality policy has no catch-all band")
+
+
+def _priority_label(score_value) -> str:
+    if score_value is None:
+        return "相关性不可用"
+    for band in POLICY["priority_bands"]:
+        if score_value >= float(band["minimum"]):
+            return band["label"]
+    raise ValueError("priority policy has no catch-all band")
+
+
+def _depth(score_value: float):
+    for band in POLICY["ljg_bands"]:
+        if score_value >= float(band["minimum"]):
+            return list(band["range"]), bool(band["card"])
+    return [0, 1], False
+
+
+def score(quality_output, source_text: str, retry_quality_output=None, relevance_output=None, context_text=None):
+    fp = content_fingerprint(source_text)
+    if not isinstance(quality_output, dict):
+        return _needs_result("needs_review", fp, ["quality output must be an object"])
+    if quality_output.get("schema_version") != QUALITY_VERSION:
+        return _needs_result("needs_review", fp, [f"quality schema_version must be {QUALITY_VERSION}"], quality_output)
+    if quality_output.get("source_status") in {"partial", "unknown"}:
+        return _needs_result("needs_full_text", fp, ["source_status is not complete"], quality_output)
+    if quality_output.get("source_status") != "complete":
+        return _needs_result("needs_review", fp, ["source_status is invalid"], quality_output)
+    recovered_invalid_attempt = False
     try:
-        score(bad)
-        cases.append(("missing dimension raises", False, "no raise"))
-    except ValueError:
-        cases.append(("missing dimension raises", True, "raised"))
-    ok = True
-    for name, expect, info in cases:
-        status = "ok" if expect else "FAIL"
-        if not expect:
-            ok = False
-        print(f"  [{status}] {name}")
-    print("self-check:", "ok" if ok else "FAIL")
-    return ok
+        first = _quality_attempt(quality_output, source_text)
+    except ValueError as exc:
+        if retry_quality_output is None:
+            return _needs_result("needs_review", fp, [str(exc), "isolated_retry_required"], quality_output)
+        try:
+            first = _quality_attempt(retry_quality_output, source_text)
+        except ValueError as retry_exc:
+            return _needs_result("needs_review", fp, [str(exc), f"retry_invalid: {retry_exc}"], quality_output)
+        if first["retry_reasons"]:
+            return _needs_result("needs_review", fp, [str(exc)] + first["retry_reasons"], quality_output)
+        recovered_invalid_attempt = True
+
+    quality_score = first["score"]
+    effective_quality_output = first["output"]
+    quality_confidence = "medium" if recovered_invalid_attempt else quality_output["domain_confidence"]
+    issues = ["invalid_attempt_recovered_by_isolated_retry"] if recovered_invalid_attempt else list(first["retry_reasons"])
+    if first["retry_reasons"] and not recovered_invalid_attempt:
+        if retry_quality_output is None:
+            return _needs_result("needs_review", fp, issues + ["isolated_retry_required"], quality_output)
+        try:
+            second = _quality_attempt(retry_quality_output, source_text)
+        except ValueError as exc:
+            return _needs_result("needs_review", fp, issues + [f"retry_invalid: {exc}"], quality_output)
+        delta = abs(first["score"] - second["score"])
+        maximum_delta = float(POLICY["retry"]["maximum_score_delta"])
+        if second["retry_reasons"] or delta > maximum_delta or _quality_band(first["score"]) != _quality_band(second["score"]):
+            return _needs_result("needs_review", fp, issues + second["retry_reasons"] + [f"retry_delta={round1(delta)}"], quality_output)
+        quality_score = round1((Decimal(str(first["score"])) + Decimal(str(second["score"]))) / Decimal("2"))
+        quality_confidence = "medium"
+        issues.append("isolated_retry_resolved")
+
+    relevance_score, relevance_confidence, relevance_dimensions, relevance_issues = _relevance_result(relevance_output, context_text)
+    issues += relevance_issues
+    if relevance_score is None:
+        decision_score = quality_score
+        context_fp = None
+    else:
+        weights = POLICY["decision_weights"]
+        weighted = round1(Decimal(str(quality_score)) * Decimal(str(weights["quality"])) + Decimal(str(relevance_score)) * Decimal(str(weights["relevance"])))
+        decision_score = max(quality_score, weighted)
+        context_fp = context_fingerprint(fp, context_text)
+    floor = float(POLICY["route"]["quality_floor"])
+    threshold = float(POLICY["route"]["long_read_threshold"])
+    route = "long_read" if quality_score >= floor and decision_score >= threshold else "card"
+    depth, cast_card = _depth(quality_score)
+    return {
+        "score_version": SCORE_VERSION,
+        "quality_version": QUALITY_VERSION,
+        "relevance_version": RELEVANCE_VERSION,
+        "content_fingerprint": fp,
+        "context_fingerprint": context_fp,
+        "score_status": "scored",
+        "quality_score": quality_score,
+        "quality_confidence": quality_confidence,
+        "relevance_score": relevance_score,
+        "relevance_confidence": relevance_confidence,
+        "decision_score": decision_score,
+        "quality_label": _quality_label(quality_score),
+        "priority_label": _priority_label(relevance_score),
+        "route": route,
+        "ljg_range": depth if route == "long_read" else None,
+        "ljg_card": cast_card and route == "long_read",
+        "claims": effective_quality_output["claim_ledger"],
+        "quality_dimensions": effective_quality_output["dimensions"],
+        "relevance_dimensions": relevance_dimensions,
+        "calibration": effective_quality_output["calibration"],
+        "conclusion": effective_quality_output.get("conclusion", ""),
+        "questions": list(effective_quality_output.get("questions", []))[:3],
+        "issues": issues,
+    }
+
+
+def self_check() -> bool:
+    assert round1(6.25) == 6.3
+    assert content_fingerprint("a \n b") == content_fingerprint("a b")
+    assert sum(Decimal(str(item["weight"])) for item in QUALITY_DIMENSIONS.values()) == Decimal("1.00")
+    assert sum(Decimal(str(item["weight"])) for item in RELEVANCE_DIMENSIONS.values()) == Decimal("1.00")
+    assert sum(Decimal(str(value)) for value in POLICY["decision_weights"].values()) == Decimal("1.00")
+    print("self-check: ok")
+    return True
+
+
+def _read_json(path: str):
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text(encoding="utf-8")
+    return json.loads(raw)
 
 
 def main():
-    args = sys.argv[1:]
-    if not args:
-        print(__doc__)
-        sys.exit(2)
-    if args[0] == "--self-check":
-        sys.exit(0 if self_check() else 1)
-    model_path = args[0]
-    source_text = None
-    if len(args) >= 2:
-        source_text = Path(args[1]).read_text(encoding="utf-8")
-    raw = sys.stdin.read() if model_path == "-" else Path(model_path).read_text(encoding="utf-8")
-    model_output = json.loads(raw)
-    result = score(model_output, source_text)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("quality_output", nargs="?")
+    parser.add_argument("source", nargs="?")
+    parser.add_argument("--retry-quality-output")
+    parser.add_argument("--relevance-output")
+    parser.add_argument("--context")
+    parser.add_argument("--self-check", action="store_true")
+    args = parser.parse_args()
+    if args.self_check:
+        return 0 if self_check() else 1
+    if not args.quality_output or not args.source:
+        parser.error("quality_output and source are required")
+    if bool(args.relevance_output) != bool(args.context):
+        parser.error("--relevance-output and --context must be provided together")
+    result = score(
+        _read_json(args.quality_output),
+        Path(args.source).read_text(encoding="utf-8"),
+        _read_json(args.retry_quality_output) if args.retry_quality_output else None,
+        _read_json(args.relevance_output) if args.relevance_output else None,
+        Path(args.context).read_text(encoding="utf-8") if args.context else None,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    sys.exit(0)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

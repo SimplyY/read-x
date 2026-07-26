@@ -107,12 +107,12 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
   <thead><tr><th background-color="light-gray">维度</th><th background-color="light-gray">判断</th></tr></thead>
   <tbody>
     <tr><td><b>质量</b></td><td>8.5/10 · 完整深读：简短证据依据</td></tr>
-    <tr><td><b>依据</b></td><td>来自 content-scoring 的维度证据与风险扣分</td></tr>
+    <tr><td><b>相关性</b></td><td>8.0/10 · 高度相关；不可用时如实标注</td></tr>
   </tbody>
 </table>
 ```
 
-分数与档位来自 link-card 传入的 `scoring_result`（`final_score` + `decision_label`），long-read 不得重新评分。
+分数与档位来自 link-card 传入的 `scoring_result`（`quality_score + quality_label`、`relevance_score + priority_label`）。`decision_score` 只用于路由，不冒充质量；long-read 不得重新评分。
 
 ### 唯一核心结论
 
@@ -142,15 +142,6 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 「对飞鱼的意义」不是必选章节。只有文章解码之外仍有明确新增价值时才输出，正文可见文本最多 50 字。不得把该段内容回填到三重世界或作者动机。
 
-## 5. 评分与深度映射
+## 5. 评分与深度契约
 
-评分由 content-scoring 在 link-card 阶段完成，long-read 消费 `scoring_result.final_score`：
-
-| final_score | 文字 ljg | ljg-card |
-|-------------|----------|----------|
-| `<8.0` | 0~1 | 不强制 |
-| `8.0~8.4` | 1 | 文档交付后运行 |
-| `8.5~8.9` | 1~2 | 文档交付后运行 |
-| `>=9.0` | 2~3 | 文档交付后运行 |
-
-文字 Skill 只在有独立问题时取上限。`ljg-card` 不计入文字数量。完整决策阈值与路由见 `content-scoring/SKILL.md`。
+评分由 content-scoring 在 link-card 阶段完成。long-read 只接受 `score_status=scored`、`route=long_read` 的结果并直接消费 `ljg_range` 与 `ljg_card`；不复制分档，不用 `decision_score` 改变深度。文字 Skill 只在有独立问题时取区间上限，`ljg-card` 不计入文字数量。
