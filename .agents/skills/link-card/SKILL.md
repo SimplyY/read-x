@@ -95,7 +95,7 @@ else:
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。
 2. 在质量隔离上下文按 content-scoring Skill 生成 `quality_output v3`；需要重评时使用 fresh context，不能泄漏第一次结论。
-3. 运行 YWNext 8 天校验；通过后在独立上下文生成 `relevance_output v1`，失败则不传相关性。
+3. 读取 YWNext `full.md` 并取刷新日期；结构齐全（四个区块）则在独立上下文生成 `relevance_output v1`，过期则把距刷新天数写进相关性上下文让模型降权、仍出分；结构损坏才不传相关性。
 4. 跑 `python3 scripts/content_scoring.py <quality_output.json> <source.md> [相关性参数]` 拿 `scoring_result v3`。
 5. 只据 `score_status` 和 `route` 分派；`route=long_read` 时把整个结果传给 long-read。
 

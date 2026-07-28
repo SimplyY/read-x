@@ -31,20 +31,22 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 ## 3. 隔离运行
 
+主 Agent 用角色扮演实现隔离，不依赖 SubAgent：每次运行 `article-decode` 或某条 ljg 前，进入该 Skill 的独立角色，只接收下文规定的输入，不复用质量评分解释、不复用其他 ljg 或 `article-decode` 的输出、不把用户画像喂给 ljg。隔离靠纪律（只喂规定输入、不串上下文），不靠进程机制。
+
 ### article-decode
 
-使用正式 `article-decode` Skill。必须通过 SubAgent、fresh thread 或运行时提供的等价隔离机制执行，不能在主 Agent 当前上下文中角色扮演。给它完整原文与客观 Evidence，不给用户画像、既有摘要、评分解释或任何 ljg 输出。它独立产出文章真正的核心、基石/边缘/暗流、思想结构、与作者对话和最值得深读的论证。
+使用正式 `article-decode` Skill。主 Agent 进入解码角色，只接收完整原文与客观 Evidence，不接收用户画像、既有摘要、评分解释或任何 ljg 输出，独立产出文章真正的核心、基石/边缘/暗流、思想结构、与作者对话和最值得深读的论证。
 
 ### 文字 ljg
 
-按 `references/routing.md` 选择。每条 Skill 在相互不可见的独立上下文中运行，只接收：
+按 `references/routing.md` 选择。每条 Skill 在相互不可见的角色扮演中运行，只接收：
 
 1. 完整原文；
 2. 客观 Evidence；
 3. 分配给它的唯一分析问题；
 4. 自身 `SKILL.md`。
 
-不得给它 `article-decode`、其他 ljg 或用户画像输出。每条同样必须通过 SubAgent、fresh thread 或等价隔离机制执行。隔离机制不可用时，明确降级并跳过对应深度产出，不得假装已独立运行。一个 Skill 失败时保留其他结果继续交付。
+不得给它 `article-decode`、其他 ljg 或用户画像输出。一条 Skill 失败时保留其他结果继续交付。
 
 ## 4. 拼接，不重写
 
@@ -59,7 +61,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 不要把独立 Skill 的表达统一改写成平直白话。相同证据可以复用，相同结论只能出现一次。能套在无关文章上的泛化句删除。
 
 - 主文约 1000~2000 字。
-- 附录放每条文字 ljg 原稿中的核心内容（每条核心内容长度700-1200字，压缩时不得去掉核心内容和逻辑连贯性），但每条原稿内部仍受可读性约束：单段≤100字、关键概念加粗、并列用列表、对比用表格、独立段落间换行。只做排版加工，不改语义、不磨平原 Skill 语气；附录标题后、各 ljg 前先放一段 200~300 字导言导读附录内容。完整规则见 `references/output-schema.md` 第 3、4 节。
+- 附录放每条文字 ljg 原稿中的核心内容（每条核心内容长度600-1000字，压缩时不得去掉核心内容和逻辑连贯性），但每条原稿内部仍受可读性约束：单段≤100字、关键概念加粗、并列用列表、对比用表格、独立段落间换行。只做排版加工，不改语义、不磨平原 Skill 语气；附录标题后、各 ljg 前先放一段 200~300 字导言导读附录内容。完整规则见 `references/output-schema.md` 第 3、4 节。
 
 ## 5. 成品结构
 
@@ -84,9 +86,16 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
 1. 用 `.wx_doc.xml` 创建飞书文档；
 2. 发送文档卡片：群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
-3. 确认文档卡片发送成功后，独立运行 `ljg-card`；按 ljg-card「截图后校验」确认 PNG 生成（capture.js exit 0 + 文件存在 + size>0，禁止 `view_image`）；
-4. PNG 私聊发给触发者：群聊场景 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --image ./图片.png`，p2p 场景 `--chat-id <bridge_context.chatId>`；`senderType=bot` 时回退发原群；
-5. 不把 PNG 插入文档；失败不修改、不延迟、不重复发送主文档。
+3. 确认文档卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
+
+   ```bash
+   lark-cli base +record-upsert --base-token ASdsbB3Gka9OKNsD7YhcJ9rZnjd --table-id tbltqJwdmOmcbFlI --as user --json '{"日期":"<当天 00:00:00>","标题":"<原文标题>","来源链接":"[<原文 URL>](<原文 URL>)","云文档链接":"[<飞书文档 URL>](<飞书文档 URL>)","评分":"<quality_score>/10","是否已读":true}'
+   ```
+
+   要点：`日期` 取当天 `00:00:00`；`标题` 用原文标题；`来源链接`/`云文档链接` 用 markdown 链接格式 `[url](url)`（与历史记录一致）；`评分` 取 content-scoring 的 `quality_score` 去尾零（如 `9/10`、`7.5/10`）；`是否已读` 固定 `true`。标题或 URL 含 `"`、`\` 等字符时，用 `python3 -c "import json,sys;print(json.dumps(sys.stdin.read()))"` 或等价方式构造 `--json` 值，禁手工拼接破坏 JSON。回写是登记步骤，失败不阻塞主流程，仅告警不回滚、不重试阻塞文档交付；
+4. 独立运行 `ljg-card`；按 ljg-card「截图后校验」确认 PNG 生成（capture.js exit 0 + 文件存在 + size>0，禁止 `view_image`）；
+5. PNG 私聊发给触发者：群聊场景 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --image ./图片.png`，p2p 场景 `--chat-id <bridge_context.chatId>`；`senderType=bot` 时回退发原群；
+6. 不把 PNG 插入文档；失败不修改、不延迟、不重复发送主文档。
 
 具体命令、降级和临时文件清理见 `references/routing.md`。
 

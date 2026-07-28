@@ -2,7 +2,7 @@
   "versions": {
     "score": "3.0",
     "quality": "3.0",
-    "relevance": "1.0"
+    "relevance": "2.0"
   },
   "grade_values": {
     "invalid": 0,
@@ -15,43 +15,108 @@
     "benchmark": 10
   },
   "quality_dimensions": {
-    "evidence_quality": {"label": "证据与论证可信度", "weight": 0.25},
-    "insight_explanatory": {"label": "洞察解释力", "weight": 0.30},
-    "transfer_durability": {"label": "长期迁移价值", "weight": 0.30},
-    "information_efficiency": {"label": "信息效率", "weight": 0.15}
+    "evidence_quality": {
+      "label": "证据与论证可信度",
+      "weight": 0.25
+    },
+    "insight_explanatory": {
+      "label": "洞察解释力",
+      "weight": 0.3
+    },
+    "transfer_durability": {
+      "label": "长期迁移价值",
+      "weight": 0.3
+    },
+    "information_efficiency": {
+      "label": "信息效率",
+      "weight": 0.15
+    }
   },
   "evidence_caps": {
     "invalid": 5.9,
     "poor": 5.9,
     "weak": 6.9
   },
-  "relevance_dimensions": {
-    "current_mainline": {"label": "当前主线匹配", "weight": 0.40},
-    "current_tension": {"label": "当前张力与决策价值", "weight": 0.30},
-    "long_term_alignment": {"label": "长期校准一致性", "weight": 0.20},
-    "current_actionability": {"label": "当前行动与时机", "weight": 0.10}
+  "relevance_bonus": {
+    "max": 1.2
   },
-  "decision_weights": {"quality": 0.80, "relevance": 0.20},
-  "route": {"quality_floor": 6.0, "long_read_threshold": 7.0},
+  "route": {
+    "quality_floor": 6.0,
+    "long_read_threshold": 7.0
+  },
   "quality_bands": [
-    {"minimum": 9.0, "label": "稀缺精读"},
-    {"minimum": 8.5, "label": "完整深读"},
-    {"minimum": 8.0, "label": "完整深读"},
-    {"minimum": 7.0, "label": "选择性深读"},
-    {"minimum": 6.0, "label": "快速阅读"},
-    {"minimum": 0.0, "label": "跳过"}
+    {
+      "minimum": 9.0,
+      "label": "稀缺精读",
+      "ljg_range": [
+        2,
+        3
+      ],
+      "ljg_card": true
+    },
+    {
+      "minimum": 8.5,
+      "label": "完整深读",
+      "ljg_range": [
+        1,
+        2
+      ],
+      "ljg_card": true
+    },
+    {
+      "minimum": 8.0,
+      "label": "完整深读",
+      "ljg_range": [
+        1,
+        1
+      ],
+      "ljg_card": true
+    },
+    {
+      "minimum": 7.0,
+      "label": "选择性深读",
+      "ljg_range": [
+        0,
+        1
+      ],
+      "ljg_card": false
+    },
+    {
+      "minimum": 6.0,
+      "label": "快速阅读",
+      "ljg_range": [
+        0,
+        1
+      ],
+      "ljg_card": false
+    },
+    {
+      "minimum": 0.0,
+      "label": "跳过",
+      "ljg_range": [
+        0,
+        1
+      ],
+      "ljg_card": false
+    }
   ],
   "priority_bands": [
-    {"minimum": 8.0, "label": "高度相关"},
-    {"minimum": 6.0, "label": "相关"},
-    {"minimum": 0.0, "label": "低相关"}
+    {
+      "minimum": 0.5,
+      "label": "相关"
+    },
+    {
+      "minimum": 0.0,
+      "label": "低相关"
+    }
   ],
-  "ljg_bands": [
-    {"minimum": 9.0, "range": [2, 3], "card": true},
-    {"minimum": 8.5, "range": [1, 2], "card": true},
-    {"minimum": 8.0, "range": [1, 1], "card": true},
-    {"minimum": 0.0, "range": [0, 1], "card": false}
-  ],
-  "claims": {"standard_min": 5, "short_min": 1, "max": 15, "short_text_chars": 1000},
-  "retry": {"maximum_score_delta": 0.5}
+  "claims": {
+    "standard_min": 5,
+    "short_min": 1,
+    "max": 15,
+    "short_text_chars": 1000
+  },
+  "retry": {
+    "maximum_score_delta": 0.5
+  }
 }

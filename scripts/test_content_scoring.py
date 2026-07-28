@@ -56,19 +56,12 @@ def quality(grades=None, confidence="high", source_status="complete", at_least_s
     }
 
 
-def relevance(grade="benchmark", confidence="high"):
-    sections = {
-        "current_mainline": ["当前主线"],
-        "current_tension": ["当前张力"],
-        "long_term_alignment": ["长期校准"],
-        "current_actionability": ["当前主线", "暂不做什么"],
-    }
+def relevance(score=1.0, confidence="high"):
     return {
-        "schema_version": "1.0",
-        "dimensions": {
-            key: {"grade": grade, "context_sections": sections[key], "rationale": f"{key} 理由"}
-            for key in cs.RELEVANCE_DIMENSIONS
-        },
+        "schema_version": "2.0",
+        "score": score,
+        "matched_mainlines": ["AI 产业认知"] if score > 0 else [],
+        "rationale": "命中元主线" if score > 0 else "未命中元主线",
         "confidence": confidence,
         "conclusion": "相关性结论",
     }
@@ -76,9 +69,7 @@ def relevance(grade="benchmark", confidence="high"):
 
 def test_policy_is_single_consistent_scale():
     assert sum(Decimal(str(item["weight"])) for item in cs.QUALITY_DIMENSIONS.values()) == Decimal("1")
-    assert sum(Decimal(str(item["weight"])) for item in cs.RELEVANCE_DIMENSIONS.values()) == Decimal("1")
-    assert float(cs.POLICY["decision_weights"]["quality"]) == 0.8
-    assert float(cs.POLICY["decision_weights"]["relevance"]) == 0.2
+    assert float(cs.POLICY["relevance_bonus"]["max"]) > 0
     assert int(cs.POLICY["claims"]["max"]) == 15
 
 
@@ -170,7 +161,7 @@ def test_retry_cross_band_stays_needs_review():
 
 def test_relevance_only_raises_priority_and_never_rescues_low_quality():
     high_quality = quality({key: "good" for key in cs.QUALITY_DIMENSIONS})
-    low_relevance = relevance("invalid")
+    low_relevance = relevance(score=0)
     result = cs.score(high_quality, SOURCE, relevance_output=low_relevance, context_text=CONTEXT)
     assert result["quality_score"] == 7.0 and result["decision_score"] == 7.0
     assert result["route"] == "long_read"
@@ -178,7 +169,7 @@ def test_relevance_only_raises_priority_and_never_rescues_low_quality():
     low = {key: "benchmark" for key in cs.QUALITY_DIMENSIONS}
     low["evidence_quality"] = "poor"
     result = cs.score(quality(low), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 5.9 and result["decision_score"] == 6.7
+    assert result["quality_score"] == 5.9 and result["decision_score"] == 5.9
     assert result["route"] == "card"
 
 
@@ -188,7 +179,7 @@ def test_relevance_can_rescue_only_boundary_quality():
         "transfer_durability": "good", "information_efficiency": "adequate",
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.6 and result["decision_score"] == 7.3
+    assert result["quality_score"] == 6.6 and result["decision_score"] == 7.6
     assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
     assert result["ljg_card"] is False
 
@@ -220,13 +211,24 @@ def test_fingerprints_ignore_layout_but_track_content_and_context():
     assert result1["context_fingerprint"] != result2["context_fingerprint"]
 
 
+def test_relevance_score_is_continuous_and_clamped():
+    grades = {key: "good" for key in cs.QUALITY_DIMENSIONS}  # 7.0
+    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(score=0.8), context_text=CONTEXT)
+    assert result["quality_score"] == 7.0 and result["relevance_score"] == 0.8 and result["decision_score"] == 7.8
+    over = relevance(score=1.5)
+    result = cs.score(quality(grades), SOURCE, relevance_output=over, context_text=CONTEXT)
+    assert result["relevance_score"] == 1.2 and result["decision_score"] == 8.2
+    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(score=0), context_text=CONTEXT)
+    assert result["relevance_score"] == 0.0 and result["decision_score"] == 7.0
+
+
 def test_depth_uses_quality_not_decision_score():
     grades = {
         "evidence_quality": "strong", "insight_explanatory": "strong",
         "transfer_durability": "strong", "information_efficiency": "good",
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 7.9 and result["decision_score"] == 8.3
+    assert result["quality_score"] == 7.9 and result["decision_score"] == 8.9
     assert result["ljg_range"] == [0, 1] and result["ljg_card"] is False
 
 
@@ -260,7 +262,7 @@ def test_cli_end_to_end_success_and_failure_routes():
             "transfer_durability": "good", "information_efficiency": "adequate",
         }
         result = run_cli(quality(boundary))
-        assert (result["quality_score"], result["relevance_score"], result["decision_score"]) == (6.6, 10.0, 7.3)
+        assert (result["quality_score"], result["relevance_score"], result["decision_score"]) == (6.6, 1.0, 7.6)
         assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
 
         result = run_cli(quality(source_status="partial"))
@@ -273,6 +275,22 @@ def test_cli_end_to_end_success_and_failure_routes():
 
         result = run_cli(quality(), "## 当前主线\n结构损坏")
         assert result["relevance_score"] is None and result["decision_score"] == result["quality_score"]
+
+
+def test_depth_ljg_merged_into_quality_bands():
+    """合并后 ljg 产出挂在 quality_bands 上，ljg_bands 键已删除。"""
+    assert cs.POLICY.get("ljg_bands") is None, "ljg_bands 应已合并进 quality_bands"
+    for band in cs.POLICY["quality_bands"]:
+        assert "ljg_range" in band and "ljg_card" in band, f"质量档位缺 ljg 字段: {band}"
+    assert cs._depth(9.0) == ([2, 3], True)
+    assert cs._depth(8.5) == ([1, 2], True)
+    assert cs._depth(8.0) == ([1, 1], True)
+    assert cs._depth(7.0) == ([0, 1], False)
+    assert cs._depth(6.0) == ([0, 1], False)
+    assert cs._depth(0.0) == ([0, 1], False)
+    assert cs._depth(8.9) == ([1, 2], True)
+    assert cs._depth(8.4) == ([1, 1], True)
+    assert cs._depth(7.4) == ([0, 1], False)
 
 
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]

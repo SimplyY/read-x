@@ -55,21 +55,14 @@
 - `closest_anchor` 只能为 A1～A7。
 - `domain_confidence`：`high|medium|low`。
 
-## relevance_output v1
+## relevance_output v2
 
 ```json
 {
-  "schema_version": "1.0",
-  "dimensions": {
-    "current_mainline": {
-      "grade": "strong",
-      "context_sections": ["当前主线"],
-      "rationale": "仅供内部计算的对应依据"
-    },
-    "current_tension": {},
-    "long_term_alignment": {},
-    "current_actionability": {}
-  },
+  "schema_version": "2.0",
+  "score": 0.8,
+  "matched_mainlines": ["AI 产业认知"],
+  "rationale": "命中程度与依据",
   "confidence": "high",
   "conclusion": "相关性结论"
 }
@@ -77,10 +70,11 @@
 
 约束：
 
-- 四个相关性维度必须且只能完整出现；等级必须来自 policy。
-- `context_sections` 非空，只能引用 `当前主线|当前张力|长期校准|暂不做什么`。
-- `confidence=low` 时脚本不采用相关性数字。
-- 该输出不得接收或复述质量分。
+- `score` 是 0 到 `relevance_bonus.max` 的数值，按内容对飞鱼元主线的命中程度给分；脚本 clamp 到 `[0, max]`。
+- `score>0` 时 `matched_mainlines` 非空，列出命中的元主线名。
+- 判定看内容吻合度与相关性，不以作者身份/名气单独判断。
+- `confidence=low` 时脚本不采用相关性，决策分回退质量分。
+- 该输出不得接收或复述质量分；`schema_version != 2.0` 的旧输出一律拒绝。
 
 ## scoring_result v3
 
@@ -88,23 +82,23 @@
 {
   "score_version": "3.0",
   "quality_version": "3.0",
-  "relevance_version": "1.0",
+  "relevance_version": "2.0",
   "content_fingerprint": "sha256",
   "context_fingerprint": "sha256 或 null",
   "score_status": "scored|needs_full_text|needs_review",
   "quality_score": 8.6,
   "quality_confidence": "high|medium|low",
-  "relevance_score": 8.2,
+  "relevance_score": 0.8,
   "relevance_confidence": "high|medium|unavailable",
   "decision_score": 8.6,
   "quality_label": "完整深读",
-  "priority_label": "高度相关",
+  "priority_label": "相关",
   "route": "card|long_read",
   "ljg_range": [1, 2],
   "ljg_card": true,
   "claims": [],
   "quality_dimensions": {},
-  "relevance_dimensions": {},
+  "relevance_dimensions": {"score": 0.8, "matched_mainlines": [], "rationale": ""},
   "calibration": {},
   "conclusion": "",
   "questions": [],
@@ -113,6 +107,8 @@
 ```
 
 `needs_full_text` 与 `needs_review` 时，三个分数为空、`route=card`、深度字段为空或 false。消费者不得自行补分。
+
+`relevance_score` 语义为生效 bonus（0 到 `relevance_bonus.max`）：`quality_score ≥ quality_floor` 时等于 clamp 后的 `score`，否则为 0.0；相关性不可用时为 null。
 
 指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `full.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
 

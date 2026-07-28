@@ -50,14 +50,14 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 4. 隔离协议
 
-每个隔离任务必须通过 SubAgent、fresh thread 或运行时提供的等价 fresh-context 机制执行，只获得：完整原文、Evidence、唯一问题、自身 Skill。禁止传入：
+主 Agent 用角色扮演实现隔离，不依赖 SubAgent 或 fresh thread：每次运行 `article-decode` 或某条 ljg 前，进入该 Skill 的独立角色，只获得完整原文、Evidence、唯一问题、自身 Skill。隔离靠纪律（只喂规定输入、不串上下文），不靠进程机制。禁止传入：
 
 - 用户画像；
 - `article-decode` 或其他 ljg 的结果；
 - 主 Agent 的预设结论；
 - 期望答案或本轮问题诊断。
 
-`article-decode` 同样独立，只获得原文、Evidence 和自身 Skill。隔离任务可以并行；容量不足时分批运行，但上下文边界不变。没有隔离机制时跳过对应深度产出并标记降级，禁止在主上下文中模拟多个 Skill。
+`article-decode` 同样独立，只获得原文、Evidence 和自身 Skill。各角色扮演之间相互不可见；容量不足时分批运行，但上下文边界不变。不因缺少 SubAgent 跳过深度产出或标记降级。
 
 ## 5. 文档拼接
 
@@ -65,7 +65,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；
-3. 每条 ljg 完整原稿放入附录，不限字数；
+3. 每条 ljg 完整原稿放入附录，每条 600-1000 字；
 4. 拆分超过 100 字的段落；
 5. 按 `output-schema.md` 转成 XML。
 

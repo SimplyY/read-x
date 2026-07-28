@@ -31,7 +31,6 @@ QUALITY_VERSION = POLICY["versions"]["quality"]
 RELEVANCE_VERSION = POLICY["versions"]["relevance"]
 GRADE_VALUES = {key: Decimal(value) for key, value in POLICY["grade_values"].items()}
 QUALITY_DIMENSIONS = POLICY["quality_dimensions"]
-RELEVANCE_DIMENSIONS = POLICY["relevance_dimensions"]
 CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
@@ -235,7 +234,16 @@ def _relevance_result(output, context_text: str | None):
     else:
         if any(key in output for key in ("quality_score", "decision_score")):
             errors.append("relevance output must not receive quality or decision scores")
-        errors += _validate_dimensions(output.get("dimensions"), RELEVANCE_DIMENSIONS, set(), relevance=True)
+        score = output.get("score")
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            errors.append("relevance score must be a number")
+        matched = output.get("matched_mainlines")
+        if not isinstance(matched, list) or any(not isinstance(m, str) or not m.strip() for m in matched):
+            errors.append("relevance matched_mainlines must be an array of non-empty strings")
+        if isinstance(score, (int, float)) and not isinstance(score, bool) and score > 0 and not matched:
+            errors.append("relevance score>0 requires non-empty matched_mainlines")
+        if not _nonempty(output.get("rationale")):
+            errors.append("relevance rationale is required")
         if output.get("confidence") not in {"high", "medium", "low"}:
             errors.append("relevance confidence is invalid")
         if not _nonempty(output.get("conclusion")):
@@ -243,7 +251,11 @@ def _relevance_result(output, context_text: str | None):
     confidence = output.get("confidence") if isinstance(output, dict) else None
     if errors or confidence == "low":
         return None, "unavailable", {}, errors or ["low_relevance_confidence"]
-    return _weighted_score(output["dimensions"], RELEVANCE_DIMENSIONS), confidence, output["dimensions"], []
+    max_bonus = Decimal(str(POLICY["relevance_bonus"]["max"]))
+    raw = Decimal(str(output["score"]))
+    bonus = Decimal(str(round1(max(Decimal("0"), min(raw, max_bonus)))))
+    info = {"score": float(bonus), "matched_mainlines": output.get("matched_mainlines", []), "rationale": output.get("rationale")}
+    return bonus, confidence, info, []
 
 
 def _quality_label(score_value: float) -> str:
@@ -263,9 +275,9 @@ def _priority_label(score_value) -> str:
 
 
 def _depth(score_value: float):
-    for band in POLICY["ljg_bands"]:
+    for band in POLICY["quality_bands"]:
         if score_value >= float(band["minimum"]):
-            return list(band["range"]), bool(band["card"])
+            return list(band["ljg_range"]), bool(band["ljg_card"])
     return [0, 1], False
 
 
@@ -312,18 +324,19 @@ def score(quality_output, source_text: str, retry_quality_output=None, relevance
         quality_confidence = "medium"
         issues.append("isolated_retry_resolved")
 
-    relevance_score, relevance_confidence, relevance_dimensions, relevance_issues = _relevance_result(relevance_output, context_text)
+    relevance_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(relevance_output, context_text)
     issues += relevance_issues
-    if relevance_score is None:
-        decision_score = quality_score
-        context_fp = None
-    else:
-        weights = POLICY["decision_weights"]
-        weighted = round1(Decimal(str(quality_score)) * Decimal(str(weights["quality"])) + Decimal(str(relevance_score)) * Decimal(str(weights["relevance"])))
-        decision_score = max(quality_score, weighted)
-        context_fp = context_fingerprint(fp, context_text)
     floor = float(POLICY["route"]["quality_floor"])
     threshold = float(POLICY["route"]["long_read_threshold"])
+    if relevance_bonus is None:
+        decision_score = quality_score
+        relevance_score = None
+        context_fp = None
+    else:
+        bonus = float(relevance_bonus) if quality_score >= floor else 0.0
+        decision_score = round1(Decimal(str(quality_score)) + Decimal(str(bonus)))
+        relevance_score = bonus
+        context_fp = context_fingerprint(fp, context_text)
     route = "long_read" if quality_score >= floor and decision_score >= threshold else "card"
     depth, cast_card = _depth(quality_score)
     return {
@@ -345,7 +358,7 @@ def score(quality_output, source_text: str, retry_quality_output=None, relevance
         "ljg_card": cast_card and route == "long_read",
         "claims": effective_quality_output["claim_ledger"],
         "quality_dimensions": effective_quality_output["dimensions"],
-        "relevance_dimensions": relevance_dimensions,
+        "relevance_dimensions": relevance_info,
         "calibration": effective_quality_output["calibration"],
         "conclusion": effective_quality_output.get("conclusion", ""),
         "questions": list(effective_quality_output.get("questions", []))[:3],
@@ -357,8 +370,7 @@ def self_check() -> bool:
     assert round1(6.25) == 6.3
     assert content_fingerprint("a \n b") == content_fingerprint("a b")
     assert sum(Decimal(str(item["weight"])) for item in QUALITY_DIMENSIONS.values()) == Decimal("1.00")
-    assert sum(Decimal(str(item["weight"])) for item in RELEVANCE_DIMENSIONS.values()) == Decimal("1.00")
-    assert sum(Decimal(str(value)) for value in POLICY["decision_weights"].values()) == Decimal("1.00")
+    assert Decimal(str(POLICY["relevance_bonus"]["max"])) > Decimal("0")
     print("self-check: ok")
     return True
 
