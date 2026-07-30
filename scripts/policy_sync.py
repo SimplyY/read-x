@@ -2,7 +2,7 @@
 """精读配置多维表格 -> scoring-policy.json 单向同步。
 
 读飞书多维表格「精读配置」表，重建动态字段，校验后写回 scoring-policy.json。
-静态字段（versions / grade_values / quality_dimensions / evidence_caps / claims / retry）
+静态字段（versions / dimension_scores / quality_dimensions / evidence_caps / claims / retry）
 保留不动。policy.json 是运行时唯一真值；多维表格是飞鱼手机编辑面板，评分热路径不碰飞书。
 写回靠 git 回退；--dry-run 先看 diff 再决定。
 

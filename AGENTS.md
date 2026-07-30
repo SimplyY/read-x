@@ -14,10 +14,10 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 link-card 流程：
 1. **抓取**：按链接类型选择抓取方式（微信公众号/即刻/通用网页）
-2. **内容质量判断**：统一调 `content-scoring` v3，不分来源；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
+2. **内容质量判断**：统一调 `content-scoring` v3.2，不分来源；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
-这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。
+这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。唯一显式例外是 `仅评分 <URL>`：保留真实路由，但发完评分卡后不进入精读。
 
 ## link-card 流程（硬性要求）
 
@@ -25,9 +25,10 @@ link-card 流程：
 
 ### 内容质量判断（核心）
 
-抓取后，统一调用 `content-scoring` v3（不分来源）。质量阶段输出四维等级与原文主张证据；相关性阶段隔离读取经校验的 YWNext `core-context/full.md`。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.2（不分来源）。质量阶段输出四维数值与原文主张证据；先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
-- **`score_status != scored`** -> 无数字状态卡
+- **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
+- **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
 - **`route=long_read`** -> long-read 全流程 -> 卡片
 - **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片
 
@@ -75,7 +76,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 以下均为卡片通知字数；主文档长度按 long-read 规则。卡片字数与原文长度 + 内容质量成正比，800 字是极高质量卡片的上限，不是默认目标。
 
-- 高质量 → **必须生成飞书文档 → 私聊发一份卡片（600-800 字摘要通知，核心内容在文档里）**
+- 高质量 → **必须生成飞书文档 → 私聊发一份卡片（600-800 字摘要通知，核心内容在文档里）**；显式 `仅评分` 除外
 - 中等质量 → 私聊发一份卡片（400-600 字，与原文长度成正比）
 - 低质量 → 私聊发一份卡片（150-300 字，一句话 + 原文链接）
 - 所有卡片 `--as bot`，不以 user 身份发送
@@ -96,7 +97,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 - 不读取 `.env`、密钥、token
 - 飞书文档创建走当前 bridge profile 的 lark-cli
-- 临时文件（`.wx_tmp.md`、`.wx_evidence.json`、`.wx_decode.md`、`.wx_ljg_*.md`、`.wx_doc.xml`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）按实际使用清理
+- 评分临时文件必须放在每次消息独立的 `mktemp -d /tmp/readx-score.XXXXXX` 目录，禁止跨任务共享固定 `/tmp/readx-*` 文件；其他临时文件（`.wx_tmp.md`、`.wx_evidence.json`、`.wx_decode.md`、`.wx_ljg_*.md`、`.wx_doc.xml`、`/tmp/link_card.json`、`/tmp/ljg_cast_*.html`）按实际使用清理
 
 ## 禁止事项
 

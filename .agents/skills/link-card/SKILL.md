@@ -45,6 +45,10 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 一次专注一件事，避免并行处理导致混乱、重复劳动和刷屏。
 
+### 仅评分入口
+
+最新一条用户指令精确为 `仅评分 <URL>` 时，设本次 `score_only=true`。仍执行真实抓取、质量评分、条件相关性和评分卡，并保留脚本计算的真实 `route`；评分卡发送后立即结束，即使 `route=long_read` 也不进入精读。卡片必须注明“本次仅评分，不进入精读”。普通链接没有这个例外。
+
 ## 核心流程
 
 ```
@@ -56,7 +60,8 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
   │    └─ 其他 URL → read skill
   │
   ├─ [1] 调 content-scoring 评分（统一标准，不分来源）
-  │    ├─ score_status 非 scored -> 无数字状态卡
+  │    ├─ needs_relevance -> 内部补相关性，不发卡、不分派
+  │    ├─ needs_full_text|needs_review -> 无数字状态卡
   │    ├─ route=long_read -> long-read 全流程（传 scoring_result）
   │    └─ route=card -> 按 quality_label 生成轻量或一句话卡片
   │
@@ -64,6 +69,10 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 ```
 
 ## [0] 抓取：按链接类型选择抓取方式
+
+每条消息开始时先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，记住返回的绝对路径为本次 `run_dir`。本次正文、匿名锚点视图、`quality_output`、`relevance_output`、`scoring_result` 和评分卡 JSON 全部写入该目录；禁止使用 `/tmp/readx-source.md`、`/tmp/readx-quality-output.json`、`/tmp/readx-anchor-view.md` 等固定共享路径，也禁止把运行产物写到仓库。不同消息即使并行也不得共享文件。
+
+微信抓取后只使用抓取命令本次明确返回的文章路径；复制到 `<run_dir>/source.md` 后核对 URL 与标题。禁止按“最新文件”、模糊标题或共享输出文件猜正文路径。
 
 | 链接类型 | 抓取方式 |
 |---------|---------|
@@ -89,31 +98,47 @@ else:
 
 ## [1] 内容质量判断（统一标准）
 
-抓取后，不论来源，统一调用 `content-scoring` v3。质量阶段只读正文和七篇锚点；相关性阶段在独立上下文中只读主张清单与经校验的 YWNext `core-context/full.md`。`scripts/content_scoring.py` 统一计算 `quality_score`、`relevance_score`、`decision_score`、`route` 和 `ljg_range`。质量结果传给 long-read，long-read 不得重评。
+抓取后，不论来源，统一调用 `content-scoring` v3.2。质量阶段只读正文和七篇锚点；只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单与经校验的 YWNext `core-context/full.md`。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
 
 ### 调用 content-scoring
 
-1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。
-2. 在质量隔离上下文按 content-scoring Skill 生成 `quality_output v3`；需要重评时使用 fresh context，不能泄漏第一次结论。
-3. 读取 YWNext `full.md` 并取刷新日期；结构齐全（四个区块）则在独立上下文生成 `relevance_output v1`，过期则把距刷新天数写进相关性上下文让模型降权、仍出分；结构损坏才不传相关性。
-4. 跑 `python3 scripts/content_scoring.py <quality_output.json> <source.md> [相关性参数]` 拿 `scoring_result v3`。
-5. 只据 `score_status` 和 `route` 分派；`route=long_read` 时把整个结果传给 long-read。
+1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后，必须立即用 `lark-cli im +messages-send --as bot` 私聊发送纯文本“正文抓取完成，开始评分｜<文章标题>”（群聊发 `senderId`，p2p 发 `chatId`）。不得只把它写入 COT/过程卡；该消息的飞书创建时间是评分主指标起点，标题用于并行任务配对。
+2. 在质量隔离上下文按 content-scoring Skill 生成 `quality_output v3.2`；需要重评时使用 fresh context，不能泄漏第一次结论。
+3. 先不传相关性，跑 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json` 拿第一个 `scoring_result v3.2`。
+4. 若 `score_status=needs_relevance`，才读取 YWNext `full.md`：结构齐全则在独立上下文生成 `relevance_output v2` 并再跑脚本；缺失或结构损坏则使用 `--relevance-unavailable` 确定性结束。过期只降权。相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
+5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
+
+### 评分快路径（禁止探索性往返）
+
+- 脚本固定为 `/Users/yuwei/code/read-x/scripts/content_scoring.py`；不搜索、不定位。
+- 质量阶段只需读 `<run_dir>/source.md`、`.agents/skills/content-scoring/SKILL.md`，并运行 `scripts/prepare_anchor_view.py "<当前 URL>" --output "<run_dir>/anchor-view.md"` 后读取匿名输出。禁止直接读 `references/anchors.md`，也禁止再读 `schema.md` 或 `scoring-policy.json`；数值由脚本独占。
+- 同一正文只读一次；只有引用校验失败时才定点回读原文，不先 grep 所有引用。
+- 不手算权重、证据封顶、档位或路由；不在运行脚本前做“预判”。
+- 用户可见的评分过程消息只允许一条：`正文抓取完成，开始评分｜<文章标题>`；禁止再发“正在评分”、字数或步骤复述。
+- 不为发卡再次阅读 Skill、schema 或 policy；卡片只消费已校验的 `scoring_result` 和文章元数据。
+- 禁止手写卡片 JSON 或用 heredoc 组装。用 `/Users/yuwei/code/read-x/scripts/render_score_card.py <run_dir>/scoring-result.json --title ... --author ... --date ... --url ... [--score-only] --output <run_dir>/score-card.json` 生成经验证的 CardKit 2.0 JSON，再用 `lark-cli` 发送。
+- 渲染器退出码为 0 即视为卡片结构验证通过；禁止再读取、筛选或人工核对生成的卡片 JSON。
+- `source_quote` 必须从已抓取正文内部原样切片复制，优先取 12～40 个字符并避开首尾引号、破折号、Markdown 标记和句末标点；禁止凭记忆重建。脚本引用校验失败仍必须 fail closed，不做模糊替换。
+- 质量 JSON 中 `importance` 只能为 `core|supporting`，`support` 只能为 `direct|partial|asserted`；四维的 `rationale`、`ceiling_reason` 都必须是非空短句。写文件前一次性自检这些枚举和必填项，避免可预防的脚本返工。
+- `score_only=true` 时评分卡发送成功即结束；不再生成文章复述、校准总结或第二张结果卡。
 
 ### 评分卡（所有路由必发）
 
 评分完成后、进入任何深度处理前，**必须先发一张评分卡**（`--as bot`）。这是评分流程的固定产物：
 
 - `score_status=needs_full_text|needs_review`：状态卡即最终卡；说明需要完整正文或人工复核，不显示任何数字。
+- `score_status=needs_relevance`：内部状态，禁止发卡。
 - `route=card`：评分卡即最终卡。评分块作为卡片头部，下方接对应摘要/金句/链接，不再单独发结果卡。
 - `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
+- `score_only=true`：不论脚本 `route`，评分卡都是最终卡，显示“本次仅评分，不进入精读”后结束。
 
-正式评分卡显示质量分、相关性分（不可用则写“不可用”）、决策分、质量档位、四维等级和一句结论。不得展示 YWNext 私有原文。示例：
+正式评分卡显示质量分、相关性（非边界显示“未计算（不影响本次路由）”，边界不可用显示“不可用”）、决策分、质量档位、四维数值和一句结论。不得展示 YWNext 私有原文。示例：
 
 ```json
 {
   "schema": "2.0",
   "header": {"title": {"tag": "plain_text", "content": "评分完成"}, "template": "indigo"},
-  "body": {"elements": [{"tag": "markdown", "content": "《标题》\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.grade} · 洞察解释 {quality_dimensions.insight_explanatory.grade}\n长期迁移 {quality_dimensions.transfer_durability.grade} · 信息效率 {quality_dimensions.information_efficiency.grade}\n{scoring_result.conclusion}\n\n正在精读，稍后发文档。"}]}
+  "body": {"elements": [{"tag": "markdown", "content": "《标题》\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score}\n长期迁移 {quality_dimensions.transfer_durability.score} · 信息效率 {quality_dimensions.information_efficiency.score}\n{scoring_result.conclusion}\n\n正在精读，稍后发文档。"}]}
 }
 ```
 
@@ -125,6 +150,8 @@ else:
 - `route=card` 且 `quality_label=快速阅读`：轻量精读卡。
 - 其他 scored card：一句话卡片。
 - 非 scored：无数字状态卡。
+
+`score_only=true` 在上述分派之前截止：发完评分卡即结束，不改写 `route`。
 
 ### route=long_read -> 走 long-read 全流程
 
@@ -197,7 +224,7 @@ else:
     "elements": [
       {
         "tag": "markdown",
-        "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.grade} · 洞察解释 {quality_dimensions.insight_explanatory.grade}\n长期迁移 {quality_dimensions.transfer_durability.grade} · 信息效率 {quality_dimensions.information_efficiency.grade}\n{scoring_result.conclusion}\n\n---\n\n核心要点（1-3 条）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2"
+        "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score}\n长期迁移 {quality_dimensions.transfer_durability.score} · 信息效率 {quality_dimensions.information_efficiency.score}\n{scoring_result.conclusion}\n\n---\n\n核心要点（1-3 条）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2"
       }
     ]
   }
@@ -217,7 +244,7 @@ else:
     "elements": [
       {
         "tag": "markdown",
-        "content": "**来源**\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.grade} · 洞察解释 {quality_dimensions.insight_explanatory.grade}\n长期迁移 {quality_dimensions.transfer_durability.grade} · 信息效率 {quality_dimensions.information_efficiency.grade}\n{scoring_result.conclusion}\n\n---\n\n一句话摘要\n\n[查看原文](链接)"
+        "content": "**来源**\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score/10 或 不可用} · 决策 {decision_score}/10\n**四维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score}\n长期迁移 {quality_dimensions.transfer_durability.score} · 信息效率 {quality_dimensions.information_efficiency.score}\n{scoring_result.conclusion}\n\n---\n\n一句话摘要\n\n[查看原文](链接)"
       }
     ]
   }
@@ -314,7 +341,7 @@ lark-cli im +messages-send \
    - **金句定义**：原文中独立成句、有记忆点、脱离上下文仍有力度的表达。不一定是「金句格式」，但必须值得划线
    - **格式**：卡片中以 `> 原文金句` 引用块呈现，每条金句不超过 60 字
    - **低质量例外**：若原文确无值得划线的内容，不强行添加；但不能因为「懒」而跳过
-10. **评分与四维展示**：正式评分只在评分卡出现一次，展示质量、相关性、决策分和四维语义等级。`needs_full_text`、`needs_review` 不显示数字。精读完成卡只留质量档位一句话并注明“完整评分详见评分卡”，不重复四维。
+10. **评分与四维展示**：正式评分只在评分卡出现一次，展示质量、相关性状态或分数、决策分和四维数值。`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。精读完成卡只留质量档位一句话并注明“完整评分详见评分卡”，不重复四维。
 
 ---
 

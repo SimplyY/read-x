@@ -40,7 +40,8 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wechat-article-to-markdown`）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` v3 四维质量分 + 隔离相关性分，同一正文质量只评一次
+- **内容质量评分**：`content-scoring` v3.2 先按数值语义计算四维质量（6 分以上 0.5 步长），仅在相关性可改变路由时隔离计算相关性，同一正文质量只评一次
+- **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
 - **长文精读**：`long-read` 编排器，Evidence -> X 光解码 -> 文字深度链路 -> Docx XML -> 飞书文档
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
@@ -52,7 +53,7 @@ bunx skills add lijigang/ljg-skills -g -a codex \
  ↓
 link-card（抓取）
  ↓
-content-scoring（quality / relevance / decision）
+content-scoring（quality -> 条件 relevance -> decision）
  ↓
 ┌──────────────────────┬──────────────────────┐
 │ route=card           │ route=long_read      │
@@ -108,6 +109,7 @@ content-scoring（quality / relevance / decision）
 | `scripts/content_scoring.py` | content-scoring 评分计算 |
 | `scripts/wx_fast.py` | 微信文章抓取（备用，httpx 直连） |
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
+| `scripts/prepare_anchor_view.py` | 为当前 URL 生成匿名锚点视图；命中锚点时自动留一，避免答案泄漏 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
 
 ## 飞书文档段落顺序

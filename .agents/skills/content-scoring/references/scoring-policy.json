@@ -1,19 +1,10 @@
 {
   "versions": {
-    "score": "3.0",
-    "quality": "3.0",
+    "score": "3.2",
+    "quality": "3.2",
     "relevance": "2.0"
   },
-  "grade_values": {
-    "invalid": 0,
-    "poor": 2,
-    "weak": 4,
-    "adequate": 6,
-    "good": 7,
-    "strong": 8,
-    "excellent": 9,
-    "benchmark": 10
-  },
+  "dimension_scores": [0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10],
   "quality_dimensions": {
     "evidence_quality": {
       "label": "证据与论证可信度",
@@ -32,11 +23,10 @@
       "weight": 0.15
     }
   },
-  "evidence_caps": {
-    "invalid": 5.9,
-    "poor": 5.9,
-    "weak": 6.9
-  },
+  "evidence_caps": [
+    {"maximum_dimension_score": 2, "quality_cap": 5.9},
+    {"maximum_dimension_score": 4, "quality_cap": 6.9}
+  ],
   "relevance_bonus": {
     "max": 1.2
   },
@@ -111,9 +101,13 @@
     }
   ],
   "claims": {
-    "standard_min": 5,
-    "short_min": 1,
-    "max": 15,
+    "standard_counts": [
+      5,
+      8,
+      12
+    ],
+    "short_min": 2,
+    "short_max": 5,
     "short_text_chars": 1000
   },
   "retry": {
