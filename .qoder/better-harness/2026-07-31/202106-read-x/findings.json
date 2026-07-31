@@ -1,0 +1,157 @@
+{
+  "summary": {
+    "projectName": "read-x",
+    "locale": "zh-CN",
+    "modelId": "agent-work-loop-v4",
+    "reportContractVersion": 25,
+    "overview": "read-x 的规则与 Skill 路由设计成熟清晰，但交付与验证侧明显薄弱：大量改动长期停留在工作区未提交，唯一的回归测试不被工具识别、窗口内也未观察到执行；文档层存在规则重复维护与超长单文件问题。",
+    "aiAgentPractice": {
+      "inspectedSurfaces": [
+        "Rules",
+        "Skills"
+      ],
+      "coverageRows": [
+        {
+          "surface": "Rules",
+          "scopes": [
+            "Project"
+          ],
+          "count": 1,
+          "paths": [
+            "AGENTS.md"
+          ]
+        },
+        {
+          "surface": "Skills",
+          "scopes": [
+            "Project"
+          ],
+          "count": 4,
+          "paths": [
+            ".agents/skills/article-decode/SKILL.md",
+            ".agents/skills/content-scoring/SKILL.md",
+            ".agents/skills/link-card/SKILL.md",
+            ".agents/skills/long-read/SKILL.md"
+          ]
+        },
+        {
+          "surface": "Memories",
+          "scopes": [
+            "Project"
+          ],
+          "count": 3
+        },
+        {
+          "surface": "Custom Agents",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        }
+      ]
+    },
+    "assignmentSummaries": [],
+    "dimensions": [
+      {
+        "id": "task-understanding",
+        "label": "任务理解",
+        "score": 68,
+        "summary": "AGENTS.md 与四个项目 Skill 把任务边界、分派路由和禁止事项写得很清楚，且路由链路可静态验证；但同一套流程规则在 AGENTS.md 与 SKILL.md 间重复维护，三个超长单文件推高细节遗漏风险。",
+        "findingRefs": [
+          "skill-docs-no-progressive-disclosure",
+          "agents-md-duplicates-skill-rules"
+        ]
+      },
+      {
+        "id": "controlled-execution",
+        "label": "可控执行",
+        "score": 58,
+        "summary": "常用命令、临时文件纪律和安全边界都有文档声明（Present），但评审窗口内没有任何被观察到的受控执行或权限决策证据。",
+        "findingRefs": []
+      },
+      {
+        "id": "change-validation",
+        "label": "改动验证",
+        "score": 48,
+        "summary": "content-scoring SKILL.md 声明了修改后验证命令，但唯一回归测试不在可识别的测试布局（evidence-pack testFiles=0），33 个提交中无源码/测试共变，窗口内未观察到任何检查信号。",
+        "findingRefs": [
+          "regression-test-not-recognized"
+        ]
+      },
+      {
+        "id": "reliable-delivery",
+        "label": "可靠交付",
+        "score": 40,
+        "summary": "18 个文件、1790 行改动停留在工作区（diffSeverity=critical），当前结果没有绑定任何验收、审查或可回退的已知版本。",
+        "findingRefs": [
+          "uncommitted-changes-lack-acceptance"
+        ]
+      },
+      {
+        "id": "learning-capture",
+        "label": "经验沉淀",
+        "score": 38,
+        "summary": "完成了有边界的 Learning Capture 评审，但会话窗口缺少归一化事件（4 个 Episode、0 个候选、覆盖全零），重复工作与干净窗口均不可判定，无法给出任何学习有效性结论。",
+        "findingRefs": []
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "uncommitted-changes-lack-acceptance",
+      "title": "大量工作区改动长期未提交，当前结果没有可绑定的验收边界",
+      "severity": "Medium",
+      "reason": "事实：core-change-watch evidence-pack 显示工作区相对 HEAD 有 18 个文件、1790 行未提交改动（diffStatus=attention-required，diffSeverity=critical），涉及评分脚本与 Skill 定义等核心路径；30 天会话事实中也没有任何提交、检查或结果信号。推断：当前评分/精读行为无法绑定到任何已审查版本，出问题时没有已知可用状态可回退。所有者：SimplyY/read-x 仓库。不确定性：无法确认这些改动是否已被人工验证过（evidence-pack 将 tests passed 标注为 UNVERIFIED）。",
+      "expectedOutput": [
+        "工作区改动全部进入版本历史，任何一次评分或精读行为都能回溯到明确的、验证过的版本。"
+      ],
+      "expectedArtifact": "分批的可审查提交序列",
+      "aiFixPrompt": "/better-harness fix this issue\n\n把当前工作区 18 个文件的未提交改动按主题拆分为可审查的小提交（评分脚本、Skill 文档、辅助脚本分开），每批提交前运行项目已声明的验证命令 python3 scripts/test_content_scoring.py 与 python3 scripts/content_scoring.py --self-check，提交信息说明该批改动的行为影响。\n\n## Validation\n\n- git status 显示工作区干净，改动全部进入版本历史\n- 重新运行 core-change-watch evidence-pack，diffStatus 不再是 attention-required",
+      "dimensionRefs": [
+        "reliable-delivery"
+      ]
+    },
+    {
+      "id": "regression-test-not-recognized",
+      "title": "唯一的回归测试不在可识别的测试布局中，核心评分改动缺少已执行的验证",
+      "severity": "Medium",
+      "reason": "事实：scripts/test_content_scoring.py 存在，且 content-scoring SKILL.md「修改后验证」一节明确要求运行它；但 evidence-pack 统计 testFiles=0（未被识别为测试），33 个提交中保留 0 个源码/测试共变候选，30 天会话窗口内没有任何检查信号（withChecks=0）。推断：验证路径只存在于文档中，工具统计与提交历史都无法证明它被执行，当前 1790 行未提交的评分链路改动实际处于无回归保护状态。所有者：SimplyY/read-x 仓库。不确定性：不能排除测试曾在窗口外或未被采集的终端中运行过。",
+      "expectedOutput": [
+        "评分链路的每次改动都有一条被工具识别、可重复执行且留有结果的回归验证路径。"
+      ],
+      "expectedArtifact": "可被识别且已执行的回归测试布局",
+      "aiFixPrompt": "/better-harness fix this issue\n\n将 scripts/test_content_scoring.py 迁移或镜像到标准 tests/ 目录布局（保留 python3 直接运行方式与 SKILL.md 中的既有入口兼容），立即运行一次 python3 scripts/test_content_scoring.py 与 python3 scripts/content_scoring.py --self-check，并把测试布局调整与运行结果随下一批提交一起进入版本历史。\n\n## Validation\n\n- 测试命令退出码为 0\n- 重新运行 core-change-watch evidence-pack，testFiles 计数不再为 0",
+      "dimensionRefs": [
+        "change-validation"
+      ]
+    },
+    {
+      "id": "skill-docs-no-progressive-disclosure",
+      "title": "三个 SKILL.md 把全部细节堆在单文件中，长流程规则缺少渐进披露",
+      "severity": "Low",
+      "reason": "事实：资产 lint 给出 3 条 advisory——article-decode（232 行）、content-scoring（131 行）、link-card（442 行）均没有本地 Markdown 引用链接；打开核实：content-scoring 目录下已存在 references/ 子文件（schema、policy、runtime），但 SKILL.md 只用反引号提及、未建立 Markdown 链接，link-card 442 行则完全没有 references 目录。推断：每次触发都要装载全部流程细节，规则继续增长时模型可见负载与细节遗漏风险同步上升。所有者：SimplyY/read-x 仓库。不确定性：尚未观察到因文档过长直接导致的执行错误。",
+      "expectedOutput": [
+        "SKILL.md 主文件只保留触发条件与核心流程，稳定细节按需通过链接加载，规则增长不再线性推高每次触发的装载量。"
+      ],
+      "expectedArtifact": "带渐进披露结构的 Skill 文档",
+      "aiFixPrompt": "/better-harness fix this issue\n\n为 .agents/skills/link-card/ 建立 references/ 子目录，把卡片模板、发送命令细节、边界情况和自测清单等稳定细节拆出为独立 Markdown 文件并在 SKILL.md 中用 Markdown 链接引用；把 content-scoring/SKILL.md 中对既有 references/ 文件的反引号提及改为 Markdown 链接；article-decode 视内容自然边界决定是否拆分。保持所有规则语义不变，只做结构拆分。\n\n## Validation\n\n- 重新运行 asset-baseline lint，skill-long-without-progressive-references advisory 消失或减少\n- 抽查拆分后的链接均可解析到存在的文件",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    },
+    {
+      "id": "agents-md-duplicates-skill-rules",
+      "title": "AGENTS.md 与各 SKILL.md 重复维护同一套流程规则，存在漂移风险",
+      "severity": "Low",
+      "reason": "事实：AGENTS.md 用约 40 行重述了 link-card 抓取/评分/分派规则与 long-read 五步流程，同样的规范文本同时存在于 link-card、content-scoring、long-read 三个 SKILL.md 中（均已打开核对）。推断：同一规则存在两个权威来源，修改一处遗漏另一处时会产生执行歧义；项目自身已确立「任何消费者不得复制阈值」的单一真值原则，说明维护者本就关注这类漂移。所有者：SimplyY/read-x 仓库。不确定性：目前尚未发现两处内容已实际不一致的具体条目。",
+      "expectedOutput": [
+        "流程规则修改只需改动一处，AGENTS.md 负责路由与顶层约束，SKILL.md 负责执行细节。"
+      ],
+      "expectedArtifact": "单一权威来源的规则结构",
+      "aiFixPrompt": "/better-harness fix this issue\n\n把 AGENTS.md 中与 SKILL.md 重复的步骤级流程细节压缩为「必须走哪个 Skill + 少数最高优先级约束」，细节以链接指向对应 SKILL.md，使每条规则只有一个权威来源。修改前逐条比对两处文本，确认没有语义丢失。\n\n## Validation\n\n- AGENTS.md 不再包含与 SKILL.md 重复的步骤级规则，仅保留路由与顶层约束\n- 重新运行 asset-baseline lint 无新增告警",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    }
+  ]
+}

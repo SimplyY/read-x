@@ -185,16 +185,10 @@
   ],
   "findings": [
     {
-      "id": "uncommitted-changes-lack-acceptance"
+      "id": "card-wordcount-hard-rule-conflict"
     },
     {
-      "id": "regression-test-not-recognized"
-    },
-    {
-      "id": "skill-docs-no-progressive-disclosure"
-    },
-    {
-      "id": "agents-md-duplicates-skill-rules"
+      "id": "scoring-exception-set-mismatch"
     }
   ]
 }

@@ -92,8 +92,13 @@ def rebuild_policy(records):
         bands.sort(key=lambda b: b["minimum"], reverse=True)
 
     _validate(route, relevance_max, quality_bands, priority_bands)
+    old_bonus = policy.get("relevance_bonus", {})
     policy["route"] = route
-    policy["relevance_bonus"] = {"max": relevance_max}
+    policy["relevance_bonus"] = {
+        "max": relevance_max,
+        "relevance_max": old_bonus.get("relevance_max"),
+        "interest_max": old_bonus.get("interest_max"),
+    }
     policy["quality_bands"] = quality_bands
     policy["priority_bands"] = priority_bands
     policy.pop("ljg_bands", None)

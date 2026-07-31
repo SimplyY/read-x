@@ -1,0 +1,125 @@
+{
+  "summary": {
+    "projectName": "read-x",
+    "locale": "zh-CN",
+    "modelId": "agent-work-loop-v4",
+    "reportContractVersion": 25,
+    "overview": "AGENTS.md 与 link-card 构成清晰的链接分派入口，评分链路有 33 个可运行测试、fail-closed 验收矩阵与临时文件隔离纪律。但两份最高优先级文档（AGENTS.md 与 link-card SKILL.md）对同一产物存在已确认的规则冲突：卡片字数三档区间与评分例外集互相矛盾，Agent 依加载顺序可能产出不同行为。会话证据 session-limited（7 月 4 个会话全部因无请求/自分析被剔除），使用侧未观测，Learning Capture 保留在证据边界。保留 2 个由文本可直接引用的治理一致性 finding。",
+    "aiAgentPractice": {
+      "inspectedSurfaces": [
+        "Rules",
+        "Skills"
+      ],
+      "coverageRows": [
+        {
+          "surface": "Rules",
+          "scopes": [
+            "Project"
+          ],
+          "count": 1,
+          "paths": [
+            "AGENTS.md"
+          ]
+        },
+        {
+          "surface": "Skills",
+          "scopes": [
+            "Project"
+          ],
+          "count": 4,
+          "paths": [
+            ".agents/skills/article-decode/SKILL.md",
+            ".agents/skills/content-scoring/SKILL.md",
+            ".agents/skills/link-card/SKILL.md",
+            ".agents/skills/long-read/SKILL.md"
+          ]
+        },
+        {
+          "surface": "Memories",
+          "scopes": [
+            "Project"
+          ],
+          "count": 4
+        },
+        {
+          "surface": "Custom Agents",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        }
+      ]
+    },
+    "assignmentSummaries": [],
+    "dimensions": [
+      {
+        "id": "task-understanding",
+        "label": "任务理解",
+        "score": 62,
+        "summary": "AGENTS.md 路由与安全边界完整，但与 link-card 在卡片字数与评分例外上存在可引用的规则冲突，最高优先级指令自相矛盾。",
+        "findingRefs": [
+          "card-wordcount-hard-rule-conflict",
+          "scoring-exception-set-mismatch"
+        ]
+      },
+      {
+        "id": "controlled-execution",
+        "label": "可控执行",
+        "score": 68,
+        "summary": "评分链路唯一入口明确、CLI 可运行、每消息临时目录隔离；无 doctor/reset 命令，会话内执行行为未观测。",
+        "findingRefs": []
+      },
+      {
+        "id": "change-validation",
+        "label": "改动验证",
+        "score": 66,
+        "summary": "33 个测试 + validate_long_read_skill.sh + 文档-代码契约断言存在且本地可跑；但无 CI、无 git hook，验证全靠 Agent 手动执行。",
+        "findingRefs": []
+      },
+      {
+        "id": "reliable-delivery",
+        "label": "可靠交付",
+        "score": 58,
+        "summary": "对外发布有 fail-closed 验收矩阵与真实验收记录；HEAD 为 'auto committed' 提交、混入核心策略与审查工件，无 CI 门禁，回滚靠 git。",
+        "findingRefs": []
+      },
+      {
+        "id": "learning-capture",
+        "label": "经验沉淀",
+        "score": 40,
+        "summary": "会话证据 session-limited，4/4 Task Episode 被剔除，0 候选；Memory 使用链未观测。未解析证据保留在证据边界，不作为 finding 发出。",
+        "findingRefs": []
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "card-wordcount-hard-rule-conflict",
+      "title": "卡片字数硬性规则在 AGENTS.md 与 link-card 之间三档全部冲突",
+      "severity": "Medium",
+      "reason": "事实：AGENTS.md「输出路由（硬性）」规定卡片字数高质量 600-800 / 中等 400-600 / 低 150-300；link-card SKILL.md「各档位字数指导」规定高质量 200-400 / 中等 300-500 / 低 50-150。三档区间互不重叠或仅部分重叠，双方都自称约束同一产物（卡片通知字数）且都标注为硬性。推断：Agent 依加载哪份文档会产出不同长度的卡片。Owner：AGENTS.md 与 link-card SKILL.md（同一规则被复制后已漂移）。不确定性：无会话证据表明该冲突已造成实际错误行为，属文本层矛盾。",
+      "expectedOutput": [
+        "让下一个 Agent 从单一权威来源读到唯一一组卡片字数区间，消除加载顺序导致的行为分叉。"
+      ],
+      "expectedArtifact": "Rules",
+      "aiFixPrompt": "/better-harness fix this issue\n\nAGENTS.md「输出路由（硬性）」与 link-card SKILL.md「各档位字数指导」对卡片三档字数给出冲突的硬性区间。选定一份为权威真值源，另一份改为引用它而非复制数值，使高/中/低三档字数在两份文档中一致。\n\n## Validation\n\n- 对比两份文档的三档字数区间，确认完全一致或单向引用\n- 确认没有第二处复制了同一组字数阈值",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    },
+    {
+      "id": "scoring-exception-set-mismatch",
+      "title": "评分例外集在 AGENTS.md 与 link-card 之间不一致",
+      "severity": "Low",
+      "reason": "事实：AGENTS.md 声明「唯一显式例外是 仅评分 <URL>」，但 link-card SKILL.md [0.5] 定义了第二个跳过评分的例外——阮一峰《科技爱好者周刊》快通道在评分之前直接跳过 content-scoring、不发评分卡。推断：AGENTS.md 的「唯一例外」表述与 link-card 的实际例外集不符，Agent 读到 AGENTS.md 可能误认为周刊也须评分。Owner：AGENTS.md 与 link-card SKILL.md。不确定性：两者可能是分阶段演进的滞后，无运行时证据表明已错误路由。",
+      "expectedOutput": [
+        "让下一个 Agent 从 AGENTS.md 读到完整、与实现一致的评分例外集。"
+      ],
+      "expectedArtifact": "Rules",
+      "aiFixPrompt": "/better-harness fix this issue\n\nAGENTS.md 声明评分的「唯一显式例外是 仅评分」，但 link-card SKILL.md [0.5] 定义了第二个跳过评分的专项快通道例外。更新 AGENTS.md 使其例外集与 link-card 实际实现一致（明确列出仅评分与专项文体快通道两类例外），或统一到单一权威描述。\n\n## Validation\n\n- 确认 AGENTS.md 对评分例外的列举与 link-card [0.5] 的实际例外一致\n- 确认没有其他文档声称评分只有单一例外",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    }
+  ]
+}

@@ -59,11 +59,11 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
         ], "yellow", "需要完整正文" if status == "needs_full_text" else "评分待复核")
 
     relevance = result.get("relevance_score")
-    relevance_value = f"+{relevance:.1f}" if isinstance(relevance, (int, float)) else "-"
-    relevance_label = "相关性" if isinstance(relevance, (int, float)) else "相关性\n未计算"
+    relevance_value = f"+{relevance:.1f}" if isinstance(relevance, (int, float)) else result.get("priority_label", "-")
+    relevance_label = "相关性"
     interest = result.get("interest_score")
-    interest_value = f"+{interest:.1f}" if isinstance(interest, (int, float)) else "-"
-    interest_label = "兴趣" if isinstance(interest, (int, float)) else "兴趣\n未计算"
+    interest_value = f"+{interest:.1f}" if isinstance(interest, (int, float)) else result.get("interest_label", "-")
+    interest_label = "兴趣"
     elements = [
         {
             "tag": "column_set",
