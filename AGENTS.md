@@ -13,8 +13,8 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 **收到任何链接时，必须走 link-card 流程，以卡片 + bot 身份回复。禁止纯文本回复。**
 
 link-card 流程：
-1. **抓取**：按链接类型选择抓取方式（微信公众号/即刻/通用网页）
-2. **内容质量判断**：统一调 `content-scoring` v3.2，不分来源；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
+1. **抓取**：按链接类型选择抓取方式；微信公众号评分只调用一次 `scripts/prepare_scoring_run.py <URL>`，不得先单独运行 `wechat-article-to-markdown`
+2. **内容质量判断**：统一调 `content-scoring` v3.14，不分来源；质量模型只读去身份正文与通用数值语义，锚点仅用于事后闭卷回归；脚本应用反证封顶并计算总分与路由；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
 这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。唯一显式例外是 `仅评分 <URL>`：保留真实路由，但发完评分卡后不进入精读。
@@ -25,7 +25,7 @@ link-card 流程：
 
 ### 内容质量判断（核心）
 
-抓取后，统一调用 `content-scoring` v3.2（不分来源）。质量阶段输出四维数值与原文主张证据；先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.14（不分来源）。质量阶段按通用中文语义为四维各做一次数值判断并输出原文主张证据，由脚本计算总分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
@@ -38,10 +38,10 @@ link-card 流程：
 
 按 `.agents/skills/long-read/SKILL.md` 执行，不跳过任何步骤：
 
-1. **抓取正文**：`wechat-article-to-markdown` skill 直接抓取（最快路径，不要用其他方式）
+1. **抓取正文**：进入 long-read 后，`wechat-article-to-markdown` skill 直接抓取（最快路径，不要用其他方式）；这条不适用于前置评分抓取
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
 3. **独立解码**：Evidence 完成后，`article-decode` 在隔离上下文中完整运行；不输出骨架或单独 X 光四层
-4. **文字深度链路**：各 ljg 在相互不可见的隔离上下文中运行；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`，不得用相关性抬高深度
+4. **文字深度链路**：各 ljg 在相互不可见的隔离上下文中运行；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度
 5. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；生成飞书文档后私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`，只发一次）
    - `ljg_card=true` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
 
@@ -86,9 +86,10 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 精读文档结论先行，使用 Docx XML 原生排版，评分不得埋在文末。
 
-- 顶部：两列评分表（`quality_score + quality_label`、`relevance_score + priority_label`；不可用则如实标注）+ 全文唯一 `light-yellow` 核心结论高亮块
+- 顶部：三列评分表（`quality_score + quality_label`、`relevance_score + priority_label`、`interest_score + interest_label`；不可用则如实标注）
+- 原文金句 + 原文链接（紧跟评分表，作为溯源入口）
+- 全文唯一 `light-yellow` 核心结论高亮块
 - 主文：真正的核心 → 基石/边缘/暗流 → 与作者对话 → 最值得深读之处 → 可选的对飞鱼意义（≤50 字）
-- 原文金句 + 原文链接（附录上方）
 - 附录：先 200~500 字导言（ljg 完整原稿的摘要），再各文字 ljg 完整原稿（不限字数）
 - 文末：必要事实（若有）
 - 单段可见文本不超过 100 字；并列信息用列表，真实对比或数据才用不超过 4 列的表格

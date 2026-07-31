@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Content Scoring v3.2 deterministic calculator.
+"""Content Scoring deterministic calculator.
 
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import re
@@ -31,6 +32,7 @@ QUALITY_VERSION = POLICY["versions"]["quality"]
 RELEVANCE_VERSION = POLICY["versions"]["relevance"]
 DIMENSION_SCORES = {Decimal(str(value)) for value in POLICY["dimension_scores"]}
 QUALITY_DIMENSIONS = POLICY["quality_dimensions"]
+QUALITY_DISQUALIFIERS = POLICY["quality_disqualifiers"]
 CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
@@ -68,6 +70,20 @@ def _nonempty(value) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+QUOTE_EQUIVALENTS = str.maketrans("“”‘’", "\"\"''")
+
+
+def _resolve_exact_quote(quote: str, source_text: str) -> str | None:
+    if quote in source_text:
+        return quote
+    canonical_quote = quote.translate(QUOTE_EQUIVALENTS)
+    canonical_source = source_text.translate(QUOTE_EQUIVALENTS)
+    if canonical_source.count(canonical_quote) != 1:
+        return None
+    start = canonical_source.index(canonical_quote)
+    return source_text[start:start + len(quote)]
+
+
 def _validate_claims(claims, source_text: str) -> list[str]:
     errors = []
     if not isinstance(claims, list):
@@ -102,13 +118,39 @@ def _validate_claims(claims, source_text: str) -> list[str]:
         if not _nonempty(claim.get("claim")):
             errors.append(f"{prefix}.claim is required")
         quote = claim.get("source_quote")
-        if not _nonempty(quote) or quote not in source_text:
+        exact_quote = _resolve_exact_quote(quote, source_text) if _nonempty(quote) else None
+        if exact_quote is None:
             errors.append(f"{prefix}.source_quote must be an exact source substring")
+        else:
+            claim["source_quote"] = exact_quote
         if claim.get("support") not in SUPPORT_LEVELS:
             errors.append(f"{prefix}.support is invalid")
         if claim.get("uncertainty") is not None and not isinstance(claim.get("uncertainty"), str):
             errors.append(f"{prefix}.uncertainty must be string or null")
     return errors
+
+
+def _quality_level_score(key: str, item: dict) -> tuple[float | None, list[str]]:
+    errors = []
+    level = item.get("level")
+    if not isinstance(level, (int, float)) or isinstance(level, bool) or Decimal(str(level)) not in DIMENSION_SCORES:
+        return None, [f"dimensions.{key}.level is invalid"]
+    if "passed_levels" in item:
+        errors.append(f"dimensions.{key}.passed_levels is obsolete")
+    if "semantic_floor" in item:
+        errors.append(f"dimensions.{key}.semantic_floor is obsolete")
+    if "score" in item:
+        errors.append(f"dimensions.{key}.score is script-owned")
+    disqualifiers = item.get("disqualifiers")
+    if not isinstance(disqualifiers, list) or any(not isinstance(value, str) for value in disqualifiers) or len(disqualifiers) != len(set(disqualifiers)):
+        return None, errors + [f"dimensions.{key}.disqualifiers must be a unique string array"]
+    unknown_disqualifiers = sorted(set(disqualifiers) - set(QUALITY_DISQUALIFIERS[key]))
+    if unknown_disqualifiers:
+        errors.append(f"dimensions.{key}.disqualifiers contains unknown values: {unknown_disqualifiers}")
+    computed = Decimal(str(level))
+    for value in set(disqualifiers) & set(QUALITY_DISQUALIFIERS[key]):
+        computed = min(computed, Decimal(str(QUALITY_DISQUALIFIERS[key][value])))
+    return float(computed), errors
 
 
 def _validate_dimensions(dimensions, expected: dict, claim_ids: set[str], relevance=False) -> list[str]:
@@ -123,9 +165,15 @@ def _validate_dimensions(dimensions, expected: dict, claim_ids: set[str], releva
         if not isinstance(item, dict):
             errors.append(f"dimensions.{key} must be an object")
             continue
-        dimension_score = item.get("score")
-        if not isinstance(dimension_score, (int, float)) or isinstance(dimension_score, bool) or Decimal(str(dimension_score)) not in DIMENSION_SCORES:
-            errors.append(f"dimensions.{key}.score is invalid")
+        if relevance:
+            dimension_score = item.get("score")
+            if not isinstance(dimension_score, (int, float)) or isinstance(dimension_score, bool) or Decimal(str(dimension_score)) not in DIMENSION_SCORES:
+                errors.append(f"dimensions.{key}.score is invalid")
+        else:
+            dimension_score, level_errors = _quality_level_score(key, item)
+            errors += level_errors
+            if dimension_score is not None and not level_errors:
+                item["score"] = dimension_score
         if not _nonempty(item.get("rationale")):
             errors.append(f"dimensions.{key}.rationale is required")
         if relevance:
@@ -144,6 +192,7 @@ def _validate_dimensions(dimensions, expected: dict, claim_ids: set[str], releva
 def _quality_attempt(output: dict, source_text: str) -> dict:
     if not isinstance(output, dict):
         raise ValueError("quality output must be an object")
+    output = deepcopy(output)
     if output.get("schema_version") != QUALITY_VERSION:
         raise ValueError(f"quality schema_version must be {QUALITY_VERSION}")
     if output.get("source_status") != "complete":
@@ -158,16 +207,8 @@ def _quality_attempt(output: dict, source_text: str) -> dict:
         if isinstance(claim, dict) and isinstance(claim.get("id"), str)
     } if isinstance(claims, list) else set()
     errors += _validate_dimensions(output.get("dimensions"), QUALITY_DIMENSIONS, claim_ids)
-    calibration = output.get("calibration")
-    if not isinstance(calibration, dict):
-        errors.append("calibration must be an object")
-    else:
-        if calibration.get("closest_anchor") not in {f"A{i}" for i in range(1, 7)}:
-            errors.append("calibration.closest_anchor must be A1..A6")
-        if not isinstance(calibration.get("at_least_seven"), bool):
-            errors.append("calibration.at_least_seven must be boolean")
-        if not _nonempty(calibration.get("comparison")):
-            errors.append("calibration.comparison is required")
+    if "calibration" in output:
+        errors.append("calibration is forbidden in closed-book quality output")
     confidence = output.get("domain_confidence")
     if confidence not in {"high", "medium", "low"}:
         errors.append("domain_confidence is invalid")
@@ -186,8 +227,6 @@ def _quality_attempt(output: dict, source_text: str) -> dict:
     retry_reasons = []
     if confidence == "low":
         retry_reasons.append("low_domain_confidence")
-    if calibration["at_least_seven"] and score_value < float(POLICY["route"]["long_read_threshold"]):
-        retry_reasons.append("anchor_floor_conflict")
     return {"score": score_value, "raw": raw, "output": output, "retry_reasons": retry_reasons}
 
 
@@ -221,7 +260,6 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
         "claims": output.get("claim_ledger") if isinstance(output.get("claim_ledger"), list) else [],
         "quality_dimensions": output.get("dimensions") if isinstance(output.get("dimensions"), dict) else {},
         "relevance_dimensions": {},
-        "calibration": output.get("calibration") if isinstance(output.get("calibration"), dict) else {},
         "conclusion": output.get("conclusion") if isinstance(output.get("conclusion"), str) else "",
         "questions": questions[:3] if isinstance(questions, list) else [],
         "issues": issues,
@@ -233,22 +271,30 @@ def _validate_context(context_text: str) -> bool:
 
 
 def _relevance_result(output, context_text: str | None):
+    """双轴相关性：relevance_score（元主线命中）+ interest_score（领域兴趣），各自封顶后相加为总 bonus。"""
     if output is None or context_text is None or not _validate_context(context_text):
-        return None, "unavailable", {}, ["relevance_context_unavailable"]
+        return None, None, "unavailable", {}, ["relevance_context_unavailable"]
     errors = []
     if not isinstance(output, dict) or output.get("schema_version") != RELEVANCE_VERSION:
         errors.append(f"relevance schema_version must be {RELEVANCE_VERSION}")
     else:
         if any(key in output for key in ("quality_score", "decision_score")):
             errors.append("relevance output must not receive quality or decision scores")
-        score = output.get("score")
-        if not isinstance(score, (int, float)) or isinstance(score, bool):
-            errors.append("relevance score must be a number")
+        rel_raw = output.get("relevance_score")
+        int_raw = output.get("interest_score")
+        for name, raw in (("relevance_score", rel_raw), ("interest_score", int_raw)):
+            if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+                errors.append(f"relevance {name} must be a number")
         matched = output.get("matched_mainlines")
         if not isinstance(matched, list) or any(not isinstance(m, str) or not m.strip() for m in matched):
             errors.append("relevance matched_mainlines must be an array of non-empty strings")
-        if isinstance(score, (int, float)) and not isinstance(score, bool) and score > 0 and not matched:
-            errors.append("relevance score>0 requires non-empty matched_mainlines")
+        matched_interests = output.get("matched_interests")
+        if not isinstance(matched_interests, list) or any(not isinstance(m, str) or not m.strip() for m in matched_interests):
+            errors.append("relevance matched_interests must be an array of non-empty strings")
+        if isinstance(rel_raw, (int, float)) and not isinstance(rel_raw, bool) and rel_raw > 0 and not matched:
+            errors.append("relevance relevance_score>0 requires non-empty matched_mainlines")
+        if isinstance(int_raw, (int, float)) and not isinstance(int_raw, bool) and int_raw > 0 and not matched_interests:
+            errors.append("relevance interest_score>0 requires non-empty matched_interests")
         if not _nonempty(output.get("rationale")):
             errors.append("relevance rationale is required")
         if output.get("confidence") not in {"high", "medium", "low"}:
@@ -257,12 +303,19 @@ def _relevance_result(output, context_text: str | None):
             errors.append("relevance conclusion is required")
     confidence = output.get("confidence") if isinstance(output, dict) else None
     if errors or confidence == "low":
-        return None, "unavailable", {}, errors or ["low_relevance_confidence"]
-    max_bonus = Decimal(str(POLICY["relevance_bonus"]["max"]))
-    raw = Decimal(str(output["score"]))
-    bonus = Decimal(str(round1(max(Decimal("0"), min(raw, max_bonus)))))
-    info = {"score": float(bonus), "matched_mainlines": output.get("matched_mainlines", []), "rationale": output.get("rationale")}
-    return bonus, confidence, info, []
+        return None, None, "unavailable", {}, errors or ["low_relevance_confidence"]
+    rel_max = Decimal(str(POLICY["relevance_bonus"]["relevance_max"]))
+    int_max = Decimal(str(POLICY["relevance_bonus"]["interest_max"]))
+    rel_bonus = Decimal(str(round1(max(Decimal("0"), min(Decimal(str(output["relevance_score"])), rel_max)))))
+    int_bonus = Decimal(str(round1(max(Decimal("0"), min(Decimal(str(output["interest_score"])), int_max)))))
+    info = {
+        "relevance_score": float(rel_bonus),
+        "interest_score": float(int_bonus),
+        "matched_mainlines": output.get("matched_mainlines", []),
+        "matched_interests": output.get("matched_interests", []),
+        "rationale": output.get("rationale"),
+    }
+    return rel_bonus, int_bonus, confidence, info, []
 
 
 def _quality_label(score_value: float) -> str:
@@ -279,6 +332,15 @@ def _priority_label(score_value) -> str:
         if score_value >= float(band["minimum"]):
             return band["label"]
     raise ValueError("priority policy has no catch-all band")
+
+
+def _interest_label(score_value) -> str:
+    if score_value is None:
+        return "兴趣不可用"
+    for band in POLICY["interest_bands"]:
+        if score_value >= float(band["minimum"]):
+            return band["label"]
+    raise ValueError("interest policy has no catch-all band")
 
 
 def _depth(score_value: float):
@@ -340,8 +402,8 @@ def score(
 
     floor = float(POLICY["route"]["quality_floor"])
     threshold = float(POLICY["route"]["long_read_threshold"])
-    relevance_can_change_route = floor <= quality_score < threshold
-    if relevance_can_change_route and relevance_output is None and not relevance_unavailable:
+    relevance_needed = quality_score >= floor
+    if relevance_needed and relevance_output is None and not relevance_unavailable:
         return {
             "score_version": SCORE_VERSION,
             "quality_version": QUALITY_VERSION,
@@ -356,37 +418,40 @@ def score(
             "decision_score": None,
             "quality_label": _quality_label(quality_score),
             "priority_label": "待计算",
+            "interest_label": "待计算",
             "route": None,
             "ljg_range": None,
             "ljg_card": False,
             "claims": effective_quality_output["claim_ledger"],
             "quality_dimensions": effective_quality_output["dimensions"],
             "relevance_dimensions": {},
-            "calibration": effective_quality_output["calibration"],
             "conclusion": effective_quality_output.get("conclusion", ""),
             "questions": list(effective_quality_output.get("questions", []))[:3],
             "issues": issues,
         }
 
-    relevance_intentionally_skipped = not relevance_can_change_route
+    relevance_intentionally_skipped = not relevance_needed
     if relevance_intentionally_skipped:
-        relevance_bonus, relevance_confidence, relevance_info, relevance_issues = None, "unavailable", {}, []
+        rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = None, None, "unavailable", {}, []
     elif relevance_unavailable:
-        relevance_bonus, relevance_confidence, relevance_info, relevance_issues = None, "unavailable", {}, ["relevance_context_unavailable"]
+        rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = None, None, "unavailable", {}, ["relevance_context_unavailable"]
     else:
-        relevance_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(relevance_output, context_text)
+        rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(relevance_output, context_text)
     issues += relevance_issues
-    if relevance_bonus is None:
+    if rel_bonus is None:
         decision_score = quality_score
         relevance_score = None
+        interest_score = None
         context_fp = None
     else:
-        bonus = float(relevance_bonus) if quality_score >= floor else 0.0
-        decision_score = round1(Decimal(str(quality_score)) + Decimal(str(bonus)))
-        relevance_score = bonus
+        rel_eff = float(rel_bonus) if quality_score >= floor else 0.0
+        int_eff = float(int_bonus) if quality_score >= floor else 0.0
+        decision_score = round1(Decimal(str(quality_score)) + Decimal(str(rel_eff)) + Decimal(str(int_eff)))
+        relevance_score = rel_eff
+        interest_score = int_eff
         context_fp = context_fingerprint(fp, context_text)
     route = "long_read" if quality_score >= floor and decision_score >= threshold else "card"
-    depth, cast_card = _depth(quality_score)
+    depth, cast_card = _depth(decision_score)
     return {
         "score_version": SCORE_VERSION,
         "quality_version": QUALITY_VERSION,
@@ -397,17 +462,18 @@ def score(
         "quality_score": quality_score,
         "quality_confidence": quality_confidence,
         "relevance_score": relevance_score,
+        "interest_score": interest_score,
         "relevance_confidence": relevance_confidence,
         "decision_score": decision_score,
         "quality_label": _quality_label(quality_score),
         "priority_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _priority_label(relevance_score),
+        "interest_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _interest_label(interest_score),
         "route": route,
         "ljg_range": depth if route == "long_read" else None,
         "ljg_card": cast_card and route == "long_read",
         "claims": effective_quality_output["claim_ledger"],
         "quality_dimensions": effective_quality_output["dimensions"],
         "relevance_dimensions": relevance_info,
-        "calibration": effective_quality_output["calibration"],
         "conclusion": effective_quality_output.get("conclusion", ""),
         "questions": list(effective_quality_output.get("questions", []))[:3],
         "issues": issues,
@@ -419,6 +485,9 @@ def self_check() -> bool:
     assert content_fingerprint("a \n b") == content_fingerprint("a b")
     assert sum(Decimal(str(item["weight"])) for item in QUALITY_DIMENSIONS.values()) == Decimal("1.00")
     assert Decimal(str(POLICY["relevance_bonus"]["max"])) > Decimal("0")
+    assert Decimal(str(POLICY["relevance_bonus"]["relevance_max"])) > Decimal("0")
+    assert Decimal(str(POLICY["relevance_bonus"]["interest_max"])) > Decimal("0")
+    assert Decimal(str(POLICY["relevance_bonus"]["relevance_max"])) + Decimal(str(POLICY["relevance_bonus"]["interest_max"])) <= Decimal(str(POLICY["relevance_bonus"]["max"]))
     print("self-check: ok")
     return True
 

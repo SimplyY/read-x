@@ -12,12 +12,45 @@ from urllib.parse import urlparse
 
 ANCHORS = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/anchors.md"
 HEADING = re.compile(r"^## A\d+｜.*$", re.MULTILINE)
+SOURCE_METADATA = re.compile(r"^>\s*(?:公众号|发布时间|原文链接|作者|日期)\s*[:：]")
+MARKDOWN_IMAGE = re.compile(r"^!\[[^]]*\]\([^)]*\).*$")
+REFERENCE_URL = re.compile(r"^(`?\[\d+\]`?\s*[^:：]*?)\s*[:：]\s*https?://\S+\s*$")
+VIDEO_NOISE = (
+    "Your browser does not support video tags",
+    "已关注Follow  Replay",
+    "观看更多转载,",
+    "退出全屏切换到竖屏全屏退出全屏",
+)
 
 
 def article_key(url: str) -> str:
     parsed = urlparse(url.strip())
     parts = [part for part in parsed.path.split("/") if part]
     return parts[-1] if parsed.netloc.endswith("weixin.qq.com") and len(parts) >= 2 and parts[-2] == "s" else url.strip()
+
+
+def blind_article_source(source: str) -> str:
+    """Remove target identity and extractor-only markup, keeping article prose unchanged."""
+    lines = source.splitlines()
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index < len(lines) and lines[index].startswith("# "):
+        index += 1
+    while index < len(lines) and (not lines[index].strip() or SOURCE_METADATA.match(lines[index])):
+        index += 1
+    if index < len(lines) and lines[index].strip() == "---":
+        index += 1
+    body = []
+    for line in lines[index:]:
+        stripped = line.strip()
+        if MARKDOWN_IMAGE.match(stripped) or any(marker in line for marker in VIDEO_NOISE):
+            continue
+        if stripped in {"0/0", "继续观看"}:
+            continue
+        reference = REFERENCE_URL.match(stripped)
+        body.append(reference.group(1) if reference else line)
+    return "\n".join(body).lstrip("\n") + ("\n" if body else "")
 
 
 def build_view(target_url: str, source: str) -> tuple[str, bool]:
@@ -59,15 +92,29 @@ def build_view(target_url: str, source: str) -> tuple[str, bool]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("target_url")
+    parser.add_argument("target_url", nargs="?")
     parser.add_argument("--source", type=Path, default=ANCHORS)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--article-source", type=Path)
+    parser.add_argument("--blind-output", type=Path)
+    parser.add_argument("--blind-only", action="store_true")
     args = parser.parse_args()
+    if bool(args.article_source) != bool(args.blind_output):
+        parser.error("--article-source and --blind-output must be used together")
+    if args.blind_only:
+        if not args.article_source or args.target_url or args.output:
+            parser.error("--blind-only requires --article-source and --blind-output only")
+        args.blind_output.write_text(blind_article_source(args.article_source.read_text(encoding="utf-8")), encoding="utf-8")
+        return 0
+    if not args.target_url:
+        parser.error("target_url is required unless --blind-only is used")
     view, excluded = build_view(args.target_url, args.source.read_text(encoding="utf-8"))
     if args.output:
         args.output.write_text(view, encoding="utf-8")
     else:
         sys.stdout.write(view)
+    if args.article_source:
+        args.blind_output.write_text(blind_article_source(args.article_source.read_text(encoding="utf-8")), encoding="utf-8")
     print(f"anchor-view: count={view.count(chr(10) + '## A')}", file=sys.stderr)
     return 0
 

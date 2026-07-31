@@ -1,8 +1,8 @@
 {
   "versions": {
-    "score": "3.2",
-    "quality": "3.2",
-    "relevance": "2.0"
+    "score": "3.14",
+    "quality": "3.14",
+    "relevance": "3.0"
   },
   "dimension_scores": [0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10],
   "quality_dimensions": {
@@ -23,12 +23,20 @@
       "weight": 0.15
     }
   },
+  "quality_disqualifiers": {
+    "evidence_quality": {"only_illustrative_or_anecdotal": 6},
+    "insight_explanatory": {},
+    "transfer_durability": {},
+    "information_efficiency": {"substantial_nonargument_section": 6}
+  },
   "evidence_caps": [
     {"maximum_dimension_score": 2, "quality_cap": 5.9},
     {"maximum_dimension_score": 4, "quality_cap": 6.9}
   ],
   "relevance_bonus": {
-    "max": 1.2
+    "max": 1.2,
+    "relevance_max": 0.6,
+    "interest_max": 0.6
   },
   "route": {
     "quality_floor": 6.0,
@@ -98,6 +106,20 @@
     {
       "minimum": 0.0,
       "label": "低相关"
+    }
+  ],
+  "interest_bands": [
+    {
+      "minimum": 0.4,
+      "label": "高兴趣"
+    },
+    {
+      "minimum": 0.2,
+      "label": "中兴趣"
+    },
+    {
+      "minimum": 0.0,
+      "label": "低兴趣"
     }
   ],
   "claims": {

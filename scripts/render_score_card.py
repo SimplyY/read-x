@@ -59,8 +59,11 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
         ], "yellow", "需要完整正文" if status == "needs_full_text" else "评分待复核")
 
     relevance = result.get("relevance_score")
-    relevance_value = f"{relevance:.1f}" if isinstance(relevance, (int, float)) else "—"
-    relevance_label = "相关性" if isinstance(relevance, (int, float)) else f"相关性\n{result.get('priority_label', '不可用')}"
+    relevance_value = f"+{relevance:.1f}" if isinstance(relevance, (int, float)) else "-"
+    relevance_label = "相关性" if isinstance(relevance, (int, float)) else "相关性\n未计算"
+    interest = result.get("interest_score")
+    interest_value = f"+{interest:.1f}" if isinstance(interest, (int, float)) else "-"
+    interest_label = "兴趣" if isinstance(interest, (int, float)) else "兴趣\n未计算"
     elements = [
         {
             "tag": "column_set",
@@ -70,6 +73,7 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
             "columns": [
                 _metric("质量", f"{result['quality_score']:.1f}"),
                 _metric(relevance_label, relevance_value),
+                _metric(interest_label, interest_value),
                 _metric("决策", f"{result['decision_score']:.1f}"),
             ],
         },
