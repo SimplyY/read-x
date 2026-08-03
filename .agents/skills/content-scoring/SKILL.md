@@ -3,9 +3,9 @@ name: content-scoring
 description: "文章内容评分引擎：抓取到正文后，先基于匿名正文与通用数值语义闭卷计算独立质量分，再按需用 YWNext full.md 隔离计算个人相关性，最后由确定性脚本输出路由与精读深度。七篇锚点仅用于事后回归；正文不完整或低置信时 fail closed。"
 ---
 
-# Content Scoring v3.14
+# Content Scoring v3.15
 
-把三个问题分开：文章本身好不好、此刻与读者是否相关、是否值得投入 long-read。模型只按中文语义选择有证据的四维数值档；合法值、权重、硬门、总分与路由由 `scripts/content_scoring.py` 从 `references/scoring-policy.json` 确定。
+把三个问题分开：文章本身好不好、此刻与读者是否相关、是否值得投入 long-read。模型一次按中文语义选择有原文支撑的三维数值档；合法值、权重、硬门、总分与路由由 `scripts/content_scoring.py` 从 `references/scoring-policy.json` 确定。
 
 ## 不可违反的边界
 
@@ -20,7 +20,7 @@ description: "文章内容评分引擎：抓取到正文后，先基于匿名正
 
 ```text
 link-card 抓取正文
-  -> 质量评分隔离上下文：quality_output v3.14（模型按通用中文语义一次选择四维分，脚本校验并计算总分）
+  -> 质量评分隔离上下文：quality_output v3.15（模型按通用中文语义一次选择三维分，脚本校验并计算总分）
   -> content_scoring.py 校验引用、算 quality_score、应用证据硬门
   -> 必要时 fresh-context 质量重评一次
   -> content_scoring.py 返回 scored 或 needs_relevance
@@ -31,7 +31,7 @@ link-card 抓取正文
 
 ## 质量阶段
 
-调用方先生成 `blind-source.md`，再调用 `scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。该脚本只把匿名正文与当前维度的 `quality-runtime.md` 语义切片发送到既有本地 MoonBridge `/v1/responses`，固定使用当前 `glm-5.2`；该模型没有可调推理等级，脚本不传推理覆盖。四维判级、洞察独立复核与主张预算在同一命令内并行；模型只返回分档和硬反证，脚本从原文确定性选取连续引用并组装质量 JSON。请求使用 JSON Schema，`store=false`；本地运行时若返回 fenced JSON、标量或单键分数，脚本只正规化该等价数值形状，其他偏差失败关闭。输入不含 URL、标题、作者、日期、用户意见、锚点、目标区间、主代理预判或前序对话。`quality-runtime.md` 是主张预算、四维数值语义和硬反证的唯一运行时真值。
+调用方先生成 `blind-source.md`，再调用 `scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。该脚本把匿名正文与 `quality-runtime.md` 的三维数值语义一次发送到既有本地 MoonBridge `/v1/responses`，固定使用当前 `glm-5.2`；该模型没有可调推理等级，脚本不传推理覆盖。模型在一个 JSON 中直接返回证据、洞察、迁移三维等级及其原文单元、全局元数据和一次主张预算；脚本校验等级与逐字引用并组装质量 JSON。请求使用 JSON Schema，`store=false`；契约偏差失败关闭。输入不含 URL、标题、作者、日期、用户意见、锚点、目标区间、主代理预判或前序对话。
 
 评分起点后执行路径已经确定，不再现场设计：同一响应并行发送评分起点并运行上述一次性质量命令；主 Agent 禁止读取匿名正文或质量运行契约。过程消息失败则丢弃模型结果；本地运行时不可用、请求超时或未生成合法文件时直接失败关闭，不得退回主上下文评分或嵌套 `codex exec`。命令完成后的下一次响应只运行 `content_scoring.py`；若结果不是 `needs_relevance`，同一命令立即渲染并发送卡片，只有边界结果才返回主代理继续相关性。禁止能力探测、搜索实现、创建 plan/任务文件、重读 Skill/schema/policy/脚本、用 shell 逐条检查引用或现场修 JSON。
 
@@ -119,7 +119,7 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 - 质量结构、引用或 schema 无效：`needs_review`。
 - YWNext 缺失、损坏：边界文章用 `--relevance-unavailable` 回退质量分并结束；过期仅降权。
 - 相关性输出无效或 low：不重试阻塞，回退质量分。
-- v3.13 及更旧质量输出：拒绝复用；不得映射为 v3.14。
+- v3.14 及更旧质量输出：拒绝复用；不得映射为 v3.15。
 
 ## 修改后验证
 

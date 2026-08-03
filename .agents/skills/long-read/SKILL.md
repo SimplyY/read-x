@@ -1,6 +1,6 @@
 ---
 name: long-read
-description: "长文精读编排器：收到微信公众号、飞书文档、网页链接、GitHub 仓库或粘贴长文后，建立客观 evidence，消费 content-scoring 的 route、ljg_range 与 ljg_card，再让 article-decode 和选中的文字深度 Skill 在隔离上下文中独立运行，最后去重拼接为高密度 Docx XML 飞书文档并私聊交付给触发者。"
+description: "长文精读编排器：收到微信公众号、飞书文档、网页链接、GitHub 仓库或粘贴长文后，建立客观 evidence，消费 content-scoring 的 route、ljg_range 与 ljg_card，再通过独立 HTTP 请求并行运行 article-decode 和选中的文字深度 Skill，最后去重拼接为高密度 Docx XML 飞书文档并私聊交付给触发者。"
 ---
 
 # long-read：长文精读编排器
@@ -12,8 +12,7 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
 ```text
 原文 -> Evidence
      -> 消费 content-scoring 的 scoring_result（直接使用 ljg_range）
-     -> article-decode（隔离上下文）
-     -> 0~3 个文字 ljg（各自隔离上下文）
+     -> article-decode + 0~3 个文字 ljg（独立 HTTP 请求，并行）
      -> 主 Agent 摘取、去重、排版为 Docx XML
      -> 创建文档并发送卡片（群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次）
      -> ljg_card=true 时再运行 ljg-card，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）
@@ -31,22 +30,31 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 ## 3. 隔离运行
 
-主 Agent 用角色扮演实现隔离，不依赖 SubAgent：每次运行 `article-decode` 或某条 ljg 前，进入该 Skill 的独立角色，只接收下文规定的输入，不复用质量评分解释、不复用其他 ljg 或 `article-decode` 的输出、不把用户画像喂给 ljg。隔离靠纪律（只喂规定输入、不串上下文），不靠进程机制。
+只通过 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 发送独立 `glm-5.2` 请求，固定 `store=false`，最多四请求并行。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
 
-### article-decode
+为每条文字 ljg 创建只含唯一问题的独立文件，然后运行：
 
-使用正式 `article-decode` Skill。主 Agent 进入解码角色，只接收完整原文与客观 Evidence，不接收用户画像、既有摘要、评分解释或任何 ljg 输出，独立产出文章真正的核心、基石/边缘/暗流、思想结构、与作者对话和最值得深读的论证。
+```bash
+python3 .agents/skills/long-read/scripts/run_isolated_analyses.py \
+  --source <run_dir>/source.md \
+  --evidence <run_dir>/evidence.json \
+  --output-dir <run_dir>/analyses \
+  --summary-file <run_dir>/summary.json \
+  --task ljg-think <run_dir>/question-01.md \
+  --task ljg-qa <run_dir>/question-02.md
+```
 
-### 文字 ljg
+`--task` 按实际选择使用 0~3 次。每次消息先用 `mktemp -d /tmp/readx-longread.XXXXXX` 建立独立 `run_dir`，禁止复用固定 `.wx_decode.md` 或 `.wx_ljg_*.md`。脚本显式禁用环境 HTTP 代理，确保回环请求不外泄；单行 JSON 摘要及 `summary.json` 只包含任务状态、耗时、usage、Skill 哈希和输出路径。主 Agent 只读取摘要及成功生成的 Markdown。
 
-按 `references/routing.md` 选择。每条 Skill 在相互不可见的角色扮演中运行，只接收：
+### 输入边界
 
-1. 完整原文；
-2. 客观 Evidence；
-3. 分配给它的唯一分析问题；
-4. 自身 `SKILL.md`。
+- `article-decode` 请求只含完整原文与客观 Evidence；
+- 每条文字 ljg 请求只含完整原文、客观 Evidence 和分配给它的唯一问题；
+- 所有请求都禁止用户画像、评分解释、其他分析结果、主 Agent 预设结论和前序对话。
 
-不得给它 `article-decode`、其他 ljg 或用户画像输出。一条 Skill 失败时保留其他结果继续交付。
+脚本在发请求前严格校验 Evidence Schema、拒绝额外字段，并确认所有逐字引文确实存在于原文；任一校验失败时不发 HTTP。模型输出含 shell 命令、本地写入路径、语音通知残留，或缺少最低正文与关键形式时，该任务失败且不落盘。
+
+脚本返回 `partial` 时跳过失败的文字 ljg，保留其他结果继续交付；`article-decode` 失败时按 `references/routing.md` 降级。不得把已有输出目录用于重跑，避免旧文件冒充本轮结果。
 
 ## 4. 拼接，不重写
 
@@ -74,7 +82,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 5. 基石 / 边缘 / 暗流；
 6. 与作者对话；
 7. 最值得深读之处；
-8. 可选「对飞鱼的意义」，有独立增量才写，最多 80 字；
+8. 可选「对飞鱼的意义」，有独立增量才写，最多 50 字；
 9. 附录：独立深度分析；
 10. 必要事实（若有，文末）。
 
@@ -106,7 +114,9 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 自检
 
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
-- [ ] `article-decode` 与每条文字 ljg 是否真正使用隔离上下文？
+- [ ] `article-decode` 与每条文字 ljg 是否由脚本发出独立 `store=false` HTTP 请求？
+- [ ] 主 Agent 是否未读取分析 Skill、未角色扮演生成、未在失败时回退？
+- [ ] Evidence 是否通过严格 Schema 与逐字引文校验，summary 是否与本轮成功文件一一对应？
 - [ ] 是否无「骨架」和独立「X 光四层」？
 - [ ] 主文与附录是否没有重复结论？
 - [ ] 原文金句是否逐字、总数不超过 8？

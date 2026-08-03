@@ -1,106 +1,151 @@
-#!/Users/yuwei/.local/share/uv/tools/wechat-article-to-markdown/bin/python3
-"""wx_fast: wechat-article-to-markdown 的轻量入口
-- 优先 httpx 直连（~1-3s，零浏览器开销）
-- 反爬/验证码时自动回退 Camoufox 浏览器（~9s）
-- 两条路径都跳过图片下载
-"""
-import sys, re, argparse, asyncio, os
+#!/usr/bin/env python3
+"""使用标准库抓取微信文章并转换为 Markdown，不启动浏览器。"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
-
-TOOL_SITE = "/Users/yuwei/.local/share/uv/tools/wechat-article-to-markdown/lib/python3.10/site-packages"
-sys.path.insert(0, TOOL_SITE)
-
-# WeChat articles are direct-connect; drop proxy env vars so httpx does not
-# pick up socks5 ALL_PROXY while socksio is missing in this venv.
-for _k in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
-    os.environ.pop(_k, None)
-
-import httpx
-from bs4 import BeautifulSoup
-from wechat_article_to_markdown import (
-    extract_metadata, process_content, convert_to_markdown, build_markdown
-)
-
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener
 
 
-def _html_to_md(html: str, url: str, label: str = ""):
-    soup = BeautifulSoup(html, "html.parser")
-    meta = extract_metadata(soup, html)
-    if not meta.get("title"):
-        return None, "no_title"
-    content_html, code_blocks, img_urls = process_content(soup)
-    if not content_html or len(content_html) < 200:
-        return None, "no_content"
-    md = convert_to_markdown(content_html, code_blocks)
-    md = re.sub(r'!\[[^\]]*\]\([^)]*\)\n?', '', md)
-    meta["source_url"] = url
-    result = build_markdown(meta, md)
-    print(f"📄 [{label}] 标题: {meta['title']}", file=sys.stderr)
-    print(f"👤 [{label}] 作者: {meta.get('author','')}", file=sys.stderr)
-    print(f"📅 [{label}] 时间: {meta.get('publish_time','')}", file=sys.stderr)
-    print(f"📊 [{label}] Markdown 约 {len(md)} 字符, 跳过 {len(img_urls)} 张图", file=sys.stderr)
-    return result, None
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
 
-def fetch_httpx(url: str):
-    print(f"🔄 尝试 httpx 直连...", file=sys.stderr)
-    r = httpx.get(url, headers={"User-Agent": UA}, follow_redirects=True, timeout=15)
-    r.raise_for_status()
-    return _html_to_md(r.text, url, "httpx")
+class ArticleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+        self.parts: list[str] = []
+        self.capture = False
+        self.depth = 0
+        self.in_pre = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if tag == "meta":
+            key = values.get("property") or values.get("name")
+            if key and values.get("content"):
+                self.meta.setdefault(key, values["content"])
+        if not self.capture:
+            if values.get("id") == "js_content":
+                self.capture, self.depth = True, 1
+            return
+        if tag not in VOID_TAGS:
+            self.depth += 1
+        if tag in {"h1", "h2", "h3", "h4"}:
+            self.parts.append(f"\n\n{'#' * int(tag[1])} ")
+        elif tag == "li":
+            self.parts.append("\n- ")
+        elif tag == "blockquote":
+            self.parts.append("\n> ")
+        elif tag == "pre":
+            self.in_pre = True
+            self.parts.append("\n```\n")
+        elif tag == "br":
+            self.parts.append("\n")
+        elif tag in {"p", "section", "div", "ul", "ol"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.capture:
+            return
+        if tag == "pre":
+            self.in_pre = False
+            self.parts.append("\n```\n")
+        elif tag in {"p", "section", "div", "li", "blockquote", "h1", "h2", "h3", "h4", "ul", "ol"}:
+            self.parts.append("\n")
+        if tag not in VOID_TAGS:
+            self.depth -= 1
+            if self.depth == 0:
+                self.capture = False
+
+    def handle_data(self, data: str) -> None:
+        if not self.capture:
+            return
+        self.parts.append(data if self.in_pre else re.sub(r"\s+", " ", data))
+
+    def markdown(self) -> str:
+        text = "".join(self.parts).replace("\xa0", " ")
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n[ \t]+", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
 
-async def fetch_camoufox(url: str):
-    print(f"🦊 httpx 失败，回退 Camoufox 浏览器...", file=sys.stderr)
-    from camoufox.async_api import AsyncCamoufox
-    async with AsyncCamoufox(headless=True) as browser:
-        page = await browser.new_page()
-        await page.goto(url, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_selector("#js_content", timeout=10000)
-        except Exception:
-            pass
-        await asyncio.sleep(2)
-        html = await page.content()
-    return _html_to_md(html, url, "camoufox")
-
-
-def fetch(url: str, output_path: Path | None = None):
-    # 1) fast path
+def _js_string(source: str, name: str) -> str:
+    match = re.search(rf"(?:var\s+)?{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;", source, re.DOTALL)
+    if not match:
+        return ""
     try:
-        result, err = fetch_httpx(url)
-        if result:
-            return result, "httpx"
-        print(f"⚠️  httpx 返回异常({err})，尝试浏览器兜底", file=sys.stderr)
-    except Exception as e:
-        print(f"⚠️  httpx 报错({e})，尝试浏览器兜底", file=sys.stderr)
-
-    # 2) camoufox fallback
-    result, err = asyncio.run(fetch_camoufox(url))
-    if not result:
-        print(f"❌ Camoufox 也失败了({err})，可能文章已删除或需要人工验证", file=sys.stderr)
-        sys.exit(1)
-    return result, "camoufox"
+        return json.loads(f'"{match.group(2)}"')
+    except json.JSONDecodeError:
+        return html.unescape(match.group(2))
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Fast WeChat article fetch (httpx first, Camoufox fallback, no images)")
-    ap.add_argument("url", help="https://mp.weixin.qq.com/s/...")
-    ap.add_argument("-o", "--output", default="-", help="output .md path; default stdout")
-    args = ap.parse_args()
-    out = Path(args.output) if args.output != "-" else None
-    import time
-    t0 = time.time()
-    md, method = fetch(args.url, out)
-    dt = time.time() - t0
-    print(f"⏱️  总耗时 {dt:.1f}s (方式: {method})", file=sys.stderr)
-    if out:
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(md, encoding="utf-8")
-        print(f"✅ 已保存: {out}", file=sys.stderr)
+def parse_article(source: str, url: str) -> str:
+    parser = ArticleParser()
+    parser.feed(source)
+    title = parser.meta.get("og:title") or _js_string(source, "msg_title")
+    author = parser.meta.get("og:article:author") or parser.meta.get("author") or _js_string(source, "nickname")
+    published = parser.meta.get("article:published_time")
+    if not published:
+        timestamp = _js_string(source, "ct")
+        if timestamp.isdigit():
+            published = datetime.fromtimestamp(int(timestamp), timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    body = parser.markdown()
+    if not title:
+        raise ValueError("no_title")
+    if len(body) < 200:
+        raise ValueError("no_content")
+    metadata = [f"# {title}", ""]
+    if author:
+        metadata.append(f"> 公众号: {author}")
+    if published:
+        metadata.append(f"> 发布时间: {published}")
+    metadata.extend([f"> 原文链接: {url}", "", "---", ""])
+    return "\n".join(metadata) + body + "\n"
+
+
+def fetch(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+        raise ValueError("只允许公开的 https://mp.weixin.qq.com/ URL")
+    request = Request(url, headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
+    with build_opener(ProxyHandler({})).open(request, timeout=15) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        source = response.read().decode(charset, errors="replace")
+    return parse_article(source, url)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Fetch WeChat article over HTTP only (no browser, no images)")
+    parser.add_argument("url")
+    parser.add_argument("-o", "--output", default="-")
+    args = parser.parse_args()
+    started = time.monotonic()
+    try:
+        markdown = fetch(args.url)
+    except Exception as exc:
+        print(f"❌ HTTP 抓取失败: {exc}", file=sys.stderr)
+        return 1
+    if args.output == "-":
+        sys.stdout.write(markdown)
     else:
-        sys.stdout.write(md)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(markdown, encoding="utf-8")
+        print(f"✅ 已保存: {output}", file=sys.stderr)
+    print(f"⏱️  总耗时 {time.monotonic() - started:.1f}s (方式: HTTP)", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

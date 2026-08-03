@@ -5,7 +5,7 @@
 | 来源 | 方法 |
 |------|------|
 | GitHub 仓库 URL | 深度走 `learn`，明确快速总结走 `summarize`；不走文章解码 |
-| `mp.weixin.qq.com` | `wechat-article-to-markdown` |
+| `mp.weixin.qq.com` | 复用 link-card 前置抓取生成的 `source.md`，禁止再次抓取 |
 | 飞书文档 URL | `lark-doc` |
 | 其他网页 URL | `read` |
 | 纯文本 | 直接使用 |
@@ -50,14 +50,14 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 4. 隔离协议
 
-主 Agent 用角色扮演实现隔离，不依赖 SubAgent 或 fresh thread：每次运行 `article-decode` 或某条 ljg 前，进入该 Skill 的独立角色，只获得完整原文、Evidence、唯一问题、自身 Skill。隔离靠纪律（只喂规定输入、不串上下文），不靠进程机制。禁止传入：
+主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_isolated_analyses.py`。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill、显式禁用环境代理，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别发送独立 MoonBridge 请求；每个请求固定 `model=glm-5.2`、`store=false`，不传会话 ID 或前序响应 ID。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
 
 - 用户画像；
 - `article-decode` 或其他 ljg 的结果；
 - 主 Agent 的预设结论；
 - 期望答案或本轮问题诊断。
 
-`article-decode` 同样独立，只获得原文、Evidence 和自身 Skill。各角色扮演之间相互不可见；容量不足时分批运行，但上下文边界不变。不因缺少 SubAgent 跳过深度产出或标记降级。
+`article-decode` 只获得原文、Evidence 和自身 Skill；每条 ljg 额外获得自己的唯一问题。主 Agent 不读取这些 Skill，不生成任务原稿。脚本输出按声明顺序编号，使用临时文件加原子替换，并把完整结果写入本轮 `summary.json`；单条 ljg 失败不影响其他结果。脚本或 MoonBridge 不可用时按第 7 节降级，禁止退回主上下文、SubAgent、fresh thread 或嵌套 `codex exec`。
 
 ## 5. 文档拼接
 
@@ -120,7 +120,7 @@ lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
 ## 7. 降级
 
 - 抓取失败：说明失败，不编造正文。
-- `article-decode` 失败：保留 Evidence 和一句话客观摘要交付。
+- `article-decode` 或执行脚本失败：保留 Evidence 和一句话客观摘要交付，禁止角色扮演回退。
 - 单条文字 ljg 失败：跳过该附录，继续交付其他结果。
 - 文档创建失败：回退为高密度卡片。
 - 卡片发送失败：记录失败，不重复发送。
@@ -128,12 +128,10 @@ lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
 
 ## 8. 临时文件
 
-按实际使用清理：
+每次消息先创建独立的 `/tmp/readx-longread.XXXXXX`，在其中保存 `source.md`、`evidence.json`、问题文件和 `analyses/*.md`；交付后只清理本轮目录。其他产物按实际使用清理：
 
 - `.wx_tmp.md`
 - `.wx_evidence.json`
-- `.wx_decode.md`
-- `.wx_ljg_*.md`
 - `.wx_doc.xml`
 - `/tmp/link_card.json`
 - `/tmp/ljg_cast_*.html`

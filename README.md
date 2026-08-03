@@ -39,11 +39,11 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 
 ## 核心功能
 
-- **链接抓取**：微信公众号（`wechat-article-to-markdown`）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` v3.14 先删除标题、作者、日期、URL 与抓取器噪声，再由同一模型并行完成四维闭卷分档、洞察复核与主张预算；脚本从原文确定性组装逐字引用、应用反证封顶并计算总分；锚点只用于事后回归，仅在相关性可改变路由时隔离计算相关性
+- **链接抓取**：微信公众号（`wx_fast.py` 纯 HTTP）、即刻、通用网页、飞书文档、纯文本
+- **内容质量评分**：`content-scoring` v3.15 先删除标题、作者、日期、URL 与抓取器噪声，再由同一模型一次完成证据、洞察、迁移三维闭卷分档与主张预算；脚本从原文确定性组装逐字引用、应用反证封顶并计算总分；锚点只用于事后回归，仅在相关性可改变路由时隔离计算相关性
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
-- **长文精读**：`long-read` 编排器，Evidence -> X 光解码 -> 文字深度链路 -> Docx XML -> 飞书文档
+- **长文精读**：`long-read` 编排器，Evidence -> 独立 HTTP 并行解码/文字深度链路 -> Docx XML -> 飞书文档
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
 ## 数据流
@@ -60,8 +60,8 @@ content-scoring（quality -> 条件 relevance -> decision）
 │ 状态/一句话/轻量卡片   │ long-read 全流程      │
 └──────────────────────┴──────────────────────┘
                                               ↓
-                            Evidence -> article-decode（隔离）
-                                     + 文字 ljg（隔离）
+                            Evidence -> article-decode + 文字 ljg
+                                     （独立 store=false HTTP，并行）
                                      -> Docx XML -> 飞书文档
                                      -> 私聊卡片通知
                             （ljg_card=true 时额外私聊 PNG）
@@ -74,9 +74,9 @@ content-scoring（quality -> 条件 relevance -> decision）
 | Skill | 职责 |
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
-| `content-scoring` | **评分引擎**。四维质量、独立相关性与确定性路由；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence -> article-decode（隔离）+ 文字 ljg（隔离）-> 拼接飞书文档 |
-| `article-decode` | **X 光解码**。隔离运行，产出 Evidence 与解码骨架 |
+| `content-scoring` | **评分引擎**。三维质量、独立相关性与确定性路由；link-card 与 long-read 共用 |
+| `long-read` | **深度编排器**。Evidence -> 独立 HTTP 并行 article-decode + 文字 ljg -> 拼接飞书文档 |
+| `article-decode` | **X 光解码**。只读原文与 Evidence，产出独立解码原稿 |
 
 调用关系：
 
@@ -88,7 +88,7 @@ content-scoring（quality -> 条件 relevance -> decision）
 
 [`ljg-skills`](https://github.com/lijigang/ljg-skills) 是独立的外部 Skill 仓库，通过 [skills CLI](https://github.com/vercel-labs/skills) 安装到全局 `~/.agents/skills/`，**不在本仓库内**。
 
-`long-read` 通过 `references/routing.md` 调度其中 7 个 Skill 做文字深度链路，每个在隔离上下文运行，互不可见：
+`long-read` 通过 `references/routing.md` 调度其中 7 个 Skill；文字分析由独立 HTTP 请求运行，互不可见：
 
 | 触发条件 | Skill |
 |----------|-------|
@@ -107,10 +107,12 @@ content-scoring（quality -> 条件 relevance -> decision）
 | 脚本 | 作用 |
 |------|------|
 | `scripts/content_scoring.py` | content-scoring 评分计算 |
-| `scripts/wx_fast.py` | 微信文章抓取（备用，httpx 直连） |
+| `scripts/wx_fast.py` | 微信文章抓取（httpx 直连，不启动浏览器） |
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
+| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 独立 HTTP 并行运行 article-decode 与文字 ljg |
+| `.agents/skills/long-read/scripts/evaluate_analyses.py` | 对比隔离产物的机械完整性，并以 summary 验证同任务性能非回退 |
 
 ## 飞书文档段落顺序
 

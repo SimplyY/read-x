@@ -12,7 +12,6 @@ DIMENSIONS = (
     ("evidence_quality", "证据与论证"),
     ("insight_explanatory", "洞察解释"),
     ("transfer_durability", "长期迁移"),
-    ("information_efficiency", "信息效率"),
 )
 
 

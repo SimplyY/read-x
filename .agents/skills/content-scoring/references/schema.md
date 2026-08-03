@@ -1,14 +1,14 @@
-# Content Scoring v3.14 Schema
+# Content Scoring v3.15 Schema
 
 数值、权重、维度分集合和阈值以 `scoring-policy.json` 为唯一真值。本文件只定义模型与脚本的契约。
 
-## quality_output v3.14
+## quality_output v3.15
 
 正文不完整时只要求 `schema_version`、`source_status` 和可用的结论；其余字段可省略。正文完整时使用完整结构：
 
 ```json
 {
-  "schema_version": "3.14",
+  "schema_version": "3.15",
   "source_status": "complete",
   "detected_domain": {"primary": "AI/Agent 工程", "secondary": "软件工程"},
   "claim_ledger": [
@@ -31,8 +31,7 @@
       "ceiling_reason": "不能更高的原因"
     },
     "insight_explanatory": {},
-    "transfer_durability": {},
-    "information_efficiency": {}
+    "transfer_durability": {}
   },
   "domain_confidence": "high",
   "conclusion": "一句话结论",
@@ -40,7 +39,7 @@
 }
 ```
 
-四个维度的 `claim_ids` 都必须至少包含一个当前 `claim_ledger` 的有效 ID；信息效率引用最能代表正文结构的主张。
+三个维度的 `claim_ids` 都必须至少包含一个当前 `claim_ledger` 的有效 ID。
 
 约束：
 
@@ -49,7 +48,7 @@
 - 直引号/弯引号差异仅在正文中唯一命中时回填原字符；其他不精确引用、零命中或多命中一律失败关闭。
 - `type`：`empirical|causal|experiential|normative|method`。
 - `importance`：`core|supporting`；`support`：`direct|partial|asserted`。
-- 四个质量维度必须且只能完整出现；模型不得提供 `score`、旧字段 `passed_levels` 或 `semantic_floor`。每维 `level` 直接选择 policy 的合法数值；脚本应用硬反证封顶后复制为 `score`。
+- 三个质量维度必须且只能完整出现；内部模型一次直接返回合法 `level`、原文 `unit_ids` 和硬反证。生成脚本组装逐字引用；评分脚本应用硬反证封顶后复制为 `score`。
 - 每维至少引用一条存在的 claim，并填写理由和上限原因。
 - 质量输出禁止包含 `calibration`；锚点和目标区间只用于评分后的外部闭卷回归。
 - `domain_confidence`：`high|medium|low`。
@@ -78,12 +77,12 @@
 - `confidence=low` 时脚本不采用相关性，决策分回退质量分。
 - 该输出不得接收或复述质量分；`schema_version != 3.0` 的旧输出一律拒绝。
 
-## scoring_result v3.14
+## scoring_result v3.15
 
 ```json
 {
-  "score_version": "3.14",
-  "quality_version": "3.14",
+  "score_version": "3.15",
+  "quality_version": "3.15",
   "relevance_version": "3.0",
   "content_fingerprint": "sha256",
   "context_fingerprint": "sha256 或 null",

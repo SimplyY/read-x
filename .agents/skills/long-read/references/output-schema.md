@@ -53,7 +53,7 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 ### 临时产物
 
-隔离产物可暂存为 `.wx_decode.md`、`.wx_ljg_*.md`。只用于主 Agent 拼接，交付后清理，不进入长期状态。
+每次消息使用独立 `/tmp/readx-longread.XXXXXX`。脚本输出 `analyses/article-decode.md` 与按声明顺序编号的 `analyses/01-ljg-*.md`；每个文件先写临时文件再原子替换。只读取脚本摘要中标为成功的产物，交付后清理本轮目录，不进入长期状态。
 
 ## 3. 拼接协议
 

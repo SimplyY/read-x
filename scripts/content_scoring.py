@@ -4,8 +4,15 @@
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
     [--retry-quality-output retry.json] \
-    [--relevance-output relevance.json --context context.md]
+    [--relevance-output relevance.json --context context.md] \
+    [--config-from-base <base-config.json>]
   python3 scripts/content_scoring.py --self-check
+
+When --config-from-base is provided, the external config file overrides
+scoring-policy.json for all tunable parameters (route thresholds, quality
+bands, priority bands, relevance bonus). Structural constants (dimension
+scores, weights, disqualifiers, evidence caps, claims, retry) remain
+from policy.json and cannot be changed via Base.
 """
 from __future__ import annotations
 
@@ -13,6 +20,7 @@ import argparse
 from copy import deepcopy
 import hashlib
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -21,9 +29,22 @@ from pathlib import Path
 
 POLICY_PATH = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/scoring-policy.json"
 
+# Fields that can be overridden by Base config
+_TUNABLE_KEYS = {"route", "quality_bands", "priority_bands", "relevance_bonus"}
 
-def _load_policy():
-    return json.loads(POLICY_PATH.read_text(encoding="utf-8"), parse_float=Decimal)
+
+def _load_policy(external_config_path: str | None = None):
+    """Load policy.json, optionally overriding tunable fields from external config."""
+    policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"), parse_float=Decimal)
+    if external_config_path:
+        ext_path = Path(external_config_path)
+        if not ext_path.is_file():
+            raise ValueError(f"external config not found: {external_config_path}")
+        ext = json.loads(ext_path.read_text(encoding="utf-8"), parse_float=Decimal)
+        for key in _TUNABLE_KEYS:
+            if key in ext:
+                policy[key] = ext[key]
+    return policy
 
 
 POLICY = _load_policy()
@@ -37,6 +58,12 @@ CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
 CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+
+
+def _reload_policy(external_config_path: str | None = None):
+    """Reload policy from external config, updating module-level globals."""
+    global POLICY
+    POLICY = _load_policy(external_config_path)
 
 
 def round1(value) -> float:
@@ -507,9 +534,16 @@ def main():
     parser.add_argument("--relevance-unavailable", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-check", action="store_true")
+    parser.add_argument("--config-from-base", metavar="BASE_CONFIG_JSON",
+                        help="Override tunable policy fields (route, bands, bonus) from a Base config JSON file")
     args = parser.parse_args()
     if args.self_check:
         return 0 if self_check() else 1
+    if args.config_from_base:
+        try:
+            _reload_policy(args.config_from_base)
+        except (ValueError, OSError) as exc:
+            print(f"warning: base config load failed ({exc}), falling back to policy.json", file=sys.stderr)
     if not args.quality_output or not args.source:
         parser.error("quality_output and source are required")
     if bool(args.relevance_output) != bool(args.context):

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch one WeChat article and prepare the deterministic scoring inputs."""
+"""Fetch one WeChat article and prepare the deterministic scoring inputs.
+
+While the article is being fetched, Base configuration is pulled in parallel
+so it's ready by the time content_scoring.py runs. If the Base fetch fails,
+it silently falls back to scoring-policy.json (no --config-from-base flag).
+"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +12,9 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import prepare_anchor_view
@@ -16,6 +23,7 @@ import prepare_anchor_view
 SAVED_PREFIX = "✅ 已保存: "
 METADATA = re.compile(r"^>\s*(公众号|发布时间|原文链接)\s*[:：]\s*(.+)$")
 BLIND_PART_BYTES = 20_000
+SCRIPTS_DIR = Path(__file__).parent
 
 
 def saved_path(output: str) -> Path:
@@ -63,14 +71,45 @@ def blind_parts(path: Path, text: str) -> list[str]:
     return paths
 
 
+def _fetch_base_config_async(run_dir: Path) -> threading.Thread:
+    """Start a daemon thread to fetch Base config in parallel.
+
+    Returns the thread; thread.result_path is set to the output file path.
+    If the fetch fails, result_path remains None and the caller falls back to policy.json.
+    """
+    config_path = run_dir / "base-config.json"
+
+    def _fetch():
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "fetch_base_config.py"),
+                 "--output", str(config_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip()[:200] if proc.stderr else "unknown error")
+        except Exception:
+            pass  # Silently fail; caller falls back to policy.json
+
+    thread = threading.Thread(target=_fetch, daemon=True)
+    thread.result_path = config_path  # type: ignore[attr-defined]
+    thread.start()
+    return thread
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("url")
     args = parser.parse_args()
 
     run_dir = Path(tempfile.mkdtemp(prefix="readx-score.", dir="/tmp"))
+
+    # Start Base config fetch in parallel with article fetch
+    config_thread = _fetch_base_config_async(run_dir)
+
+    fetched_path = run_dir / "fetched.md"
     fetched = subprocess.run(
-        ["wechat-article-to-markdown", args.url],
+        [str(SCRIPTS_DIR / "wx_fast.py"), args.url, "--output", str(fetched_path)],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -90,6 +129,19 @@ def main() -> int:
     blind_source = prepare_anchor_view.blind_article_source(source)
     blind_path.write_text(blind_source, encoding="utf-8")
 
+    # Wait for Base config fetch to complete (it should already be done by now)
+    config_thread.join(timeout=5)
+
+    # Check if Base config was successfully fetched
+    base_config_path = None
+    if hasattr(config_thread, "result_path") and config_thread.result_path.is_file():
+        # Validate the config is valid JSON before passing it through
+        try:
+            json.loads(config_thread.result_path.read_text(encoding="utf-8"))
+            base_config_path = str(config_thread.result_path)
+        except (json.JSONDecodeError, OSError):
+            pass  # Fall back to policy.json
+
     result = {
         "run_dir": str(run_dir),
         "source": str(source_path),
@@ -98,6 +150,8 @@ def main() -> int:
         "url": args.url,
         **article_metadata(source),
     }
+    if base_config_path:
+        result["base_config"] = base_config_path
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 

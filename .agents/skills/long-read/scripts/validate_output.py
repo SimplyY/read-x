@@ -15,6 +15,7 @@ from pathlib import Path
 
 REQUIRED_META = {"title", "author", "source_url", "published_at", "genre", "word_count"}
 REQUIRED_CLAIM_FIELDS = {"id", "claim", "evidence", "evidence_type", "confidence"}
+EVIDENCE_FIELDS = {"metadata", "claims", "facts", "data_points", "quotes", "uncertainties", "article_structure"}
 VALID_EVIDENCE_TYPES = {"quote", "data", "example", "reasoning"}
 VALID_CONFIDENCE = {"high", "medium", "low"}
 MAX_QUOTES = 8
@@ -34,10 +35,11 @@ def check_structure(ev):
     findings = []
     if not isinstance(ev, dict):
         return ["evidence is not a JSON object"]
-    for key in ["metadata", "claims", "facts", "data_points", "quotes",
-                "uncertainties", "article_structure"]:
+    for key in EVIDENCE_FIELDS:
         if key not in ev:
             findings.append(f"missing top-level key: {key}")
+    for key in set(ev) - EVIDENCE_FIELDS:
+        findings.append(f"unexpected top-level key: {key}")
     meta = ev.get("metadata", {})
     if not isinstance(meta, dict):
         findings.append("metadata is not an object")
@@ -45,23 +47,49 @@ def check_structure(ev):
         for k in REQUIRED_META:
             if k not in meta:
                 findings.append(f"metadata missing field: {k}")
-    for i, c in enumerate(ev.get("claims", [])):
+        for k in set(meta) - REQUIRED_META:
+            findings.append(f"metadata has unexpected field: {k}")
+        for key in ("title", "genre"):
+            if key in meta and (not isinstance(meta[key], str) or not meta[key].strip()):
+                findings.append(f"metadata {key} must be a non-empty string")
+        for key in ("author", "source_url", "published_at"):
+            if key in meta and meta[key] is not None and (not isinstance(meta[key], str) or not meta[key].strip()):
+                findings.append(f"metadata {key} must be null or a non-empty string")
+        if "word_count" in meta and (isinstance(meta["word_count"], bool) or not isinstance(meta["word_count"], int) or meta["word_count"] < 0):
+            findings.append("metadata word_count must be a non-negative integer")
+    claims = ev.get("claims", [])
+    if not isinstance(claims, list):
+        findings.append("claims is not a list")
+        claims = []
+    for i, c in enumerate(claims):
         if not isinstance(c, dict):
             findings.append(f"claims[{i}] is not an object")
             continue
         for f in REQUIRED_CLAIM_FIELDS:
             if f not in c:
                 findings.append(f"claims[{i}] missing field: {f}")
+        for f in set(c) - REQUIRED_CLAIM_FIELDS:
+            findings.append(f"claims[{i}] has unexpected field: {f}")
+        for f in REQUIRED_CLAIM_FIELDS:
+            if f in c and (not isinstance(c[f], str) or not c[f].strip()):
+                findings.append(f"claims[{i}] {f} must be a non-empty string")
         et = c.get("evidence_type")
-        if et and et not in VALID_EVIDENCE_TYPES:
+        if isinstance(et, str) and et and et not in VALID_EVIDENCE_TYPES:
             findings.append(f"claims[{i}] invalid evidence_type: {et}")
         conf = c.get("confidence")
-        if conf and conf not in VALID_CONFIDENCE:
+        if isinstance(conf, str) and conf and conf not in VALID_CONFIDENCE:
             findings.append(f"claims[{i}] invalid confidence: {conf}")
     quotes = ev.get("quotes", [])
     if isinstance(quotes, list) and len(quotes) > MAX_QUOTES:
         findings.append(
             f"quotes has {len(quotes)} items; maximum is {MAX_QUOTES}")
+    for key in ("facts", "data_points", "quotes", "uncertainties", "article_structure"):
+        if key in ev and not isinstance(ev[key], list):
+            findings.append(f"{key} is not a list")
+    for key in ("facts", "data_points", "quotes", "uncertainties", "article_structure"):
+        for i, value in enumerate(ev.get(key, []) if isinstance(ev.get(key), list) else []):
+            if not isinstance(value, str) or not value.strip():
+                findings.append(f"{key}[{i}] is not a non-empty string")
     return findings
 
 
@@ -193,6 +221,14 @@ def self_check():
     bad_t["claims"][0]["evidence_type"] = "hearsay"
     f = check_structure(bad_t)
     cases.append(("fail: bad evidence_type", len(f) == 1, f))
+
+    bad_types = json.loads(json.dumps(good))
+    bad_types["metadata"]["title"] = {"user_profile": "x"}
+    bad_types["metadata"]["word_count"] = "100"
+    bad_types["claims"][0]["evidence"] = ""
+    bad_types["quotes"] = [""]
+    f = check_structure(bad_types) + check_quotes_substring(bad_types, src_ok)
+    cases.append(("fail: malformed field types and empty quotes", len(f) == 4, f))
 
     # author null is allowed
     null_author = json.loads(json.dumps(good))

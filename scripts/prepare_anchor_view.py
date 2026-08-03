@@ -83,7 +83,7 @@ def build_view(target_url: str, source: str) -> tuple[str, bool]:
     rendered = [
         "# 匿名质量锚点",
         "",
-        "以下编号仅在本次评分中有效；标题、URL、目标分和原始编号均未提供。只比较论证结构与四维数值。",
+        "以下编号仅在本次评分中有效；标题、URL、目标分和原始编号均未提供。只比较论证结构与三维数值。",
     ]
     for index, block in enumerate(kept, 1):
         rendered.extend(["", f"## A{index}", "", block])

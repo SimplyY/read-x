@@ -1,33 +1,28 @@
 {
   "versions": {
-    "score": "3.14",
-    "quality": "3.14",
+    "score": "3.15",
+    "quality": "3.15",
     "relevance": "3.0"
   },
   "dimension_scores": [0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10],
   "quality_dimensions": {
     "evidence_quality": {
       "label": "证据与论证可信度",
-      "weight": 0.25
+      "weight": 0.35
     },
     "insight_explanatory": {
       "label": "洞察解释力",
-      "weight": 0.3
+      "weight": 0.35
     },
     "transfer_durability": {
       "label": "长期迁移价值",
       "weight": 0.3
-    },
-    "information_efficiency": {
-      "label": "信息效率",
-      "weight": 0.15
     }
   },
   "quality_disqualifiers": {
     "evidence_quality": {"only_illustrative_or_anecdotal": 6},
     "insight_explanatory": {},
-    "transfer_durability": {},
-    "information_efficiency": {"substantial_nonargument_section": 6}
+    "transfer_durability": {}
   },
   "evidence_caps": [
     {"maximum_dimension_score": 2, "quality_cap": 5.9},

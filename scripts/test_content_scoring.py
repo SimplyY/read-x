@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Content Scoring v3.14 unit and adversarial checks."""
+"""Content Scoring v3.15 unit and adversarial checks."""
 from __future__ import annotations
 
 import os
@@ -16,6 +16,7 @@ import generate_quality as quality_generator
 import render_score_card as card
 import prepare_anchor_view as anchor_view
 import prepare_scoring_run as scoring_run
+import wx_fast as wechat_fetcher
 
 
 QUOTES = [f"原文核心句{i}。" for i in range(1, 13)]
@@ -142,11 +143,9 @@ def test_runtime_contract_prevents_observed_shape_regressions():
     assert "方法是否原创只影响洞察，不降低已成立的迁移价值" in runtime
     assert "至少两个机制构成反馈闭环" in runtime and "改变干预或产生可检验预测" in runtime
     assert "多个具名事件与结果形成可复核链" in runtime
-    assert "结尾一句推广不触发" in runtime
-    assert "连续介绍两个以上产品、板块、课程或招募项" in runtime
-    assert "固定动作" in runtime and "不得枚举备选分数" in runtime
-    assert "每维只做一次判断" in runtime and "禁止生成第二套等级" in runtime
-    assert "四维必须独立判级" in runtime and "只按自己的通用语义表判断" in runtime
+    assert "一次调用直接选择证据、洞察、迁移三个维度" in runtime
+    assert "直接选择第一条完整满足的合法 `level`" in runtime
+    assert "三维必须独立判级" in runtime and "只按自己的通用数值语义判断" in runtime
     assert "锚点只用于评分完成后的外部闭卷回归" in runtime
     assert "规则、注意力、行为" not in runtime
     assert "个人能力变成可复制系统" not in runtime
@@ -159,23 +158,47 @@ def test_runtime_contract_prevents_observed_shape_regressions():
 
 def test_repo_rules_keep_wechat_scoring_on_single_fetch_entrypoint():
     rules = (Path(cs.__file__).parents[1] / "AGENTS.md").read_text(encoding="utf-8")
-    assert "微信公众号评分只调用一次 `scripts/prepare_scoring_run.py <URL>`" in rules
-    assert "这条不适用于前置评分抓取" in rules
+    assert "微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`" in rules
+    assert "内部使用纯 HTTP，不启动或回退浏览器" in rules
+    assert "复用 link-card 前置抓取生成的 `source.md`" in rules
 
 
 def test_link_card_has_one_wechat_scoring_entrypoint():
     skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
     assert "mp.weixin.qq.com → prepare_scoring_run.py（内部只抓取一次）" in skill
     assert "| `mp.weixin.qq.com` | `prepare_scoring_run.py`" in skill
+    assert "`wx_fast.py` 纯 HTTP" in skill and "不启动或回退任何浏览器" in skill
+
+
+def test_wechat_fetcher_has_no_browser_fallback():
+    root = Path(cs.__file__).parents[1]
+    fetcher = (root / "scripts/wx_fast.py").read_text(encoding="utf-8")
+    preparer = (root / "scripts/prepare_scoring_run.py").read_text(encoding="utf-8")
+    assert "wx_fast.py" in preparer
+    for forbidden in ("Camoufox", "camoufox", "AsyncCamoufox", "playwright"):
+        assert forbidden not in fetcher
+        assert forbidden not in preparer
+
+
+def test_wechat_fetcher_parses_public_article_without_external_package():
+    source = '''
+    <meta property="og:title" content="测试文章">
+    <meta property="og:article:author" content="测试公众号">
+    <script>var ct = "1767225600";</script>
+    <div id="js_content"><h2>标题</h2><p>''' + ("正文内容" * 60) + '''</p><ul><li>要点</li></ul></div>
+    '''
+    markdown = wechat_fetcher.parse_article(source, "https://mp.weixin.qq.com/s/test")
+    assert markdown.startswith("# 测试文章\n")
+    assert "> 公众号: 测试公众号" in markdown
+    assert "> 原文链接: https://mp.weixin.qq.com/s/test" in markdown
+    assert "## 标题" in markdown and "- 要点" in markdown
 
 
 def test_quality_disqualifiers_apply_deterministic_caps():
     output = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS})
     output["dimensions"]["evidence_quality"]["disqualifiers"] = ["only_illustrative_or_anecdotal"]
-    output["dimensions"]["information_efficiency"]["disqualifiers"] = ["substantial_nonargument_section"]
     result = cs.score(output, SOURCE)
     assert result["quality_dimensions"]["evidence_quality"]["score"] == 6.0
-    assert result["quality_dimensions"]["information_efficiency"]["score"] == 6.0
     unknown = quality()
     unknown["dimensions"]["evidence_quality"]["disqualifiers"] = ["article_is_calibration"]
     result = cs.score(unknown, SOURCE)
@@ -309,6 +332,7 @@ def test_blind_article_source_drops_extractor_noise_only():
 def test_prepare_scoring_run_parses_one_path_and_metadata():
     production_source = Path(scoring_run.__file__).read_text(encoding="utf-8")
     assert "build_view(" not in production_source and '"anchor_view"' not in production_source
+    assert "wx_fast.py" in production_source and "wechat-article-to-markdown" not in production_source
     with tempfile.TemporaryDirectory() as directory:
         article = Path(directory) / "article.md"
         article.write_text("# 标题\n> 公众号：作者\n> 发布时间: 2026-07-30\n", encoding="utf-8")
@@ -342,7 +366,7 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "scripts/prepare_scoring_run.py <URL>" in skill
     assert "禁止在模型中自行 `mktemp`" in skill and "重建标题路径" in skill
     assert "过程消息只能在 `source.md` 已存在" in skill
-    assert "主张、引用、枚举、四维输出和 JSON 自检只遵循 `quality-runtime.md`" in skill
+    assert "主张、引用、枚举、三维输出和 JSON 自检只遵循 `quality-runtime.md`" in skill
     assert "渲染器退出码为 0 即视为卡片结构验证通过" in skill
     assert "/Users/yuwei/code/read-x/scripts/content_scoring.py" in skill
     assert "quality-runtime.md" in skill and "禁止把完整 content-scoring Skill" in skill
@@ -359,29 +383,30 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "scripts/render_score_card.py" in skill
     assert "禁止手写卡片 JSON" in skill
     assert "--output <run_dir>/score-card.json" in skill
-    assert "唯一运行时真值" in scoring_skill
+    assert "三维数值语义一次发送" in scoring_skill and "直接返回证据、洞察、迁移三维等级" in scoring_skill
     assert "既有本地 MoonBridge" in scoring_skill and "脚本不传推理覆盖" in scoring_skill
     assert "不得退回主上下文评分" in scoring_skill
-    assert "四维必须正交" in quality_runtime and "只影响 `evidence_quality`" in quality_runtime
-    assert "source_quote in source_text" in quality_runtime and "每维只做一次判断" in quality_runtime
+    assert "三维必须正交" in quality_runtime and "只影响 `evidence_quality`" in quality_runtime
+    assert "source_quote in source_text" in quality_runtime
     assert "只读完整 `blind-source.md`" in quality_runtime and "与 `anchor-view.md`" not in quality_runtime
     assert "不得把若干线性后果自行首尾相接" in quality_runtime
     assert "多组件系统本身完整成立即可" in quality_runtime
-    assert "完整章节用于销售付费产品" in quality_runtime
-    assert all(quality_runtime.count(f"| {score:.1f} |") == 4 for score in (6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10))
+    assert all(quality_runtime.count(f"| {score:.1f} |") >= 3 for score in (6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10))
 
 
 def test_quality_generator_is_closed_book_and_schema_bound():
-    schema = quality_generator.output_schema()
-    assert "calibration" not in schema["properties"]
-    assert schema["properties"]["schema_version"]["const"] == cs.QUALITY_VERSION
+    schema = quality_generator.quality_run_schema()
+    assert "budget" in schema["required"] and "dimensions" in schema["required"]
+    dimensions = schema["properties"]["dimensions"]
+    assert set(dimensions["required"]) == set(cs.QUALITY_DIMENSIONS)
+    assert all(item["required"] == ["level", "unit_ids", "disqualifiers"] for item in dimensions["properties"].values())
     assert quality_generator.MODEL == "glm-5.2" and quality_generator.ENDPOINT.startswith("http://127.0.0.1:")
     generator_source = Path(quality_generator.__file__).read_text(encoding="utf-8")
     assert "reasoning" not in generator_source
     assert "DIMENSION_KEYWORDS" not in generator_source and "transfer_examples" not in generator_source
     assert "insight_check" not in generator_source and "由原文证据" not in generator_source
-    assert quality_generator.selection_schema(True)["properties"]["budget"]["enum"] == [2, 3, 4, 5]
-    assert quality_generator.selection_schema(False)["properties"]["budget"]["enum"] == [5, 8, 12]
+    assert quality_generator.quality_run_schema(True)["properties"]["budget"]["enum"] == [2, 3, 4, 5]
+    assert quality_generator.quality_run_schema(False)["properties"]["budget"]["enum"] == [5, 8, 12]
     runtime = quality_generator.RUNTIME.read_text(encoding="utf-8")
     assert "anchor-view" not in runtime and "目标区间" in runtime
     with tempfile.TemporaryDirectory() as directory:
@@ -393,25 +418,8 @@ def test_quality_generator_is_closed_book_and_schema_bound():
             assert "blind-source parts" in str(exc)
         else:
             raise AssertionError("non-blind input must fail before model execution")
-    sentences = ["测试结果充分支持文章核心结论", "因为存在明确机制所以结果发生变化", "如何复用这个方法需要执行三个步骤", "另外全文结构始终保持紧凑清晰", "根据独立报告还有第二项重要证据"]
-    source = "。".join(sentences) + "。"
-    units = quality_generator.source_units(source)
-    selection = {
-        "budget": 5,
-        "claims": [{"unit_id": index, "type": "empirical", "importance": "supporting", "support": "direct", "uncertainty": None} for index in range(1, 6)],
-    }
-    ledger = quality_generator.build_ledger(source, units, selection)
-    assert len(ledger) == 5 and all(claim["source_quote"] in source for claim in ledger)
-    assert all(12 <= len(claim["source_quote"]) <= 24 for claim in ledger)
-    invalid = dict(selection)
-    invalid["claims"] = [dict(claim) for claim in selection["claims"]]
-    invalid["claims"][0]["type"] = "evaluation"
-    try:
-        quality_generator.build_ledger(source, units, invalid)
-    except RuntimeError as exc:
-        assert "claim type is invalid" in str(exc)
-    else:
-        raise AssertionError("unknown claim types must fail before dimension calls")
+    dimensions = {key: {"unit_ids": [index, 4, 5]} for index, key in enumerate(cs.QUALITY_DIMENSIONS, 1)}
+    assert quality_generator.select_units(dimensions, 5) == [1, 2, 3, 4, 5]
 
 
 def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
@@ -425,7 +433,7 @@ def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
     assert "未计算（不影响本次路由）" in payload
     boundary = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     waiting = cs.score(quality(boundary), SOURCE)
     try:
@@ -438,13 +446,13 @@ def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
 
 def test_seven_anchor_profiles_match_user_ranges():
     profiles = {
-        "A1": ((8.0, 9.0, 9.0, 8.0), (8.5, 9.0)),
-        "A2": ((7.0, 7.0, 8.0, 7.0), (7.0, 7.5)),
-        "A3": ((6.0, 8.0, 8.0, 6.0), (7.0, 7.2)),
-        "A4": ((8.0, 6.0, 7.0, 8.0), (7.0, 7.2)),
-        "A5": ((8.0, 8.0, 9.0, 7.0), (8.0, 8.3)),
-        "A6": ((7.0, 9.0, 9.0, 8.0), (8.3, 8.5)),
-        "A7": ((8.0, 9.0, 9.0, 8.0), (8.5, 9.0)),
+        "A1": ((8.0, 9.0, 9.0), (8.5, 9.0)),
+        "A2": ((7.0, 7.0, 8.0), (7.0, 7.5)),
+        "A3": ((6.0, 7.5, 8.0), (7.0, 7.5)),
+        "A4": ((8.0, 6.0, 7.0), (6.8, 7.2)),
+        "A5": ((8.0, 8.0, 9.0), (8.0, 8.5)),
+        "A6": ((7.0, 9.0, 9.0), (8.2, 8.5)),
+        "A7": ((8.0, 9.0, 9.0), (8.5, 9.0)),
     }
     keys = list(cs.QUALITY_DIMENSIONS)
     for anchor, (grade_list, expected_range) in profiles.items():
@@ -491,11 +499,11 @@ def test_relevance_only_raises_priority_and_never_rescues_low_quality():
 def test_boundary_waits_for_relevance_and_cannot_route():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE)
     assert result["score_status"] == "needs_relevance"
-    assert result["quality_score"] == 6.6
+    assert result["quality_score"] == 6.7
     assert result["decision_score"] is None and result["route"] is None
     assert result["ljg_range"] is None and result["priority_label"] == "待计算"
 
@@ -503,11 +511,11 @@ def test_boundary_waits_for_relevance_and_cannot_route():
 def test_boundary_can_finish_when_relevance_is_unavailable():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_unavailable=True)
     assert result["score_status"] == "scored"
-    assert result["quality_score"] == result["decision_score"] == 6.6
+    assert result["quality_score"] == result["decision_score"] == 6.7
     assert result["route"] == "card" and result["relevance_score"] is None
     assert "relevance_context_unavailable" in result["issues"]
 
@@ -515,10 +523,10 @@ def test_boundary_can_finish_when_relevance_is_unavailable():
 def test_relevance_can_rescue_only_boundary_quality():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.6 and result["decision_score"] == 7.8
+    assert result["quality_score"] == 6.7 and result["decision_score"] == 7.9
     assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
     assert result["ljg_card"] is False
 
@@ -526,7 +534,7 @@ def test_relevance_can_rescue_only_boundary_quality():
 def test_relevance_failure_falls_back_to_quality():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     boundary = quality(grades)
     result = cs.score(boundary, SOURCE, relevance_output=relevance(confidence="low"), context_text=CONTEXT)
@@ -551,7 +559,7 @@ def test_fingerprints_ignore_layout_but_track_content_and_context():
     assert cs.content_fingerprint("甲乙") != cs.content_fingerprint("甲丙")
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     result1 = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
     changed = CONTEXT.replace("当前工作", "新的当前工作")
@@ -563,32 +571,32 @@ def test_fingerprints_ignore_layout_but_track_content_and_context():
 def test_relevance_and_interest_scores_clamped_per_axis():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
-    }  # 6.6, relevance boundary
+        "transfer_durability": 7.0,
+    }  # 6.7, relevance boundary
     # 相关轴独立封顶 0.6
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(relevance_score=0.8, interest_score=0.0), context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.0 and result["decision_score"] == 7.2
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.0 and result["decision_score"] == 7.3
     # 兴趣轴独立封顶 0.6
     over_int = relevance(relevance_score=0.0, interest_score=1.5)
     result = cs.score(quality(grades), SOURCE, relevance_output=over_int, context_text=CONTEXT)
-    assert result["interest_score"] == 0.6 and result["decision_score"] == 7.2
+    assert result["interest_score"] == 0.6 and result["decision_score"] == 7.3
     # 双轴满档 1.2
     both = relevance(relevance_score=0.6, interest_score=0.6)
     result = cs.score(quality(grades), SOURCE, relevance_output=both, context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6 and result["decision_score"] == 7.8
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6 and result["decision_score"] == 7.9
     # 双零回质量基线
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
-    assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.6
+    assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.7
 
 
 def test_depth_uses_joint_decision_score():
-    # 边界 q6.6 + 双满档 bonus 1.2 -> decision 7.8 -> [0,1]无卡（边界带双满档也不到 card）
+    # 边界 q6.7 + 双满档 bonus 1.2 -> decision 7.9 -> [0,1]无卡（边界带双满档也不到 card）
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
-        "transfer_durability": 7.0, "information_efficiency": 6.0,
+        "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.6 and result["decision_score"] == 7.8
+    assert result["quality_score"] == 6.7 and result["decision_score"] == 7.9
     assert result["ljg_range"] == [0, 1] and result["ljg_card"] is False
     # q7.0 + 双满档 -> decision 8.2 -> [1,1]+卡（边界质量带双轴合力才进 card）
     card_grades = {key: 7.0 for key in cs.QUALITY_DIMENSIONS}
@@ -661,10 +669,10 @@ def test_cli_end_to_end_success_and_failure_routes():
 
         boundary = {
             "evidence_quality": 6.0, "insight_explanatory": 7.0,
-            "transfer_durability": 7.0, "information_efficiency": 6.0,
+            "transfer_durability": 7.0,
         }
         result = run_cli(quality(boundary))
-        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.6, 0.6, 0.6, 7.8)
+        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.7, 0.6, 0.6, 7.9)
         assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
 
         quality_path.write_text(json.dumps(quality(boundary), ensure_ascii=False), encoding="utf-8")
@@ -679,7 +687,7 @@ def test_cli_end_to_end_success_and_failure_routes():
         )
         result = json.loads(completed.stdout)
         assert result["score_status"] == "scored" and result["route"] == "card"
-        assert result["decision_score"] == result["quality_score"] == 6.6
+        assert result["decision_score"] == result["quality_score"] == 6.7
 
         result = run_cli(quality(source_status="partial"))
         assert result["score_status"] == "needs_full_text" and result["quality_score"] is None

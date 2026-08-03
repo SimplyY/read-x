@@ -13,11 +13,11 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 **收到任何链接时，必须走 link-card 流程，以卡片 + bot 身份回复。禁止纯文本回复。**
 
 link-card 流程：
-1. **抓取**：按链接类型选择抓取方式；微信公众号评分只调用一次 `scripts/prepare_scoring_run.py <URL>`，不得先单独运行 `wechat-article-to-markdown`
-2. **内容质量判断**：统一调 `content-scoring` v3.14，不分来源；质量模型只读去身份正文与通用数值语义，锚点仅用于事后闭卷回归；脚本应用反证封顶并计算总分与路由；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
+1. **抓取**：按链接类型选择抓取方式；微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`，内部使用纯 HTTP，不启动或回退浏览器
+2. **内容质量判断**：统一调 `content-scoring` v3.15，不分来源；质量模型只读去身份正文与通用三维数值语义，锚点仅用于事后闭卷回归；脚本应用反证封顶并计算总分与路由；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
-这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。唯一显式例外是 `仅评分 <URL>`：保留真实路由，但发完评分卡后不进入精读。
+这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。显式例外有二：`仅评分 <URL>` 保留真实路由，但发完评分卡后不进入精读；已知专项文体（如阮一峰《科技爱好者周刊》）走快通道，跳过评分直接按专项规则生成卡片（见 link-card SKILL.md [0.5]）。
 
 ## link-card 流程（硬性要求）
 
@@ -25,7 +25,7 @@ link-card 流程：
 
 ### 内容质量判断（核心）
 
-抓取后，统一调用 `content-scoring` v3.14（不分来源）。质量阶段按通用中文语义为四维各做一次数值判断并输出原文主张证据，由脚本计算总分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.15（不分来源）。质量阶段一次判断证据、洞察、迁移三维等级并输出原文单元，由脚本校验并计算总分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
@@ -38,10 +38,10 @@ link-card 流程：
 
 按 `.agents/skills/long-read/SKILL.md` 执行，不跳过任何步骤：
 
-1. **抓取正文**：进入 long-read 后，`wechat-article-to-markdown` skill 直接抓取（最快路径，不要用其他方式）；这条不适用于前置评分抓取
+1. **抓取正文**：进入 long-read 后复用 link-card 前置抓取生成的 `source.md`，禁止再次抓取
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
-3. **独立解码**：Evidence 完成后，`article-decode` 在隔离上下文中完整运行；不输出骨架或单独 X 光四层
-4. **文字深度链路**：各 ljg 在相互不可见的隔离上下文中运行；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度
+3. **独立解码**：Evidence 完成后，通过 `run_isolated_analyses.py` 向 MoonBridge 发出独立 `store=false` HTTP 请求运行 `article-decode`；脚本必须严格校验 Evidence、禁用环境代理并写本轮 summary；不输出骨架或单独 X 光四层
+4. **文字深度链路**：各 ljg 由同一脚本并行发出互不可见的独立 HTTP 请求；命令、路径或交付残留必须失败关闭且不落盘；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
 5. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；生成飞书文档后私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`，只发一次）
    - `ljg_card=true` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
 
@@ -51,16 +51,15 @@ link-card 流程：
 - `.agents/skills/article-decode/` — 长文章 X 光解码 Skill（隔离运行）
 - `.agents/skills/content-scoring/` - 内容评分引擎（link-card 与 long-read 共用，同一正文只评一次）
 - `.agents/skills/link-card/` - link-card Skill 定义（卡片输出 + 链接分派 + 调用 content-scoring）
-- `wechat-article-to-markdown` skill — 微信文章抓取（默认唯一路径）
-- `scripts/wx_fast.py` — 微信文章抓取（备用，httpx 直连）
+- `scripts/wx_fast.py` — 微信文章纯 HTTP 抓取（默认唯一路径，不启动浏览器）
 - `output/` — 已生成文档
 - `outputs/` — 历史输出
 
 ## 常用命令
 
 ```bash
-# 抓取微信文章
-wechat-article-to-markdown "<mp.weixin.qq.com URL>"
+# 抓取并准备微信文章评分输入
+python3 scripts/prepare_scoring_run.py "<mp.weixin.qq.com URL>"
 
 # 创建飞书文档（long-read 输出用）
 lark-cli docs +create --content @.wx_doc.xml --parent-position my_library
@@ -74,11 +73,11 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 ## 输出路由（硬性）
 
-以下均为卡片通知字数；主文档长度按 long-read 规则。卡片字数与原文长度 + 内容质量成正比，800 字是极高质量卡片的上限，不是默认目标。
+以下均为卡片通知字数；主文档长度按 long-read 规则。卡片字数与原文长度 + 内容质量成正比，800 字是极高质量卡片的上限，不是默认目标。各档位字数区间以 `.agents/skills/link-card/SKILL.md`「各档位字数指导」为权威真值源，此处不再复制数值，避免漂移。
 
-- 高质量 → **必须生成飞书文档 → 私聊发一份卡片（600-800 字摘要通知，核心内容在文档里）**；显式 `仅评分` 除外
-- 中等质量 → 私聊发一份卡片（400-600 字，与原文长度成正比）
-- 低质量 → 私聊发一份卡片（150-300 字，一句话 + 原文链接）
+- 高质量 -> **必须生成飞书文档 -> 私聊发一份卡片（摘要通知，核心内容在文档里）**；显式 `仅评分` 除外
+- 中等质量 -> 私聊发一份卡片（与原文长度成正比）
+- 低质量 -> 私聊发一份卡片（一句话 + 原文链接）
 - 所有卡片 `--as bot`，不以 user 身份发送
 - 群聊场景私聊发给 `bridge_context.senderId`（触发者本人），不污染群聊；p2p 场景 `chatId` 即私聊会话，只发一次；`senderType=bot`（bot-at-bot）时回退发原群
 
