@@ -13,3 +13,10 @@ __pycache__/
 GROUP_INFO.md
 output/
 docs/
+
+# qoder 编辑器产物
+.qoder/
+
+# 早期 Python 实验脚本（有功能但无引用，待确认去留）
+scripts/fetch_base_config.py
+scripts/lark_user.py
