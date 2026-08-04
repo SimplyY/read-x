@@ -127,5 +127,5 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 python3 scripts/test_content_scoring.py
 python3 scripts/content_scoring.py --self-check
 python3 /Users/yuwei/.codex/skills/.system/skill-creator/scripts/quick_validate.py .agents/skills/content-scoring
-python3 -c 'import re;t=open("/Users/yuwei/code/skills/ywnext/runtime/core-context/full.md").read();print("full.md 结构", "OK" if all(re.search(r"^## "+s+r"\s*$",t,re.M) for s in ["长期校准","当前主线","当前张力","暂不做什么"]) else "BAD")'  # read-x 相关性只校验结构，过期不阻断；ywnext 找事仍用 check 脚本做硬门
+python3 -c 'import re;t=open("/Users/yuwei/code/skills/ywnext/runtime/core-context/full.md").read();print("full.md 结构", "OK" if all(re.search(r"^## "+s+r"\s*$",t,re.M) for s in ["长期校准","当前主线","当前张力","暂不做什么","领域兴趣"]) else "BAD")'  # read-x 相关性只校验结构（含领域兴趣），过期不阻断；ywnext 找事仍用 check 脚本做硬门
 ```
