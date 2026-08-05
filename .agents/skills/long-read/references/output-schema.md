@@ -72,6 +72,8 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 创建前读取当前 `lark-doc` Skill 的 XML、style、create workflow。默认写 `.wx_doc.xml`，不要退回 Markdown。
 
+**`<title>` 硬约束（避免重复文档）**：文档根 `<doc>` 下首个元素必须是 `<title>文档标题</title>`，这是 `lark-cli docs +create` 的标题来源；正文标题仍用 `<h1>`，二者并存。缺 `<title>` 会被标记 `missing_document_title`。文档创建是不可逆外部写：创建前确认 XML 含 `<title>`，创建后从完整 JSON 提取 `document_id`/`url` 再继续；若 stdout 被截断，重读落盘的 JSON 文件取 `url`，绝不重跑 `docs +create` 产生第二个文档。
+
 ### 固定顺序
 
 ```text

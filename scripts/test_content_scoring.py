@@ -451,7 +451,7 @@ def test_seven_anchor_profiles_match_user_ranges():
         "A3": ((6.0, 7.5, 8.0), (7.0, 7.5)),
         "A4": ((8.0, 6.0, 7.0), (6.8, 7.2)),
         "A5": ((8.0, 8.0, 9.0), (8.0, 8.5)),
-        "A6": ((7.0, 9.0, 9.0), (8.2, 8.5)),
+        "A6": ((7.0, 9.0, 9.0), (8.4, 8.7)),
         "A7": ((8.0, 9.0, 9.0), (8.5, 9.0)),
     }
     keys = list(cs.QUALITY_DIMENSIONS)
@@ -503,7 +503,7 @@ def test_boundary_waits_for_relevance_and_cannot_route():
     }
     result = cs.score(quality(grades), SOURCE)
     assert result["score_status"] == "needs_relevance"
-    assert result["quality_score"] == 6.7
+    assert result["quality_score"] == 6.8
     assert result["decision_score"] is None and result["route"] is None
     assert result["ljg_range"] is None and result["priority_label"] == "待计算"
 
@@ -515,7 +515,7 @@ def test_boundary_can_finish_when_relevance_is_unavailable():
     }
     result = cs.score(quality(grades), SOURCE, relevance_unavailable=True)
     assert result["score_status"] == "scored"
-    assert result["quality_score"] == result["decision_score"] == 6.7
+    assert result["quality_score"] == result["decision_score"] == 6.8
     assert result["route"] == "card" and result["relevance_score"] is None
     assert "relevance_context_unavailable" in result["issues"]
 
@@ -526,9 +526,9 @@ def test_relevance_can_rescue_only_boundary_quality():
         "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.7 and result["decision_score"] == 7.9
-    assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
-    assert result["ljg_card"] is False
+    assert result["quality_score"] == 6.8 and result["decision_score"] == 8.0
+    assert result["route"] == "long_read" and result["ljg_range"] == [1, 1]
+    assert result["ljg_card"] is True
 
 
 def test_relevance_failure_falls_back_to_quality():
@@ -572,32 +572,32 @@ def test_relevance_and_interest_scores_clamped_per_axis():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
         "transfer_durability": 7.0,
-    }  # 6.7, relevance boundary
+    }  # 6.8, relevance boundary
     # 相关轴独立封顶 0.6
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(relevance_score=0.8, interest_score=0.0), context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.0 and result["decision_score"] == 7.3
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.0 and result["decision_score"] == 7.4
     # 兴趣轴独立封顶 0.6
     over_int = relevance(relevance_score=0.0, interest_score=1.5)
     result = cs.score(quality(grades), SOURCE, relevance_output=over_int, context_text=CONTEXT)
-    assert result["interest_score"] == 0.6 and result["decision_score"] == 7.3
+    assert result["interest_score"] == 0.6 and result["decision_score"] == 7.4
     # 双轴满档 1.2
     both = relevance(relevance_score=0.6, interest_score=0.6)
     result = cs.score(quality(grades), SOURCE, relevance_output=both, context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6 and result["decision_score"] == 7.9
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6 and result["decision_score"] == 8.0
     # 双零回质量基线
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
-    assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.7
+    assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.8
 
 
 def test_depth_uses_joint_decision_score():
-    # 边界 q6.7 + 双满档 bonus 1.2 -> decision 7.9 -> [0,1]无卡（边界带双满档也不到 card）
+    # 边界 q6.8 + 双满档 bonus 1.2 -> decision 8.0 -> [1,1]有卡（边界带双满档进 card）
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
         "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.7 and result["decision_score"] == 7.9
-    assert result["ljg_range"] == [0, 1] and result["ljg_card"] is False
+    assert result["quality_score"] == 6.8 and result["decision_score"] == 8.0
+    assert result["ljg_range"] == [1, 1] and result["ljg_card"] is True
     # q7.0 + 双满档 -> decision 8.2 -> [1,1]+卡（边界质量带双轴合力才进 card）
     card_grades = {key: 7.0 for key in cs.QUALITY_DIMENSIONS}
     result = cs.score(quality(card_grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
@@ -672,8 +672,8 @@ def test_cli_end_to_end_success_and_failure_routes():
             "transfer_durability": 7.0,
         }
         result = run_cli(quality(boundary))
-        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.7, 0.6, 0.6, 7.9)
-        assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
+        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.8, 0.6, 0.6, 8.0)
+        assert result["route"] == "long_read" and result["ljg_range"] == [1, 1]
 
         quality_path.write_text(json.dumps(quality(boundary), ensure_ascii=False), encoding="utf-8")
         completed = subprocess.run(
@@ -687,7 +687,7 @@ def test_cli_end_to_end_success_and_failure_routes():
         )
         result = json.loads(completed.stdout)
         assert result["score_status"] == "scored" and result["route"] == "card"
-        assert result["decision_score"] == result["quality_score"] == 6.7
+        assert result["decision_score"] == result["quality_score"] == 6.8
 
         result = run_cli(quality(source_status="partial"))
         assert result["score_status"] == "needs_full_text" and result["quality_score"] is None

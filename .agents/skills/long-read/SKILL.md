@@ -102,7 +102,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
    要点：`日期` 取当天 `00:00:00`；`标题` 用原文标题；`来源链接`/`云文档链接` 用 markdown 链接格式 `[url](url)`（与历史记录一致）；`评分` 取 content-scoring 的 `quality_score` 去尾零（如 `9/10`、`7.5/10`）；`是否已读` 固定 `true`。标题或 URL 含 `"`、`\` 等字符时，用 `python3 -c "import json,sys;print(json.dumps(sys.stdin.read()))"` 或等价方式构造 `--json` 值，禁手工拼接破坏 JSON。回写是登记步骤，失败不阻塞主流程，仅告警不回滚、不重试阻塞文档交付；
 4. 独立运行 `ljg-card`；按 ljg-card「截图后校验」确认 PNG 生成（capture.js exit 0 + 文件存在 + size>0，禁止 `view_image`）；
-5. PNG 私聊发给触发者：群聊场景 `lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --image ./图片.png`，p2p 场景 `--chat-id <bridge_context.chatId>`；`senderType=bot` 时回退发原群；
+5. PNG 私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：p2p 场景 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image ./图片.png`，群聊场景 `--user-id <bridge_context.senderId>`；`senderType=bot` 时回退发原群；
 6. 不把 PNG 插入文档；失败不修改、不延迟、不重复发送主文档。
 
 具体命令、降级和临时文件清理见 `references/routing.md`。
@@ -125,3 +125,4 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 - [ ] 附录每条 ljg 是否各用一个注明 Skill 名的独立 h2 包裹，原稿内部小标题是否降为 h3 未占用 h2？
 - [ ] 附录每条 ljg 原稿是否做过排版加工（拆段≤100字、加粗、列表/表格、换行），而非原样照搬？
 - [ ] ljg-card PNG 是否用文件校验（capture.js exit 0 + 文件存在 + size>0）确认，未调用 `view_image`？
+- [ ] ljg-card PNG 是否只发送一次（按 chatType 二选一，未同时执行 `--chat-id` 与 `--user-id`）？

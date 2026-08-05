@@ -8,15 +8,15 @@
   "quality_dimensions": {
     "evidence_quality": {
       "label": "证据与论证可信度",
-      "weight": 0.35
+      "weight": 0.20
     },
     "insight_explanatory": {
       "label": "洞察解释力",
-      "weight": 0.35
+      "weight": 0.40
     },
     "transfer_durability": {
       "label": "长期迁移价值",
-      "weight": 0.3
+      "weight": 0.40
     }
   },
   "quality_disqualifiers": {

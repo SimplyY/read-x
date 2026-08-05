@@ -105,11 +105,11 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 
 1. 独立读取并运行 `ljg-card` Skill；
 2. 生成 PNG 并验证文件存在且非空；
-3. 从 PNG 所在目录执行，使用相对路径私聊发给触发者；p2p 使用当前 `chatId`，`senderType=bot` 时回退原群：
+3. 从 PNG 所在目录执行，使用相对路径私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：
 
-```bash
-lark-cli im +messages-send --as bot --user-id <senderId> --image ./<name>.png
-```
+- p2p：`lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image ./<name>.png`
+- 群聊：`lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --image ./<name>.png`
+- `senderType=bot`：回退 `--chat-id` 发原群
 
 禁止：
 

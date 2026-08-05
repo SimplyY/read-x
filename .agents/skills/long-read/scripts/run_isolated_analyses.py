@@ -7,9 +7,11 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -21,6 +23,8 @@ from validate_output import check_quotes_substring, check_structure
 ENDPOINT = "http://127.0.0.1:38441/v1/responses"
 MODEL = "glm-5.2"
 MAX_TASKS = 4
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 5.0
 ALLOWED_LJG = {
     "ljg-learn", "ljg-qa", "ljg-roundtable", "ljg-think", "ljg-word", "ljg-writes",
 }
@@ -193,7 +197,7 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def call_task(
+def _call_once(
     task: AnalysisTask,
     source: str,
     evidence: str,
@@ -201,6 +205,7 @@ def call_task(
     timeout: float,
     max_output_tokens: int,
 ) -> dict:
+    """Single MoonBridge attempt; raises on any failure so the caller can retry."""
     task_input = build_input(source, evidence, task.question)
     payload = {
         "model": MODEL,
@@ -215,33 +220,70 @@ def call_task(
         headers={"Content-Type": "application/json"},
     )
     started = time.perf_counter()
-    try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=timeout) as response:
-            result = json.load(response)
-        output = extract_output(result, task.name, task.min_output_chars, task.required_markers)
-        atomic_write(task.output_path, output)
-        return {
-            "task": task.name,
-            "status": "completed",
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-            "output": str(task.output_path),
-            "output_chars": len(output.rstrip("\n")),
-            "skill_sha256": task.skill_sha256,
-            "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
-            "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
-            "usage": result.get("usage", {}),
-        }
-    except Exception as exc:
-        return {
-            "task": task.name,
-            "status": "failed",
-            "elapsed_seconds": round(time.perf_counter() - started, 3),
-            "skill_sha256": task.skill_sha256,
-            "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
-            "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        result = json.load(response)
+    output = extract_output(result, task.name, task.min_output_chars, task.required_markers)
+    atomic_write(task.output_path, output)
+    return {
+        "task": task.name,
+        "status": "completed",
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "output": str(task.output_path),
+        "output_chars": len(output.rstrip("\n")),
+        "skill_sha256": task.skill_sha256,
+        "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
+        "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
+        "usage": result.get("usage", {}),
+    }
+
+
+def call_task(
+    task: AnalysisTask,
+    source: str,
+    evidence: str,
+    endpoint: str,
+    timeout: float,
+    max_output_tokens: int,
+) -> dict:
+    """Run a task with bounded retry on transient MoonBridge failures.
+
+    MoonBridge may time out, return malformed JSON, or yield an incomplete or
+    too-short output on a single call; a fresh attempt usually succeeds. Mirrors
+    the retry strategy in generate_quality.py instead of treating every
+    transient blip as a hard failure.
+    """
+    task_input = build_input(source, evidence, task.question)
+    digests = {
+        "skill_sha256": task.skill_sha256,
+        "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
+        "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
+    }
+    last_error = None
+    started = time.perf_counter()
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            result = _call_once(task, source, evidence, endpoint, timeout, max_output_tokens)
+            result["attempts"] = attempt
+            return result
+        except (
+            urllib.error.URLError,
+            socket.timeout,
+            json.JSONDecodeError,
+            RuntimeError,
+            OSError,
+        ) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS)
+    return {
+        "task": task.name,
+        "status": "failed",
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "attempts": RETRY_ATTEMPTS,
+        **digests,
+        "error": last_error,
+    }
 
 
 def prepare_tasks(
