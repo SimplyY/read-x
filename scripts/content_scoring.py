@@ -302,7 +302,8 @@ def _relevance_result(output, context_text: str | None):
     if output is None or context_text is None or not _validate_context(context_text):
         return None, None, "unavailable", {}, ["relevance_context_unavailable"]
     errors = []
-    if not isinstance(output, dict) or output.get("schema_version") != RELEVANCE_VERSION:
+    # 兼容历史生成侧字段名 relevance_version（契约字段为 schema_version，值须一致）
+    if not isinstance(output, dict) or output.get("schema_version", output.get("relevance_version")) != RELEVANCE_VERSION:
         errors.append(f"relevance schema_version must be {RELEVANCE_VERSION}")
     else:
         if any(key in output for key in ("quality_score", "decision_score")):
@@ -326,7 +327,8 @@ def _relevance_result(output, context_text: str | None):
             errors.append("relevance rationale is required")
         if output.get("confidence") not in {"high", "medium", "low"}:
             errors.append("relevance confidence is invalid")
-        if not _nonempty(output.get("conclusion")):
+        # 结论与 generate_relevance 一致：conclusion 缺失时回退 rationale（rationale 已必填）
+        if not _nonempty(output.get("conclusion") or output.get("rationale")):
             errors.append("relevance conclusion is required")
     confidence = output.get("confidence") if isinstance(output, dict) else None
     if errors or confidence == "low":

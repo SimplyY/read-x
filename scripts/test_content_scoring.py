@@ -496,6 +496,42 @@ def test_relevance_only_raises_priority_and_never_rescues_low_quality():
     assert result["context_fingerprint"] is None
 
 
+def test_relevance_version_alias_is_accepted():
+    high_quality = quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS})
+    rel = relevance()
+    rel.pop("schema_version")
+    rel["relevance_version"] = cs.RELEVANCE_VERSION
+    result = cs.score(high_quality, SOURCE, relevance_output=rel, context_text=CONTEXT)
+    assert result["score_status"] == "scored"
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6
+    assert result["decision_score"] == 8.2
+    assert result["context_fingerprint"] is not None
+
+
+def test_relevance_version_alias_wrong_value_fails_closed():
+    high_quality = quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS})
+    rel = relevance()
+    rel.pop("schema_version")
+    rel["relevance_version"] = "9.9"
+    result = cs.score(high_quality, SOURCE, relevance_output=rel, context_text=CONTEXT)
+    assert result["relevance_score"] is None and result["interest_score"] is None
+    assert result["relevance_confidence"] == "unavailable"
+    assert result["decision_score"] == 7.0
+    assert any("relevance schema_version must be" in issue for issue in result["issues"])
+
+
+def test_relevance_version_alias_without_conclusion_falls_back_to_rationale():
+    high_quality = quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS})
+    rel = relevance()
+    rel.pop("schema_version")
+    rel["relevance_version"] = cs.RELEVANCE_VERSION
+    rel.pop("conclusion")
+    result = cs.score(high_quality, SOURCE, relevance_output=rel, context_text=CONTEXT)
+    assert result["score_status"] == "scored"
+    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6
+    assert result["decision_score"] == 8.2
+
+
 def test_boundary_waits_for_relevance_and_cannot_route():
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
@@ -549,6 +585,11 @@ def test_relevance_failure_falls_back_to_quality():
     missing_conclusion = relevance()
     missing_conclusion["conclusion"] = ""
     result = cs.score(boundary, SOURCE, relevance_output=missing_conclusion, context_text=CONTEXT)
+    assert result["relevance_score"] == 0.6  # conclusion 缺失回退 rationale，正常通过
+    no_conclusion_no_rationale = relevance()
+    no_conclusion_no_rationale["conclusion"] = ""
+    no_conclusion_no_rationale["rationale"] = ""
+    result = cs.score(boundary, SOURCE, relevance_output=no_conclusion_no_rationale, context_text=CONTEXT)
     assert result["relevance_score"] is None and "relevance conclusion is required" in result["issues"]
 
 
