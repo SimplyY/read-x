@@ -95,8 +95,12 @@
   ],
   "priority_bands": [
     {
-      "minimum": 0.5,
-      "label": "相关"
+      "minimum": 0.4,
+      "label": "高相关"
+    },
+    {
+      "minimum": 0.2,
+      "label": "轻相关"
     },
     {
       "minimum": 0.0,
