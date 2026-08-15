@@ -32,6 +32,8 @@ link-card 流程：
 - **`route=long_read`** -> long-read 全流程 -> 卡片
 - **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片
 
+**三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
+
 `scoring_result` 原样传给 long-read。任何消费者不得复制阈值、重算路由或把相关性混称为质量。完整规则见 `.agents/skills/content-scoring/SKILL.md`。
 
 ### `route=long_read` → long-read 全流程

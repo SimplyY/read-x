@@ -28,6 +28,10 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 评分在 `link-card` 阶段由 `content-scoring` 完成一次。`long-read` 只接受 `score_status=scored` 且 `route=long_read` 的 `scoring_result v3`，直接消费 `ljg_range` 与 `ljg_card`，**不得重新评分或复制阈值**。区间内只有存在互不重复的独立问题才取上限；`scoring_result.questions` 优先作为问题来源。`ljg_card=true` 时必须等主文档创建和通知成功后才开始。
 
+### 三档齐全门（硬性）
+
+对 `quality_score ≥ quality_floor`（6.0）的文章，进入交付前必须三档齐全：`relevance_score` 与 `interest_score` 都必须是实数。任一为 `null`/「待计算」/「不可用」时，禁止进入精读交付（不发精读完成卡、不发文档交付卡），先按 content-scoring 相关性隔离阶段补算相关性、兴趣两轴，三档全部算完才一起发卡交付。质量分单独不算完，交付卡不得只带质量分发出。
+
 ## 3. 隔离运行
 
 只通过 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 发送独立 `glm-5.2` 请求，固定 `store=false`，最多四请求并行。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
@@ -92,6 +96,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
 ## 6. 交付顺序
 
+0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
 1. 用 `.wx_doc.xml` 创建飞书文档；
 2. 发送文档卡片：群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
 3. 确认文档卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
@@ -114,6 +119,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 自检
 
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
+- [ ] `quality_score ≥ quality_floor` 时，交付卡是否在相关性、兴趣两轴都算完后才一起发出，未只带质量分单发？
 - [ ] `article-decode` 与每条文字 ljg 是否由脚本发出独立 `store=false` HTTP 请求？
 - [ ] 主 Agent 是否未读取分析 Skill、未角色扮演生成、未在失败时回退？
 - [ ] Evidence 是否通过严格 Schema 与逐字引文校验，summary 是否与本轮成功文件一一对应？
