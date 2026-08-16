@@ -57,6 +57,27 @@ QUALITY_DISQUALIFIERS = POLICY["quality_disqualifiers"]
 CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
+READING_CATEGORY_KEYS = ("invest", "ai", "cognition", "business", "culture", "other")
+READING_CATEGORY_LABELS = {"invest": "投资/财经", "ai": "AI/技术", "cognition": "认知/成长", "business": "商业/产业", "culture": "人文/生活", "other": "未分类"}
+_CATEGORY_SYNONYMS = [
+    ("invest", ("投资", "财经", "金融", "股票", "股市", "基金", "复利", "经济", "宏观", "能源", "energy", "财富", "资本", "估值")),
+    ("ai", ("ai", "人工智能", "大模型", "llm", "agent", "智能体", "技术", "科技", "编程", "软件", "算法", "saas", "tech")),
+    ("cognition", ("认知", "成长", "教育", "学习", "思维", "心智", "方法", "自驱力")),
+    ("business", ("商业", "产业", "创业", "公司", "企业", "管理", "组织", "战略", "创始人", "品牌")),
+    ("culture", ("人文", "生活", "艺术", "历史", "文学", "哲学", "电影", "播客", "访谈", "健康", "人生")),
+]
+
+
+def _normalize_reading_category(raw) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip().lower()
+    if value in READING_CATEGORY_KEYS:
+        return value
+    for key, terms in _CATEGORY_SYNONYMS:
+        if any(term in value for term in terms):
+            return key
+    return None
 CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 
 
@@ -239,6 +260,7 @@ def _quality_attempt(output: dict, source_text: str) -> dict:
     confidence = output.get("domain_confidence")
     if confidence not in {"high", "medium", "low"}:
         errors.append("domain_confidence is invalid")
+
     if not _nonempty(output.get("conclusion")):
         errors.append("conclusion is required")
     questions = output.get("questions", [])
@@ -412,6 +434,11 @@ def score(
 
     quality_score = first["score"]
     effective_quality_output = first["output"]
+    raw_category = _normalize_reading_category(effective_quality_output.get("reading_category"))
+    reading_category = READING_CATEGORY_LABELS.get(raw_category) if raw_category else None
+    reading_category_confidence = effective_quality_output.get("reading_category_confidence")
+    if reading_category_confidence not in {"high", "medium", "low"}:
+        reading_category_confidence = None
     quality_confidence = "medium" if recovered_invalid_attempt else quality_output["domain_confidence"]
     issues = ["invalid_attempt_recovered_by_isolated_retry"] if recovered_invalid_attempt else list(first["retry_reasons"])
     if first["retry_reasons"] and not recovered_invalid_attempt:
@@ -455,6 +482,8 @@ def score(
             "quality_dimensions": effective_quality_output["dimensions"],
             "relevance_dimensions": {},
             "conclusion": effective_quality_output.get("conclusion", ""),
+            "reading_category": reading_category,
+            "reading_category_confidence": reading_category_confidence,
             "questions": list(effective_quality_output.get("questions", []))[:3],
             "issues": issues,
         }
@@ -504,6 +533,8 @@ def score(
         "quality_dimensions": effective_quality_output["dimensions"],
         "relevance_dimensions": relevance_info,
         "conclusion": effective_quality_output.get("conclusion", ""),
+        "reading_category": reading_category,
+        "reading_category_confidence": reading_category_confidence,
         "questions": list(effective_quality_output.get("questions", []))[:3],
         "issues": issues,
     }

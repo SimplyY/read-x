@@ -93,10 +93,12 @@ def quality_run_schema(short_text: bool = False) -> dict:
             "source_status": {"type": "string", "enum": ["complete", "partial", "unknown"]},
             "primary_domain": {"type": "string", "minLength": 1}, "secondary_domain": {"type": "string"},
             "domain_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "reading_category": {"type": "string", "enum": list(scoring.READING_CATEGORY_KEYS)},
+            "reading_category_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
             "budget": {"type": "integer", "enum": [2, 3, 4, 5] if short_text else [5, 8, 12]},
             "dimensions": {"type": "object", "properties": dimensions, "required": list(dimensions), "additionalProperties": False},
         },
-        "required": ["source_status", "primary_domain", "secondary_domain", "domain_confidence", "budget", "dimensions"],
+        "required": ["source_status", "primary_domain", "secondary_domain", "domain_confidence", "reading_category", "reading_category_confidence", "budget", "dimensions"],
         "additionalProperties": False,
     }
 
@@ -151,10 +153,21 @@ def generate(parts: list[Path], timeout: float) -> dict:
     numbered = "\n".join(f"[{index}] {unit}" for index, unit in enumerate(units, 1))
     short_text = len(source) < 1000
     example_dimensions = ",".join(f'"{key}":{{"level":7.0,"unit_ids":[1],"disqualifiers":[]}}' for key in scoring.QUALITY_DIMENSIONS)
-    example = '{"source_status":"complete","primary_domain":"技术","secondary_domain":"","domain_confidence":"high","budget":' + str(2 if short_text else 5) + f',"dimensions":{{{example_dimensions}}}}}'
+    example = '{"source_status":"complete","primary_domain":"技术","secondary_domain":"","domain_confidence":"high","reading_category":"ai","reading_category_confidence":"high","budget":' + str(2 if short_text else 5) + f',"dimensions":{{{example_dimensions}}}}}'
+    category_spec = (
+        "reading_category 严格按正文核心主题归类（不以标题关键词、出现频率最高的词或作者身份归类），"
+        "只允许输出以下六个键之一（键名本身，不要写中文类目）："
+        "invest=投资/财经（围绕投资决策、市场、估值、资产配置、经济/金融、收益与风险）；"
+        "ai=AI/技术（围绕AI/技术本身的能力、原理、产品、工具、工程与科技产业趋势）；"
+        "cognition=认知/成长（围绕人的思维、学习、教育、心智、行为改变、成长与自我管理方法）；"
+        "business=商业/产业（围绕公司经营、创业、商业模式、组织、管理与产业竞争）；"
+        "culture=人文/生活（围绕历史、哲学、文学、艺术、生活方式、健康与人际关系）；"
+        "other=以上均不匹配。若正文以AI或技术为背景、但核心是教育/认知，归cognition；核心是投资，归invest。"
+    )
     prompt = (
         "一次判断三个质量维度。三维严格按数值语义各判一次，不读取或推断用户画像。"
         "每维 unit_ids 只保留直接决定该分数的原文单元；不要输出过程、事实枚举、理由、上限或总分。"
+        f"{category_spec}"
         f"只输出同形状单行 JSON：{example}\n<quality_rubric>\n{rubric}\n</quality_rubric>"
         f"\n<blind_source>\n{numbered}\n</blind_source>"
     )
@@ -187,6 +200,7 @@ def generate(parts: list[Path], timeout: float) -> dict:
     return {
         "schema_version": scoring.QUALITY_VERSION, "source_status": result["source_status"],
         "detected_domain": {"primary": result["primary_domain"], "secondary": result["secondary_domain"]},
+        "reading_category": result["reading_category"], "reading_category_confidence": result["reading_category_confidence"],
         "claim_ledger": ledger, "dimensions": output_dimensions, "domain_confidence": result["domain_confidence"],
         "conclusion": ledger[0]["claim"], "questions": [],
     }

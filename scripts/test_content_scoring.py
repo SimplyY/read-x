@@ -801,6 +801,54 @@ def test_depth_ljg_merged_into_quality_bands():
     assert cs._depth(7.4) == ([0, 1], False)
 
 
+
+def test_reading_category_passes_through_when_valid():
+    q = quality()
+    q["reading_category"] = "ai"
+    q["reading_category_confidence"] = "high"
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result["score_status"] == "scored"
+    assert result["reading_category"] == "AI/技术"
+    assert result["reading_category_confidence"] == "high"
+
+
+def test_reading_category_is_optional_for_backward_compat():
+    q = quality()
+    assert "reading_category" not in q
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result["score_status"] == "scored"
+    assert result.get("reading_category") is None
+
+
+
+def test_reading_category_free_text_is_normalized():
+    cases = {"科技/技术": "AI/技术", "人工智能": "AI/技术", "投资与金融": "投资/财经", "energy": "投资/财经", "认知与成长": "认知/成长", "other": "未分类"}
+    for raw, expected in cases.items():
+        q = quality()
+        q["reading_category"] = raw
+        result = cs.score(q, SOURCE, relevance_unavailable=True)
+        assert result["score_status"] == "scored"
+        assert result["reading_category"] == expected, f"{raw!r} -> {result['reading_category']!r}"
+    q = quality()
+    q["reading_category"] = "深度解析"
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result.get("reading_category") is None, "无法归类的自由文本不强行贴标签"
+
+
+def test_reading_category_invalid_is_nonfatal_and_not_passed_through():
+    q = quality()
+    q["reading_category"] = "随便写"
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result["score_status"] == "scored"
+    assert result.get("reading_category") is None, "无效分类不阻断评分，也不泄露脏值"
+    q["reading_category"] = "other"
+    q["reading_category_confidence"] = "maybe"
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result["score_status"] == "scored"
+    assert result.get("reading_category") == "未分类"
+    assert result.get("reading_category_confidence") is None
+
+
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
 
 
