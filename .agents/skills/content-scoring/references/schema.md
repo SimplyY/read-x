@@ -58,7 +58,7 @@
 ```json
 {
   "schema_version": "3.0",
-  "relevance_score": 0.6,
+  "relevance_score": 0.5,
   "interest_score": 0.4,
   "matched_mainlines": ["AI 产业认知"],
   "matched_interests": ["价值投资"],
@@ -70,8 +70,8 @@
 
 约束：
 
-- `relevance_score` 是 0 到 `relevance_bonus.relevance_max`（0.6）的数值，按内容对飞鱼元主线的命中程度给分；脚本 clamp 到 `[0, 0.6]`。
-- `interest_score` 是 0 到 `relevance_bonus.interest_max`（0.6）的数值，按内容对飞鱼领域兴趣区块的命中程度给分；脚本 clamp 到 `[0, 0.6]`。两轴相加为总 bonus，自然 ≤ `relevance_bonus.max`（1.2）。
+- `relevance_score` 是 0 到 `relevance_bonus.relevance_max`（0.5）的数值，按内容对飞鱼元主线的命中程度给分；脚本 clamp 到 `[0, 0.5]`。
+- `interest_score` 是 0 到 `relevance_bonus.interest_max`（0.5）的数值，按内容对飞鱼领域兴趣区块的命中程度给分；脚本 clamp 到 `[0, 0.5]`。两轴相加为总 bonus，自然 ≤ `relevance_bonus.max`（1.0）。
 - `relevance_score>0` 时 `matched_mainlines` 非空；`interest_score>0` 时 `matched_interests` 非空。
 - 判定看内容吻合度与相关性，不以作者身份/名气单独判断。
 - `confidence=low` 时脚本不采用相关性，决策分回退质量分。
@@ -89,8 +89,8 @@
   "score_status": "scored|needs_relevance|needs_full_text|needs_review",
   "quality_score": 8.0,
   "quality_confidence": "high|medium|low",
-  "relevance_score": 0.6,
-  "interest_score": 0.6,
+  "relevance_score": 0.5,
+  "interest_score": 0.5,
   "relevance_confidence": "high|medium|unavailable",
   "decision_score": 9.2,
   "quality_label": "完整深读",
@@ -101,7 +101,7 @@
   "ljg_card": true,
   "claims": [],
   "quality_dimensions": {},
-  "relevance_dimensions": {"relevance_score": 0.6, "interest_score": 0.6, "matched_mainlines": [], "matched_interests": [], "rationale": ""},
+  "relevance_dimensions": {"relevance_score": 0.5, "interest_score": 0.5, "matched_mainlines": [], "matched_interests": [], "rationale": ""},
   "conclusion": "",
   "questions": [],
   "issues": []
@@ -114,7 +114,7 @@
 
 `quality_score < quality_floor` 的低质量文章不运行相关性：`relevance_score=null`、`interest_score=null`、`context_fingerprint=null`、`decision_score=quality_score`、`priority_label=未计算（不影响本次路由）`、`interest_label=未计算（不影响本次路由）`。`quality_score ≥ quality_floor` 的文章一律计算相关性；`route` 仅由 `quality_score ≥ quality_floor` 且 `decision_score ≥ long_read_threshold` 决定（高质量已 long_read，bonus 不改 route），但 `ljg_range` 与 `ljg_card` 按 `decision_score` 计算深度档，因此相关+兴趣会抬高高质文章的精读深度，并决定边界带（7.0-7.9）能否进 card 档。`< quality_floor` 时双满档也拉不进精读。
 
-`relevance_score` 语义为 `quality_score ≥ quality_floor` 文章的 relevance 轴生效分（0 到 `relevance_bonus.relevance_max`，0.6）；`interest_score` 为兴趣轴生效分（0 到 `relevance_bonus.interest_max`，0.6）。决策分 `decision_score = quality_score + relevance_score + interest_score`，bonus 非负故深度档单向提档不降档；`< quality_floor` 或相关性不可用时两者为 null，`decision_score = quality_score`。
+`relevance_score` 语义为 `quality_score ≥ quality_floor` 文章的 relevance 轴生效分（0 到 `relevance_bonus.relevance_max`，0.5）；`interest_score` 为兴趣轴生效分（0 到 `relevance_bonus.interest_max`，0.5）。决策分 `decision_score = quality_score + relevance_score + interest_score`，bonus 非负故深度档单向提档不降档；`< quality_floor` 或相关性不可用时两者为 null，`decision_score = quality_score`。
 
 指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `full.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
 

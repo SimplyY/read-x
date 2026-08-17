@@ -65,7 +65,7 @@ def quality(dimension_scores=None, confidence="high", source_status="complete", 
     }
 
 
-def relevance(relevance_score=0.6, interest_score=0.6, confidence="high"):
+def relevance(relevance_score=0.5, interest_score=0.5, confidence="high"):
     return {
         "schema_version": cs.RELEVANCE_VERSION,
         "relevance_score": relevance_score,
@@ -358,14 +358,12 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
     scoring_skill = (Path(cs.__file__).parents[1] / ".agents/skills/content-scoring/SKILL.md").read_text(encoding="utf-8")
     quality_runtime = (Path(cs.__file__).parents[1] / ".agents/skills/content-scoring/references/quality-runtime.md").read_text(encoding="utf-8")
-    assert "不得只把它写入 COT/过程卡" in skill
-    assert "用户可见的评分过程消息只允许一条" in skill
-    assert "标题用于并行任务配对" in skill
+    assert "评分期间不发送任何用户可见过程消息" in skill
+    assert "每次处理链接的第一步都必须重新读取本文件当前版本" in skill
     assert "mktemp -d /tmp/readx-score.XXXXXX" in skill
     assert "禁止固定共享路径" in skill
     assert "scripts/prepare_scoring_run.py <URL>" in skill
     assert "禁止在模型中自行 `mktemp`" in skill and "重建标题路径" in skill
-    assert "过程消息只能在 `source.md` 已存在" in skill
     assert "主张、引用、枚举、三维输出和 JSON 自检只遵循 `quality-runtime.md`" in skill
     assert "渲染器退出码为 0 即视为卡片结构验证通过" in skill
     assert "/Users/yuwei/code/read-x/scripts/content_scoring.py" in skill
@@ -503,8 +501,8 @@ def test_relevance_version_alias_is_accepted():
     rel["relevance_version"] = cs.RELEVANCE_VERSION
     result = cs.score(high_quality, SOURCE, relevance_output=rel, context_text=CONTEXT)
     assert result["score_status"] == "scored"
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6
-    assert result["decision_score"] == 8.2
+    assert result["relevance_score"] == 0.5 and result["interest_score"] == 0.5
+    assert result["decision_score"] == 8.0
     assert result["context_fingerprint"] is not None
 
 
@@ -528,8 +526,8 @@ def test_relevance_version_alias_without_conclusion_falls_back_to_rationale():
     rel.pop("conclusion")
     result = cs.score(high_quality, SOURCE, relevance_output=rel, context_text=CONTEXT)
     assert result["score_status"] == "scored"
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6
-    assert result["decision_score"] == 8.2
+    assert result["relevance_score"] == 0.5 and result["interest_score"] == 0.5
+    assert result["decision_score"] == 8.0
 
 
 def test_boundary_waits_for_relevance_and_cannot_route():
@@ -562,9 +560,10 @@ def test_relevance_can_rescue_only_boundary_quality():
         "transfer_durability": 7.0,
     }
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.8 and result["decision_score"] == 8.0
-    assert result["route"] == "long_read" and result["ljg_range"] == [1, 1]
-    assert result["ljg_card"] is True
+    # 双满档降为 1.0 后，边界质量 6.8 只抬深度不再进 card
+    assert result["quality_score"] == 6.8 and result["decision_score"] == 7.8
+    assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
+    assert result["ljg_card"] is False
 
 
 def test_relevance_failure_falls_back_to_quality():
@@ -585,7 +584,7 @@ def test_relevance_failure_falls_back_to_quality():
     missing_conclusion = relevance()
     missing_conclusion["conclusion"] = ""
     result = cs.score(boundary, SOURCE, relevance_output=missing_conclusion, context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6  # conclusion 缺失回退 rationale，正常通过
+    assert result["relevance_score"] == 0.5  # conclusion 缺失回退 rationale，正常通过
     no_conclusion_no_rationale = relevance()
     no_conclusion_no_rationale["conclusion"] = ""
     no_conclusion_no_rationale["rationale"] = ""
@@ -614,40 +613,41 @@ def test_relevance_and_interest_scores_clamped_per_axis():
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
         "transfer_durability": 7.0,
     }  # 6.8, relevance boundary
-    # 相关轴独立封顶 0.6
+    # 相关轴独立封顶 0.5
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(relevance_score=0.8, interest_score=0.0), context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.0 and result["decision_score"] == 7.4
-    # 兴趣轴独立封顶 0.6
+    assert result["relevance_score"] == 0.5 and result["interest_score"] == 0.0 and result["decision_score"] == 7.3
+    # 兴趣轴独立封顶 0.5
     over_int = relevance(relevance_score=0.0, interest_score=1.5)
     result = cs.score(quality(grades), SOURCE, relevance_output=over_int, context_text=CONTEXT)
-    assert result["interest_score"] == 0.6 and result["decision_score"] == 7.4
-    # 双轴满档 1.2
-    both = relevance(relevance_score=0.6, interest_score=0.6)
+    assert result["interest_score"] == 0.5 and result["decision_score"] == 7.3
+    # 双轴满档 1.0
+    both = relevance(relevance_score=0.5, interest_score=0.5)
     result = cs.score(quality(grades), SOURCE, relevance_output=both, context_text=CONTEXT)
-    assert result["relevance_score"] == 0.6 and result["interest_score"] == 0.6 and result["decision_score"] == 8.0
+    assert result["relevance_score"] == 0.5 and result["interest_score"] == 0.5 and result["decision_score"] == 7.8
     # 双零回质量基线
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
     assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.8
 
 
 def test_depth_uses_joint_decision_score():
-    # 边界 q6.8 + 双满档 bonus 1.2 -> decision 8.0 -> [1,1]有卡（边界带双满档进 card）
+    # 边界 q6.8 + 双满档 bonus 1.0 -> decision 7.8 -> [0,1]无卡（双满档降档后不够进 card）
     grades = {
         "evidence_quality": 6.0, "insight_explanatory": 7.0,
         "transfer_durability": 7.0,
     }
-    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 6.8 and result["decision_score"] == 8.0
-    assert result["ljg_range"] == [1, 1] and result["ljg_card"] is True
-    # q7.0 + 双满档 -> decision 8.2 -> [1,1]+卡（边界质量带双轴合力才进 card）
+    both = relevance(relevance_score=0.5, interest_score=0.5)
+    result = cs.score(quality(grades), SOURCE, relevance_output=both, context_text=CONTEXT)
+    assert result["quality_score"] == 6.8 and result["decision_score"] == 7.8
+    assert result["ljg_range"] == [0, 1] and result["ljg_card"] is False
+    # q7.0 + 双满档 -> decision 8.0 -> [1,1]+卡（边界质量带双轴合力才进 card）
     card_grades = {key: 7.0 for key in cs.QUALITY_DIMENSIONS}
     result = cs.score(quality(card_grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    assert result["quality_score"] == 7.0 and result["decision_score"] == 8.2
+    assert result["quality_score"] == 7.0 and result["decision_score"] == 8.0
     assert result["ljg_range"] == [1, 1] and result["ljg_card"] is True
-    # q7.0 + 单轴满档 0.6 -> decision 7.6 -> [0,1]无卡（单轴不够进 card）
-    single = relevance(relevance_score=0.6, interest_score=0.0)
+    # q7.0 + 单轴满档 0.5 -> decision 7.5 -> [0,1]无卡（单轴不够进 card）
+    single = relevance(relevance_score=0.5, interest_score=0.0)
     result = cs.score(quality(card_grades), SOURCE, relevance_output=single, context_text=CONTEXT)
-    assert result["decision_score"] == 7.6
+    assert result["decision_score"] == 7.5
     assert result["ljg_range"] == [0, 1] and result["ljg_card"] is False
 
 
@@ -656,31 +656,28 @@ def test_three_axis_routing_matrix():
     def run(q, rel, int_):
         grades = {key: q for key in cs.QUALITY_DIMENSIONS}
         return cs.score(quality(grades), SOURCE, relevance_output=relevance(rel, int_), context_text=CONTEXT)
-    # q6.5 双满档也拉不进 card（7.7<8.0）
-    r = run(6.5, 0.6, 0.6)
-    assert r["quality_score"] == 6.5 and r["decision_score"] == 7.7
+    # q6.5 双满档也拉不进 card（7.5<8.0）
+    r = run(6.5, 0.5, 0.5)
+    assert r["quality_score"] == 6.5 and r["decision_score"] == 7.5
     assert r["route"] == "long_read" and r["ljg_range"] == [0, 1] and r["ljg_card"] is False
-    # q7.0 单轴满档不够进 card（7.6<8.0）
-    r = run(7.0, 0.6, 0.0)
-    assert r["decision_score"] == 7.6 and r["ljg_card"] is False
-    # q7.0 双轴合计 1.0 进 card（8.0）
-    r = run(7.0, 0.4, 0.6)
+    # q7.0 单轴满档不够进 card（7.5<8.0）
+    r = run(7.0, 0.5, 0.0)
+    assert r["decision_score"] == 7.5 and r["ljg_card"] is False
+    # q7.0 双轴合计 0.9 不进 card（7.9<8.0）
+    r = run(7.0, 0.4, 0.5)
+    assert r["decision_score"] == 7.9 and r["ljg_range"] == [0, 1] and r["ljg_card"] is False
+    # q7.0 双满档 8.0 进 card
+    r = run(7.0, 0.5, 0.5)
     assert r["decision_score"] == 8.0 and r["ljg_range"] == [1, 1] and r["ljg_card"] is True
-    # q7.0 双满档 8.2 进 card
-    r = run(7.0, 0.6, 0.6)
-    assert r["decision_score"] == 8.2 and r["ljg_range"] == [1, 1] and r["ljg_card"] is True
     # q8.0 零相关零兴趣仍 card（质量基线 8.0）
     r = run(8.0, 0.0, 0.0)
     assert r["decision_score"] == 8.0 and r["ljg_range"] == [1, 1] and r["ljg_card"] is True
-    # q8.0 双满档 -> 9.2 [2,3]
-    r = run(8.0, 0.6, 0.6)
-    assert r["decision_score"] == 9.2 and r["ljg_range"] == [2, 3] and r["ljg_card"] is True
+    # q8.0 双满档 -> 9.0 [2,3]
+    r = run(8.0, 0.5, 0.5)
+    assert r["decision_score"] == 9.0 and r["ljg_range"] == [2, 3] and r["ljg_card"] is True
     # q8.5 零相关零兴趣 [1,2]
     r = run(8.5, 0.0, 0.0)
     assert r["decision_score"] == 8.5 and r["ljg_range"] == [1, 2] and r["ljg_card"] is True
-    # q9.0 零相关零兴趣 [2,3]
-    r = run(9.0, 0.0, 0.0)
-    assert r["decision_score"] == 9.0 and r["ljg_range"] == [2, 3] and r["ljg_card"] is True
 
 
 def test_cli_end_to_end_success_and_failure_routes():
@@ -713,8 +710,8 @@ def test_cli_end_to_end_success_and_failure_routes():
             "transfer_durability": 7.0,
         }
         result = run_cli(quality(boundary))
-        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.8, 0.6, 0.6, 8.0)
-        assert result["route"] == "long_read" and result["ljg_range"] == [1, 1]
+        assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.8, 0.5, 0.5, 7.8)
+        assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
 
         quality_path.write_text(json.dumps(quality(boundary), ensure_ascii=False), encoding="utf-8")
         completed = subprocess.run(

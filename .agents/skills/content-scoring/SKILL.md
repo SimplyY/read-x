@@ -33,7 +33,7 @@ link-card 抓取正文
 
 调用方先生成 `blind-source.md`，再调用 `scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。该脚本把匿名正文与 `quality-runtime.md` 的三维数值语义一次发送到既有本地 MoonBridge `/v1/responses`，固定使用当前 `glm-5.2`；该模型没有可调推理等级，脚本不传推理覆盖。模型在一个 JSON 中直接返回证据、洞察、迁移三维等级及其原文单元、全局元数据和一次主张预算；脚本校验等级与逐字引用并组装质量 JSON。请求使用 JSON Schema，`store=false`；契约偏差失败关闭。输入不含 URL、标题、作者、日期、用户意见、锚点、目标区间、主代理预判或前序对话。
 
-评分起点后执行路径已经确定，不再现场设计：同一响应并行发送评分起点并运行上述一次性质量命令；主 Agent 禁止读取匿名正文或质量运行契约。过程消息失败则丢弃模型结果；本地运行时不可用、请求超时或未生成合法文件时直接失败关闭，不得退回主上下文评分或嵌套 `codex exec`。命令完成后的下一次响应只运行 `content_scoring.py`；若结果不是 `needs_relevance`，同一命令立即渲染并发送卡片，只有边界结果才返回主代理继续相关性。禁止能力探测、搜索实现、创建 plan/任务文件、重读 Skill/schema/policy/脚本、用 shell 逐条检查引用或现场修 JSON。
+质量命令执行路径已经确定，不再现场设计：直接运行上述一次性质量命令；主 Agent 禁止读取匿名正文或质量运行契约。本地运行时不可用、请求超时或未生成合法文件时直接失败关闭，不得退回主上下文评分或嵌套 `codex exec`。命令完成后的下一次响应只运行 `content_scoring.py`；若结果不是 `needs_relevance`，同一命令立即渲染并发送卡片，只有边界结果才返回主代理继续相关性。禁止能力探测、搜索实现、创建 plan/任务文件、重读 Skill/schema/policy/脚本、用 shell 逐条检查引用或现场修 JSON。
 
 ## 第五步：按需相关性隔离评分
 
@@ -47,10 +47,10 @@ link-card 抓取正文
 
 相关性隔离上下文只接收文章元数据、`claim_ledger` 和上述文件，输出 `relevance_output v3`：对两条独立轴各给一个分。
 
-- **方向相关 `relevance_score`**（0 到 `relevance_bonus.relevance_max`，0.6）：按文章**内容**对飞鱼元主线的命中程度。
-- **领域兴趣 `interest_score`**（0 到 `relevance_bonus.interest_max`，0.6）：按文章**内容**对飞鱼领域兴趣区块（full.md 第五区块「领域兴趣」）的命中程度。
+- **方向相关 `relevance_score`**（0 到 `relevance_bonus.relevance_max`，0.5）：按文章**内容**对飞鱼元主线的命中程度。
+- **领域兴趣 `interest_score`**（0 到 `relevance_bonus.interest_max`，0.5）：按文章**内容**对飞鱼领域兴趣区块（full.md 第五区块「领域兴趣」）的命中程度。
 
-两轴等权对等，各 max 0.6，合 max 1.2。飞鱼元主线（从 full.md 长期校准 + 当前主线提炼）：AI 产业认知、价值投资、教育+AI、AI 时代探索。飞鱼领域兴趣从 full.md「领域兴趣」区块读取，由用户定期刷新。
+两轴等权对等，各 max 0.5，合 max 1.0。飞鱼元主线（从 full.md 长期校准 + 当前主线提炼）：AI 产业认知、价值投资、教育+AI、AI 时代探索。飞鱼领域兴趣从 full.md「领域兴趣」区块读取，由用户定期刷新。
 
 判定原则（第一性）：
 - 看内容吻合度与相关性，不以作者身份/名气单独判断。李开复谈 AI 产业命中，李开复谈无关话题不命中。
@@ -62,15 +62,15 @@ link-card 抓取正文
 - 0：未命中任何元主线
 - 0.2~0.3：轻命中（蹭热点/泛泛提及）
 - 0.4~0.5：实质命中一个元主线
-- 0.6：多主线或深度推进（满档）
+- 0.5：多主线或深度推进且极高相关（满档，谨慎给）
 
 `interest_score` 锚点：
 - 0：未命中兴趣领域
 - 0.2~0.3：边缘兴趣（沾边）
 - 0.4~0.5：明确兴趣领域
-- 0.6：核心兴趣领域或当下强好奇（满档）
+- 0.5：核心兴趣领域且极高兴趣或当下强好奇（满档，仅极高兴趣才给）
 
-不得把 YWNext 当作文章事实，不得把其私有原文抄进用户卡片。结构损坏（缺四个区块）、输出无效或置信度 low 时令相关性不可用；过期仅降权不阻断。兴趣区块缺失时 `interest_score` 给 0，bonus 退化为纯相关（max 0.6）。
+不得把 YWNext 当作文章事实，不得把其私有原文抄进用户卡片。结构损坏（缺四个区块）、输出无效或置信度 low 时令相关性不可用；过期仅降权不阻断。兴趣区块缺失时 `interest_score` 给 0，bonus 退化为纯相关（max 0.5）。
 
 ## 第六步：确定性计算
 
@@ -93,7 +93,7 @@ YWNext 缺失或结构损坏时，不生成相关性，确定性结束边界状�
 python3 scripts/content_scoring.py quality_output.json source.md --relevance-unavailable
 ```
 
-决策分公式（第一性，加法）：`decision_score = quality_score + relevance_score + interest_score`。`relevance_score` 与 `interest_score` 各 clamp 到 0.6，总 bonus 自然 ≤ 1.2（仅 `quality_score ≥ quality_floor` 时生效，否则两轴为 0.0）；相关性不可用时 `decision_score = quality_score`。`route = long_read` 当 `quality_score ≥ quality_floor` 且 `decision_score ≥ long_read_threshold`。
+决策分公式（第一性，加法）：`decision_score = quality_score + relevance_score + interest_score`。`relevance_score` 与 `interest_score` 各 clamp 到 0.5，总 bonus 自然 ≤ 1.0（仅 `quality_score ≥ quality_floor` 时生效，否则两轴为 0.0）；相关性不可用时 `decision_score = quality_score`。`route = long_read` 当 `quality_score ≥ quality_floor` 且 `decision_score ≥ long_read_threshold`。
 
 完整字段见 `references/schema.md`。调用方只消费 `score_status`、三个分数、`route`、`ljg_range`、`ljg_card` 和展示字段：
 
@@ -101,7 +101,7 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 - `needs_relevance`：仅作为内部暂停态；`decision_score`、`route`、`ljg_range` 为空，不得分派。
 - `scored`：按 `route` 分派；不得人工覆盖。
 - `quality_score < quality_floor` 的文章 `relevance_score=null`、`interest_score=null`、`decision_score=quality_score`、`priority_label=未计算（不影响本次路由）`、`interest_label=未计算（不影响本次路由）`；`≥ quality_floor` 一律计算相关性。
-- 深度档 `ljg_range` 与 `ljg_card` 按 `decision_score` 计算：bonus 非负故单向提档不降档。高质量（`≥ long_read_threshold`）bonus 不改 route，但会抬高精读深度；边界带（7.0-7.9）靠 bonus 把 `decision_score` 推过 8.0 才进 card 档（单轴 0.6 在 q≥7.4 时即够，双轴合计 ≥1.0 对任意 q≥7.0 都够）；`< quality_floor` 双满档也拉不进精读。long-read 直接消费脚本算出的 `ljg_range` 与 `ljg_card`，不得自行用相关性二次抬高。
+- 深度档 `ljg_range` 与 `ljg_card` 按 `decision_score` 计算：bonus 非负故单向提档不降档。高质量（`≥ long_read_threshold`）bonus 不改 route，但会抬高精读深度；边界带（7.0-7.9）靠 bonus 把 `decision_score` 推过 8.0 才进 card 档（单轴 0.5 在 q≥7.5 时即够，双轴合计 1.0 仅对 q≥7.0 恰好够）；`< quality_floor` 双满档也拉不进精读。long-read 直接消费脚本算出的 `ljg_range` 与 `ljg_card`，不得自行用相关性二次抬高。
 
 ## 隔离重评协议
 

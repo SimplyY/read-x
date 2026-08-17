@@ -10,6 +10,8 @@ dispatch_intent: "link-card"
 
 群内收到任何链接，先抓取内容、做内容质量判断，然后决定走深度分析还是轻量摘要，最后用卡片形式私聊发给触发者本人（群聊场景发 `bridge_context.senderId`；p2p 场景 `chatId` 即私聊会话，只发一次）。**所有卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
 
+每次处理链接的第一步都必须重新读取本文件当前版本；长会话不得沿用启动时缓存的旧流程。若已读版本仍包含评分过程消息，必须放弃该版本并重读。
+
 ## 第一性原理
 
 **为什么用卡片？**
@@ -76,7 +78,7 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 微信公众号只运行一次 `python3 /Users/yuwei/code/read-x/scripts/prepare_scoring_run.py <URL>`。它调用 `wx_fast.py` 进行纯 HTTP 抓取，不启动或回退任何浏览器；确定性创建独立 `run_dir`、解析唯一保存路径、复制并核对 `source.md`、生成匿名正文，最终只输出含绝对路径和文章元数据的 JSON。HTTP 失败即失败关闭。禁止在模型中自行 `mktemp`、解析 `fetch.log`、重建标题路径、扫描 output、调用 `grep -P` 或重复抓取。
 
-非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。过程消息只能在 `source.md` 已存在并核对 URL 后发送。
+非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。
 
 | 链接类型 | 抓取方式 |
 |---------|---------|
@@ -118,7 +120,7 @@ else:
 
 ### 命中后的处理
 
-1. **跳过 content-scoring**：不调 `generate_quality.py`、不调 `content_scoring.py`、不发「正文抓取完成，开始评分」过程消息、不发评分卡。
+1. **跳过 content-scoring**：不调 `generate_quality.py`、不调 `content_scoring.py`、不发评分过程消息、不发评分卡。
 2. **直接按 genre-rules 周刊专项生成卡片**：读 `source.md`，按周刊板块解析。USER.md 仅用于筛选层决定保留/去掉哪些板块，正文不逐条贴用户画像标签（见 genre-rules.md 第1节「相关性约束」）。
 3. **卡片输出**：`--as bot`，群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次；不生成飞书文档。
 4. **卡片不显示评分**：专项快通道不发评分卡，卡片 header 用「📖 《周刊标题》(第X期)」，body 直接是板块化解析内容 + 原文链接。
@@ -143,9 +145,9 @@ else:
 
 ### 调用 content-scoring
 
-1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的**下一次模型响应只发并行工具调用，不写解释**：一边用 `lark-cli im +messages-send --as bot --user-id <senderId> --msg-type text --text "正文抓取完成，开始评分｜<文章标题>" --format json` 私聊发送过程消息（p2p 改用 `--chat-id <chatId>`），一边执行第 2 步的闭卷质量命令。过程消息成功是质量结果生效的硬门；发送失败则丢弃模型结果并 fail closed。不得只把它写入 COT/过程卡；飞书创建时间是评分主指标起点，标题用于并行任务配对。
+1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过既有本地 MoonBridge 直接调用相同 `glm-5.2`，不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。命令失败、超时或未生成文件时失败关闭，禁止回退主上下文、启动子 Agent 或嵌套 `codex exec`。
-3. 质量命令与过程消息均成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿第一个 `scoring_result v3.15`。
+3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿第一个 `scoring_result v3.15`。
 4. 若 `score_status=needs_relevance`，才读取 YWNext `full.md`：结构齐全则在独立上下文生成 `relevance_output v3` 并再跑脚本；缺失或结构损坏则使用 `--relevance-unavailable` 确定性结束。过期只降权。相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
@@ -167,14 +169,14 @@ fi
 ### 评分快路径（禁止探索性往返）
 
 - 脚本固定为 `/Users/yuwei/code/read-x/scripts/content_scoring.py`；不搜索、不定位。
-- 抓取后的第一个工具批次同时发送评分起点并运行一次性闭卷质量命令。评分起点后禁止再查脚本用法、创建 plan、生成任务文件或确认 `codex exec`。
+- 抓取后的第一个工具批次只运行一次性闭卷质量命令。此后禁止再查脚本用法、创建 plan、生成任务文件或确认 `codex exec`。
 - 主 Agent 不读取评分材料；`generate_quality.py` 只读 `blind_source_parts` 和 `quality-runtime.md`，用一次模型调用直接判断证据、洞察、迁移三维等级，裁决一次预算并从原文组装引用，一次写出 `quality-output.json`。
 - 禁止把完整 content-scoring Skill、原始 `source.md`、`references/anchors.md`、任何锚点视图、schema、policy、URL、标题或用户对话传入质量 Agent；数值由脚本独占。
-- 从“正文抓取完成，开始评分”到评分卡，非边界文章只允许：①并行发送起点与运行质量命令；②运行脚本并在同一命令渲染发送。只有 `needs_relevance` 才插入相关性响应。期间禁止用户可见解释、help、能力探测、搜索实现、方案设计、创建中间任务说明、重复读文件或手工核验引用。
+- 从抓取完成到评分卡，非边界文章只允许：①运行质量命令；②运行脚本并在同一命令渲染发送。只有 `needs_relevance` 才插入相关性响应。期间禁止用户可见解释、help、能力探测、搜索实现、方案设计、创建中间任务说明、重复读文件或手工核验引用。
 - 第一次 `content_scoring.py`、非边界卡片渲染与发送必须在同一个工具调用中完成；先按 `score_status` 分支，不复制 6/7 数值阈值。脚本发现结构/枚举/引用错误时按既有失败关闭发送状态卡，不在当前上下文现场修 JSON 后重跑。只有契约规定的 fresh-context 隔离重评可产生第二份质量输出。
 - 同一正文只读一次；引用失败直接按契约关闭，不在当前上下文返工。
 - 不手算权重、证据封顶、档位或路由；不在运行脚本前做“预判”。
-- 用户可见的评分过程消息只允许一条：`正文抓取完成，开始评分｜<文章标题>`；禁止再发“正在评分”、字数或步骤复述。
+- 评分期间不发送任何用户可见过程消息，最终只发评分卡。
 - 不为发卡再次阅读 Skill、schema 或 policy；卡片只消费已校验的 `scoring_result` 和文章元数据。
 - 禁止手写卡片 JSON 或用 heredoc 组装。用 `/Users/yuwei/code/read-x/scripts/render_score_card.py <run_dir>/scoring-result.json --title ... --author ... --date ... --url ... [--score-only] --output <run_dir>/score-card.json` 生成经验证的 CardKit 2.0 JSON，再用 `lark-cli` 发送。
 - 渲染器退出码为 0 即视为卡片结构验证通过；禁止再读取、筛选或人工核对生成的卡片 JSON。

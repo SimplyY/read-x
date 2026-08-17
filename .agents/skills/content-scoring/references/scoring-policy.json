@@ -29,9 +29,9 @@
     {"maximum_dimension_score": 4, "quality_cap": 6.9}
   ],
   "relevance_bonus": {
-    "max": 1.2,
-    "relevance_max": 0.6,
-    "interest_max": 0.6
+    "max": 1.0,
+    "relevance_max": 0.5,
+    "interest_max": 0.5
   },
   "route": {
     "quality_floor": 6.0,
