@@ -87,6 +87,16 @@
 
 只依据原文内部支撑，不用模型记忆或外部事实核验文章真伪。标准机制或资料转述即使能排列成因果链，洞察仍为 6.0；“模型以前见过”不等于资料转述。方法是否原创只影响洞察，不降低已成立的迁移价值；外部复现、来源和样本数只限制证据，不得压低迁移。文笔、名气、标题、篇幅和个人相关性不计分。唯一硬反证是：证据只有说明性故事、零散轶事或类比时用 `only_illustrative_or_anecdotal`（证据封顶 6）；详细第一手过程案例不触发。其余维度 `disqualifiers=[]`。
 
+## 哲理/思想类轨道
+
+当正文本质为哲理、思想、历史沉思或人生观照（重构对人性、价值、生活或历史的看法，而非提供可直接操作的机制或方法）时，改按本轨道判三维，并应把 `reading_category` 判为 `culture`。权重不变（0.2/0.4/0.4）。
+
+- `evidence_quality`：按「论证自洽与诚实」判：立场是否清晰、推理是否自洽、边界是否诚实。思辨、类比、思想实验是这类正文的正当论证形式，不触发 `only_illustrative_or_anecdotal`，不因缺乏实证数据封顶。
+- `insight_explanatory`：按「认知重构力度」判：是否给出非显然判断，是否重构读者对人性/价值/生活/历史的既有核心看法。哲理洞察往往间接，不以机制或操作形式出现，但深刻。间接性不扣分。能重构一个核心看法的认知，洞察可达 8～9。
+- `transfer_durability`：按「持久透镜」判：能否沉淀为长期改变看法的世界观、透镜或内在秩序，跨场景、跨时间持续生效。不要求可操作的方法或行动映射。持久透镜可达 8～9。
+
+`reading_category=culture` 但正文实为可直接操作的实用内容时，一律用上一节通用三维语义，不得套本轨道。
+
 ## 最终 JSON
 
 顶层字段固定为：`schema_version:"3.15"`、`source_status`、`detected_domain:{primary,secondary}`、`claim_ledger`、`dimensions`、`domain_confidence`（仅 `high|medium|low`）、`conclusion`、`questions`。禁止输出 `calibration`。

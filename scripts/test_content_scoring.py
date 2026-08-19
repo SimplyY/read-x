@@ -283,14 +283,14 @@ def test_external_anchor_audit_view_is_anonymous_and_leave_one_out():
     }
     for key, private_reason in targets.items():
         blinded, excluded = anchor_view.build_view(f"https://mp.weixin.qq.com/s/{key}", source)
-        assert excluded is True and blinded.count("\n## A") == 6
+        assert excluded is True and blinded.count("\n## A") == 7
         assert key not in blinded and private_reason not in blinded
         assert "用户区间" not in blinded and "校准结果" not in blinded
         assert "核心主张" not in blinded and "原文：" not in blinded and "（C1" not in blinded
     ordinary, excluded = anchor_view.build_view("https://example.com/article", source)
     ordinary_again, excluded_again = anchor_view.build_view("https://example.com/article", source)
     assert excluded is False and excluded_again is False
-    assert ordinary == ordinary_again and ordinary.count("\n## A") == 6
+    assert ordinary == ordinary_again and ordinary.count("\n## A") == 7
     assert "核心主张" not in ordinary and len(ordinary) < len(source) / 2
 
 
@@ -775,10 +775,10 @@ def test_cli_output_files_avoid_shell_redirection():
         ], check=True, capture_output=True, text=True)
         assert result["score_status"] == "scored"
         assert json.loads(card_path.read_text(encoding="utf-8"))["schema"] == "2.0"
-        assert anchor_path.read_text(encoding="utf-8").count("\n## A") == 6
+        assert anchor_path.read_text(encoding="utf-8").count("\n## A") == 7
         assert blind_path.read_text(encoding="utf-8") == SOURCE + "\n"
         assert blind_completed.stdout == blind_completed.stderr == ""
-        assert anchor_completed.stderr.strip() == "anchor-view: count=6"
+        assert anchor_completed.stderr.strip() == "anchor-view: count=7"
         assert calibration_completed.stderr == anchor_completed.stderr
 
 
