@@ -1,6 +1,6 @@
 # Content Scoring v3.15 Schema
 
-数值、权重、维度分集合和阈值以 `scoring-policy.json` 为唯一真值。本文件只定义模型与脚本的契约。
+结构性数值、权重、维度分集合和阈值的本地基线来自 `scoring-policy.json`；运行时可调路由与档位字段可由已校验的 Base 快照覆盖。本文件只定义模型与脚本的契约。
 
 ## quality_output v3.15
 
@@ -82,6 +82,7 @@
 ```json
 {
   "score_version": "3.15",
+  "policy_source": "base|local",
   "quality_version": "3.15",
   "relevance_version": "3.0",
   "content_fingerprint": "sha256",
@@ -112,7 +113,7 @@
 
 `needs_relevance` 是质量已确定、只有相关性可改变路由时的内部暂停态。它可携带 `quality_score`，但 `decision_score`、`route`、`ljg_range` 必须为 null，不得发卡或分派。完成相关性，或用 `--relevance-unavailable` 明确不可用后，才会返回 `scored`。
 
-`quality_score < quality_floor` 的低质量文章不运行相关性：`relevance_score=null`、`interest_score=null`、`context_fingerprint=null`、`decision_score=quality_score`、`priority_label=未计算（不影响本次路由）`、`interest_label=未计算（不影响本次路由）`。`quality_score ≥ quality_floor` 的文章一律计算相关性；`route` 仅由 `quality_score ≥ quality_floor` 且 `decision_score ≥ long_read_threshold` 决定（高质量已 long_read，bonus 不改 route），但 `ljg_range` 与 `ljg_card` 按 `decision_score` 计算深度档，因此相关+兴趣会抬高高质文章的精读深度，并决定边界带（7.0-7.9）能否进 card 档。`< quality_floor` 时双满档也拉不进精读。
+`quality_score < quality_floor` 的低质量文章不运行相关性：`relevance_score=null`、`interest_score=null`、`context_fingerprint=null`、`decision_score=quality_score`、`quality_label` 按该总分档位生成、`priority_label=未计算（不影响本次路由）`、`interest_label=未计算（不影响本次路由）`。`quality_score ≥ quality_floor` 的文章一律计算相关性；`quality_label`、`ljg_range`、`ljg_card` 与 `long_read_threshold` 统一按 `decision_score` 判断，`route` 仍要求原始 `quality_score ≥ quality_floor`，防止低质量文章靠加分晋级。`< quality_floor` 时双满档也拉不进精读。
 
 `relevance_score` 语义为 `quality_score ≥ quality_floor` 文章的 relevance 轴生效分（0 到 `relevance_bonus.relevance_max`，0.5）；`interest_score` 为兴趣轴生效分（0 到 `relevance_bonus.interest_max`，0.5）。决策分 `decision_score = quality_score + relevance_score + interest_score`，bonus 非负故深度档单向提档不降档；`< quality_floor` 或相关性不可用时两者为 null，`decision_score = quality_score`。
 
@@ -126,7 +127,8 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 python3 scripts/content_scoring.py quality_output.json source.md \
   --retry-quality-output retry.json \
   --relevance-output relevance_output.json \
-  --context /Users/yuwei/code/skills/ywnext/runtime/core-context/full.md
+  --context /Users/yuwei/code/skills/ywnext/runtime/core-context/full.md \
+  --config-from-base <run_dir>/base-config.json
 ```
 
-`--relevance-output` 与 `--context` 必须同时提供，且不得与 `--relevance-unavailable` 同时使用。脚本不负责调用模型、刷新 YWNext 或持久化缓存。
+`--config-from-base` 在 Base 快照存在时必须传入；`needs_relevance` 的第二次运行必须复用同一快照。`--relevance-output` 与 `--context` 必须同时提供，且不得与 `--relevance-unavailable` 同时使用。脚本不负责调用模型、刷新 YWNext 或持久化缓存。

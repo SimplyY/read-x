@@ -76,9 +76,9 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 ## [0] 抓取：按链接类型选择抓取方式
 
-微信公众号只运行一次 `python3 /Users/yuwei/code/read-x/scripts/prepare_scoring_run.py <URL>`。它调用 `wx_fast.py` 进行纯 HTTP 抓取，不启动或回退任何浏览器；确定性创建独立 `run_dir`、解析唯一保存路径、复制并核对 `source.md`、生成匿名正文，最终只输出含绝对路径和文章元数据的 JSON。HTTP 失败即失败关闭。禁止在模型中自行 `mktemp`、解析 `fetch.log`、重建标题路径、扫描 output、调用 `grep -P` 或重复抓取。
+微信公众号只运行一次 `python3 /Users/yuwei/code/read-x/scripts/prepare_scoring_run.py <URL>`。它调用 `wx_fast.py` 进行纯 HTTP 抓取，不启动或回退任何浏览器；确定性创建独立 `run_dir`、解析唯一保存路径、复制并核对 `source.md`、生成匿名正文，并在同一 run 目录生成 Base 配置快照。最终只输出含绝对路径、文章元数据和 `policy_source` 的 JSON。HTTP 失败即失败关闭。禁止在模型中自行 `mktemp`、解析 `fetch.log`、重建标题路径、扫描 output、调用 `grep -P` 或重复抓取。
 
-非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。
+非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`，再运行 `python3 /Users/yuwei/code/read-x/scripts/fetch_base_config.py --output <run_dir>/base-config.json`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。Base 读取失败时继续使用本地策略，并保留失败原因。
 
 | 链接类型 | 抓取方式 |
 |---------|---------|
@@ -147,14 +147,18 @@ else:
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过既有本地 MoonBridge 直接调用相同 `glm-5.2`，不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。命令失败、超时或未生成文件时失败关闭，禁止回退主上下文、启动子 Agent 或嵌套 `codex exec`。
-3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿第一个 `scoring_result v3.15`。
-4. 若 `score_status=needs_relevance`，才读取 YWNext `full.md`：结构齐全则在独立上下文生成 `relevance_output v3` 并再跑脚本；缺失或结构损坏则使用 `--relevance-unavailable` 确定性结束。过期只降权。相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
+3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿第一个 `scoring_result v3.15`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
+4. 若 `score_status=needs_relevance`，才读取 YWNext `full.md`：结构齐全则在独立上下文生成 `relevance_output v3` 并再跑脚本；第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`。缺失或结构损坏则使用 `--relevance-unavailable` 确定性结束，同样复用 Base 快照。过期只降权。相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
 第 3 步不是“先评分、下轮再发卡”。质量 JSON 之后必须在同一次 `exec_command` 内按下列固定尾部执行；只替换路径、卡片元数据和发送目标，不改分支：
 
 ```bash
-python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <scoring-result.json>
+score_config_args=()
+if [ -f "<base_config.json>" ]; then
+  score_config_args=(--config-from-base "<base_config.json>")
+fi
+python3 scripts/content_scoring.py <quality_output.json> <source.md> "${score_config_args[@]}" --output <scoring-result.json>
 score_status_value=$(jq -r '.score_status' <scoring-result.json>)
 if [ "$score_status_value" = needs_relevance ]; then
   cat <scoring-result.json>
@@ -227,7 +231,18 @@ fi
 - 信息有用但无意外（行业常识、经验总结、工具推荐）
 - 转述/编译类但质量不错
 
-**执行**：抓取 -> 提取核心观点（1-3 条）-> 提取金句（必选，见下方金句规则）-> 卡片输出（私聊发，群聊发 `senderId`，p2p 发 `chatId`，不生成飞书文档）
+**执行**：抓取 -> 按「速读卡结构」提炼 -> 卡片输出（私聊发，群聊发 `senderId`，p2p 发 `chatId`，不生成飞书文档）。
+
+速读不是简略，是高密度的全文浓缩：让读者在手机上不点原文，也能吸收这篇 7 分文章的真正价值。速读卡结构（自上而下）：
+
+1. **一句话定位**：这篇文章在回答什么问题 / 核心张力。让读者先抓住「它到底在讲什么」。
+2. **核心观点 3-5 条**：每条观点不是标签式罗列，而是带一句论证或原文支撑，保留文章自身的推理逻辑。宁可少而准，不要空泛堆砌。
+3. **值得记住的细节/例子 1-2 个**：具体的案例、数据、画面，让观点落地、有记忆点。
+4. **可迁移启发 1 句**（有才写，不强凑）：这对我/我们能借鉴什么。
+5. **金句**（必选，见下方金句规则）：保留原文值得划线的表达。
+6. **阅读原文链接**。
+
+速读卡字数控制在 200-400 字（评分块不计入），信息密度优先；不要因为它「不需要精读」就只给三五行。若文章确实只有 1 个值得记的观点，就只写 1 个，不为了凑数拉长。
 
 ### 其他 scored card -> 一句话卡片
 
@@ -290,6 +305,26 @@ fi
       {
         "tag": "markdown",
         "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n---\n\n核心要点（1-3 条）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2"
+      }
+    ]
+  }
+}
+```
+
+### 快速阅读卡（quality_label=快速阅读）
+
+```json
+{
+  "schema": "2.0",
+  "header": {
+    "title": {"tag": "plain_text", "content": "文章标题"},
+    "template": "indigo"
+  },
+  "body": {
+    "elements": [
+      {
+        "tag": "markdown",
+        "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**一句话定位**：这篇文章在回答什么问题 / 核心张力\n\n**核心观点**\n1. 观点 + 一句论证\n2. 观点 + 一句论证\n3. 观点 + 一句论证\n\n**值得记住**\n- 具体例子/案例/数据 1\n- 具体例子/案例/数据 2\n\n**可迁移**：这对我/我们能借鉴什么（有才写）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2\n\n[阅读原文](链接)"
       }
     ]
   }
@@ -399,6 +434,7 @@ lark-cli im +messages-send \
 |---------|---------|------|
 | 高质量（long-read + 飞书文档） | 200-400 字 | 卡片是摘要通知，核心内容在飞书文档里。不含详细评分（已在评分卡），聚焦核心结论、暗流、ljg 链路引导 |
 | 中等质量 | 300-500 字 | 与原文长度成正比。短帖 300-400 字，中篇 400-500 字 |
+| 快速阅读 | 200-400 字 | 速读卡结构：一句话定位 + 核心观点（带论证）+ 值得记住 + 可迁移 + 金句。高密度浓缩，不是三五行简略 |
 | 低质量 | 50-150 字 | 评分块（不计入字数）+ 一句话摘要 + 原文链接
 
 9. **金句规则（无文档卡片必选）**：不生成飞书文档的卡片（中等质量 + 低质量有可提取内容时），必须从原文提取金句。

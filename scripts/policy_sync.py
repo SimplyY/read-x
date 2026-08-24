@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""精读配置多维表格 -> scoring-policy.json 单向同步。
+"""读取并解析精读配置多维表格。
 
-读飞书多维表格「精读配置」表，重建动态字段，校验后写回 scoring-policy.json。
+读飞书多维表格「精读配置」表，重建动态字段并校验。
 静态字段（versions / dimension_scores / quality_dimensions / evidence_caps / claims / retry）
-保留不动。policy.json 是运行时唯一真值；多维表格是飞鱼手机编辑面板，评分热路径不碰飞书。
+保留本地 policy 的值。评分运行时使用 Base 快照；本文件的 pull 命令仍可用于人工预览或写回。
 写回靠 git 回退；--dry-run 先看 diff 再决定。
 
 Usage:
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import re
 import subprocess
 import sys
@@ -51,7 +52,19 @@ def fetch_records(base_token: str, table_id: str):
 
 def _grp(row_dict):
     v = row_dict["配置分组"]
-    return v[0] if isinstance(v, list) else v
+    if isinstance(v, list):
+        if len(v) != 1 or not isinstance(v[0], str) or not v[0].strip():
+            raise ValueError(f"配置分组非法: {v!r}")
+        return v[0]
+    if not isinstance(v, str) or not v.strip():
+        raise ValueError(f"配置分组非法: {v!r}")
+    return v
+
+
+def _number(value, field):
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value):
+        raise ValueError(f"{field} 必须是有限数字: {value!r}")
+    return float(value)
 
 
 def parse_ljg_text(text):
@@ -64,29 +77,61 @@ def parse_ljg_text(text):
     return [lo, hi], m.group(3) == "卡片"
 
 
+def _typed_ljg_fields(row):
+    """Prefer typed Base columns, while accepting the legacy 文本值 format."""
+    minimum = row.get("ljg_min")
+    maximum = row.get("ljg_max")
+    card = row.get("ljg_card")
+    if minimum is None and maximum is None:
+        return parse_ljg_text(row.get("文本值"))
+    if not isinstance(card, (bool, type(None))):
+        raise ValueError(f"ljg_card 必须是布尔值: {card!r}")
+    minimum = _number(minimum, "ljg_min")
+    maximum = _number(maximum, "ljg_max")
+    if int(minimum) != minimum or int(maximum) != maximum:
+        raise ValueError(f"ljg_min/max 必须是整数: {minimum!r}, {maximum!r}")
+    result = [int(minimum), int(maximum)]
+    typed_card = bool(card)
+    legacy = row.get("文本值")
+    if legacy:
+        legacy_range, legacy_card = parse_ljg_text(legacy)
+        if legacy_range != result or legacy_card != typed_card:
+            raise ValueError(f"typed 精读字段与文本值不一致: {row.get('配置项')!r}")
+    return result, typed_card
+
+
 def rebuild_policy(records):
     """按配置分组重建动态字段。返回新 policy dict（静态字段来自原文件）。"""
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"), parse_float=Decimal)
     route, relevance_max = {}, None
     quality_bands, priority_bands = [], []
     for r in records:
+        for field in ("配置项", "数值", "配置分组", "是否启用"):
+            if field not in r:
+                raise ValueError(f"配置记录缺少字段: {field}")
+        if not isinstance(r["配置项"], str) or not r["配置项"].strip():
+            raise ValueError(f"配置项非法: {r['配置项']!r}")
+        if not isinstance(r["是否启用"], bool):
+            raise ValueError(f"是否启用必须是布尔值: {r['是否启用']!r}")
         if not r.get("是否启用"):
             continue
         g = _grp(r)
         name, num, txt = r["配置项"], r["数值"], r.get("文本值")
         if g == "路由门槛":
             if name == "质量下限":
-                route["quality_floor"] = float(num)
+                route["quality_floor"] = _number(num, "质量下限")
             elif name == "长读门槛":
-                route["long_read_threshold"] = float(num)
+                route["long_read_threshold"] = _number(num, "长读门槛")
         elif g == "相关性加分":
             if name == "加分上限":
-                relevance_max = float(num)
+                relevance_max = _number(num, "加分上限")
         elif g == "质量档位":
-            rng, card = parse_ljg_text(txt)
-            quality_bands.append({"minimum": float(num), "label": name, "ljg_range": rng, "ljg_card": card})
+            rng, card = _typed_ljg_fields(r)
+            quality_bands.append({"minimum": _number(num, name), "label": name, "ljg_range": rng, "ljg_card": card})
         elif g == "优先级档位":
-            priority_bands.append({"minimum": float(num), "label": txt})
+            if not isinstance(txt, str) or not txt.strip():
+                raise ValueError(f"优先级档位缺少文本值: {name!r}")
+            priority_bands.append({"minimum": _number(num, name), "label": txt})
 
     for bands in (quality_bands, priority_bands):
         bands.sort(key=lambda b: b["minimum"], reverse=True)
@@ -106,16 +151,26 @@ def rebuild_policy(records):
 
 
 def _validate(route, relevance_max, quality_bands, priority_bands):
-    assert relevance_max is not None and relevance_max > 0, "相关性加分上限缺失或非正"
-    assert "quality_floor" in route and "long_read_threshold" in route, "路由门槛不完整"
-    assert route["quality_floor"] < route["long_read_threshold"], "质量下限须小于长读门槛"
+    if relevance_max is None or relevance_max <= 0:
+        raise ValueError("相关性加分上限缺失或非正")
+    if "quality_floor" not in route or "long_read_threshold" not in route:
+        raise ValueError("路由门槛不完整")
+    if route["quality_floor"] >= route["long_read_threshold"]:
+        raise ValueError("质量下限须小于长读门槛")
+    if route["quality_floor"] < 0 or route["long_read_threshold"] < 0:
+        raise ValueError("路由门槛不能为负")
     for bands, name in [(quality_bands, "质量"), (priority_bands, "优先级")]:
-        assert bands, f"{name}档位为空"
-        assert bands[-1]["minimum"] <= 0, f"{name}档位缺少兜底（minimum<=0）"
+        if not bands:
+            raise ValueError(f"{name}档位为空")
+        if bands[-1]["minimum"] > 0:
+            raise ValueError(f"{name}档位缺少兜底（minimum<=0）")
     for b in quality_bands:
-        assert isinstance(b["ljg_range"], list) and len(b["ljg_range"]) == 2, f"质量档位 ljg_range 非法: {b}"
-        assert 0 <= b["ljg_range"][0] <= b["ljg_range"][1], f"质量档位 ljg_range 越界: {b}"
-        assert isinstance(b["ljg_card"], bool), f"质量档位 ljg_card 非布尔: {b}"
+        if not isinstance(b["ljg_range"], list) or len(b["ljg_range"]) != 2:
+            raise ValueError(f"质量档位 ljg_range 非法: {b}")
+        if not 0 <= b["ljg_range"][0] <= b["ljg_range"][1]:
+            raise ValueError(f"质量档位 ljg_range 越界: {b}")
+        if not isinstance(b["ljg_card"], bool):
+            raise ValueError(f"质量档位 ljg_card 非布尔: {b}")
 
 
 def _dump(policy) -> str:

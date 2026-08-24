@@ -18,5 +18,4 @@ docs/
 .qoder/
 
 # 早期 Python 实验脚本（有功能但无引用，待确认去留）
-scripts/fetch_base_config.py
 scripts/lark_user.py

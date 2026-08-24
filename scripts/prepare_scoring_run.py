@@ -3,7 +3,7 @@
 
 While the article is being fetched, Base configuration is pulled in parallel
 so it's ready by the time content_scoring.py runs. If the Base fetch fails,
-it silently falls back to scoring-policy.json (no --config-from-base flag).
+the caller falls back to scoring-policy.json and the result records the reason.
 """
 from __future__ import annotations
 
@@ -88,11 +88,12 @@ def _fetch_base_config_async(run_dir: Path) -> threading.Thread:
             )
             if proc.returncode != 0:
                 raise RuntimeError(proc.stderr.strip()[:200] if proc.stderr else "unknown error")
-        except Exception:
-            pass  # Silently fail; caller falls back to policy.json
+        except Exception as exc:
+            thread.error = str(exc)[:200]  # type: ignore[attr-defined]
 
     thread = threading.Thread(target=_fetch, daemon=True)
     thread.result_path = config_path  # type: ignore[attr-defined]
+    thread.error = None  # type: ignore[attr-defined]
     thread.start()
     return thread
 
@@ -130,17 +131,18 @@ def main() -> int:
     blind_path.write_text(blind_source, encoding="utf-8")
 
     # Wait for Base config fetch to complete (it should already be done by now)
-    config_thread.join(timeout=5)
+    config_thread.join()
 
     # Check if Base config was successfully fetched
     base_config_path = None
-    if hasattr(config_thread, "result_path") and config_thread.result_path.is_file():
+    config_error = getattr(config_thread, "error", None)
+    if not config_error and hasattr(config_thread, "result_path") and config_thread.result_path.is_file():
         # Validate the config is valid JSON before passing it through
         try:
             json.loads(config_thread.result_path.read_text(encoding="utf-8"))
             base_config_path = str(config_thread.result_path)
-        except (json.JSONDecodeError, OSError):
-            pass  # Fall back to policy.json
+        except (json.JSONDecodeError, OSError) as exc:
+            config_error = str(exc)[:200]
 
     result = {
         "run_dir": str(run_dir),
@@ -148,10 +150,13 @@ def main() -> int:
         "blind_source": str(blind_path),
         "blind_source_parts": blind_parts(blind_path, blind_source),
         "url": args.url,
+        "policy_source": "base" if base_config_path else "local",
         **article_metadata(source),
     }
     if base_config_path:
         result["base_config"] = base_config_path
+    elif config_error:
+        result["config_error"] = config_error
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return 0
 

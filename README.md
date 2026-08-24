@@ -41,6 +41,7 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 
 - **链接抓取**：微信公众号（`wx_fast.py` 纯 HTTP）、即刻、通用网页、飞书文档、纯文本
 - **内容质量评分**：`content-scoring` v3.15 先删除标题、作者、日期、URL 与抓取器噪声，再由同一模型一次完成证据、洞察、迁移三维闭卷分档与主张预算；脚本从原文确定性组装逐字引用、应用反证封顶并计算总分；锚点只用于事后回归，仅在相关性可改变路由时隔离计算相关性
+- **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
 - **长文精读**：`long-read` 编排器，Evidence -> 独立 HTTP 并行解码/文字深度链路 -> Docx XML -> 飞书文档
@@ -107,6 +108,7 @@ content-scoring（quality -> 条件 relevance -> decision）
 | 脚本 | 作用 |
 |------|------|
 | `scripts/content_scoring.py` | content-scoring 评分计算 |
+| `scripts/fetch_base_config.py` | 读取并校验精读配置 Base，生成运行级 JSON 快照 |
 | `scripts/wx_fast.py` | 微信文章抓取（httpx 直连，不启动浏览器） |
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |

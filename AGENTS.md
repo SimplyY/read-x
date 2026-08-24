@@ -25,7 +25,7 @@ link-card 流程：
 
 ### 内容质量判断（核心）
 
-抓取后，统一调用 `content-scoring` v3.15（不分来源）。质量阶段一次判断证据、洞察、迁移三维等级并输出原文单元，由脚本校验并计算总分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.15（不分来源）。每次评分先读取一份运行级 Base 配置快照；快照可用时必须传给 `scripts/content_scoring.py --config-from-base`，不可用时使用本地策略并保留 `policy_source=local`。质量阶段一次判断证据、洞察、迁移三维等级并输出原文单元，由脚本校验并计算总分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取经校验的 YWNext `core-context/full.md` 并计算相关性。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
@@ -62,6 +62,9 @@ link-card 流程：
 ```bash
 # 抓取并准备微信文章评分输入
 python3 scripts/prepare_scoring_run.py "<mp.weixin.qq.com URL>"
+
+# 非微信来源：在当前 run_dir 生成 Base 配置快照
+python3 scripts/fetch_base_config.py --output <run_dir>/base-config.json
 
 # 创建飞书文档（long-read 输出用）
 lark-cli docs +create --content @.wx_doc.xml --parent-position my_library

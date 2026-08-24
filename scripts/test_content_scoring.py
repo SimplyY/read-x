@@ -12,7 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import content_scoring as cs
+import fetch_base_config
 import generate_quality as quality_generator
+import policy_sync
 import render_score_card as card
 import prepare_anchor_view as anchor_view
 import prepare_scoring_run as scoring_run
@@ -83,6 +85,196 @@ def test_policy_is_single_consistent_scale():
     assert float(cs.POLICY["relevance_bonus"]["max"]) > 0
     assert cs.POLICY["claims"]["standard_counts"] == [5, 8, 12]
     assert cs.DIMENSION_SCORES == {Decimal(str(value)) for value in (0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10)}
+
+
+def base_record(name, group, number, text=None, ljg_min=None, ljg_max=None, ljg_card=None):
+    return {
+        "配置项": name,
+        "数值": number,
+        "配置分组": [group],
+        "文本值": text,
+        "是否启用": True,
+        "ljg_min": ljg_min,
+        "ljg_max": ljg_max,
+        "ljg_card": ljg_card,
+    }
+
+
+def valid_base_records():
+    records = [
+        base_record("质量下限", "路由门槛", 6),
+        base_record("长读门槛", "路由门槛", 7),
+        base_record("加分上限", "相关性加分", 1.0),
+        base_record("稀缺精读", "质量档位", 9, "2-3篇/卡片", 2, 3, True),
+        base_record("完整深读", "质量档位", 8, "1篇/卡片", 1, 1, True),
+        base_record("选择性深读", "质量档位", 7, "0-1篇/无卡片", 0, 1, None),
+        base_record("跳过", "质量档位", 0, "0-1篇/无卡片", 0, 1, None),
+        base_record("相关", "优先级档位", 0.4, "相关"),
+        base_record("低相关", "优先级档位", 0, "低相关"),
+    ]
+    return records
+
+
+def test_base_records_build_runtime_policy_from_typed_fields():
+    policy = policy_sync.rebuild_policy(valid_base_records())
+    assert policy["route"] == {"quality_floor": 6.0, "long_read_threshold": 7.0}
+    assert policy["quality_bands"][0]["ljg_range"] == [2, 3]
+    assert policy["quality_bands"][0]["ljg_card"] is True
+    assert policy["priority_bands"] == [
+        {"minimum": 0.4, "label": "相关"},
+        {"minimum": 0.0, "label": "低相关"},
+    ]
+
+
+def test_base_typed_fields_must_match_legacy_display_text():
+    records = valid_base_records()
+    records[3]["ljg_max"] = 1
+    try:
+        policy_sync.rebuild_policy(records)
+    except ValueError as exc:
+        assert "不一致" in str(exc)
+    else:
+        raise AssertionError("typed depth fields must reject stale 文本值")
+
+
+def test_base_records_reject_missing_fields_and_invalid_typed_checkbox():
+    records = valid_base_records()
+    records.append({"配置项": "残缺禁用项", "是否启用": False})
+    try:
+        policy_sync.rebuild_policy(records)
+    except ValueError as exc:
+        assert "缺少字段" in str(exc)
+    else:
+        raise AssertionError("missing fields must fail even on disabled records")
+
+    records = valid_base_records()
+    records[3]["ljg_card"] = "false"
+    try:
+        policy_sync.rebuild_policy(records)
+    except ValueError as exc:
+        assert "布尔" in str(exc)
+    else:
+        raise AssertionError("typed checkbox strings must fail closed")
+
+
+def test_base_records_reject_non_finite_numbers():
+    records = valid_base_records()
+    records[0]["数值"] = float("nan")
+    try:
+        policy_sync.rebuild_policy(records)
+    except ValueError as exc:
+        assert "有限数字" in str(exc)
+    else:
+        raise AssertionError("non-finite Base numbers must fail closed")
+
+
+def test_base_snapshot_changes_route_and_depth():
+    external = policy_sync.rebuild_policy(valid_base_records())
+    external["route"]["long_read_threshold"] = 9.0
+    external["quality_bands"][1] = {
+        "minimum": 8.0, "label": "Base 精读", "ljg_range": [0, 0], "ljg_card": False,
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = Path(directory) / "base-config.json"
+        config_path.write_text(policy_sync._dump(external), encoding="utf-8")
+        try:
+            cs._reload_policy(str(config_path))
+            result = cs.score(quality(), SOURCE, relevance_unavailable=True)
+            assert result["policy_source"] == "base"
+            assert result["route"] == "card"
+            assert result["quality_label"] == "Base 精读"
+        finally:
+            cs._reload_policy()
+
+
+def test_cli_invalid_base_config_falls_back_to_local_policy():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        quality_path = root / "quality.json"
+        source_path = root / "source.md"
+        config_path = root / "base-config.json"
+        output_path = root / "score.json"
+        quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
+        source_path.write_text(SOURCE, encoding="utf-8")
+        config_path.write_text("{not-json", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
+             "--config-from-base", str(config_path), "--relevance-unavailable", "--output", str(output_path)],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0
+        assert json.loads(output_path.read_text(encoding="utf-8"))["policy_source"] == "local"
+        assert "falling back to policy.json" in result.stderr
+
+
+def test_cli_incomplete_base_config_falls_back_to_local_policy():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        quality_path = root / "quality.json"
+        source_path = root / "source.md"
+        config_path = root / "base-config.json"
+        output_path = root / "score.json"
+        quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
+        source_path.write_text(SOURCE, encoding="utf-8")
+        config_path.write_text("{}", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
+             "--config-from-base", str(config_path), "--relevance-unavailable", "--output", str(output_path)],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0
+        assert json.loads(output_path.read_text(encoding="utf-8"))["policy_source"] == "local"
+        assert "base config is incomplete" in result.stderr
+
+
+def test_cli_malformed_base_band_falls_back_to_local_policy():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        quality_path = root / "quality.json"
+        source_path = root / "source.md"
+        config_path = root / "base-config.json"
+        output_path = root / "score.json"
+        malformed = policy_sync.rebuild_policy(valid_base_records())
+        malformed["quality_bands"] = [{"minimum": "bad"}]
+        quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
+        source_path.write_text(SOURCE, encoding="utf-8")
+        config_path.write_text(policy_sync._dump(malformed), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
+             "--config-from-base", str(config_path), "--relevance-unavailable", "--output", str(output_path)],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0
+        assert json.loads(output_path.read_text(encoding="utf-8"))["policy_source"] == "local"
+        assert "base config quality_bands contains an invalid band" in result.stderr
+
+
+def test_base_fetch_failure_is_visible_to_prepare_thread():
+    original_run = scoring_run.subprocess.run
+    scoring_run.subprocess.run = lambda *args, **kwargs: type(
+        "Result", (), {"returncode": 1, "stderr": "network unavailable"}
+    )()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            thread = scoring_run._fetch_base_config_async(Path(directory))
+            thread.join()
+            assert thread.error == "network unavailable"
+    finally:
+        scoring_run.subprocess.run = original_run
+
+
+def test_base_snapshot_cli_contract_is_documented_for_all_sources():
+    root = Path(cs.__file__).parents[1]
+    link_card = (root / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
+    rules = (root / "AGENTS.md").read_text(encoding="utf-8")
+    schema = (root / ".agents/skills/content-scoring/references/schema.md").read_text(encoding="utf-8")
+    assert "scripts/fetch_base_config.py" in link_card
+    assert "--config-from-base" in link_card
+    assert "第二次运行必须复用同一个 `base_config.json`" in link_card
+    assert "运行级 Base 配置快照" in rules
+    assert '"policy_source": "base|local"' in schema
+    assert "--config-from-base <run_dir>/base-config.json" in schema
+    assert fetch_base_config.__file__.endswith("scripts/fetch_base_config.py")
 
 
 def test_half_point_dimension_scores_are_precise_and_other_steps_fail_closed():
@@ -564,6 +756,15 @@ def test_relevance_can_rescue_only_boundary_quality():
     assert result["quality_score"] == 6.8 and result["decision_score"] == 7.8
     assert result["route"] == "long_read" and result["ljg_range"] == [0, 1]
     assert result["ljg_card"] is False
+
+
+def test_quality_label_uses_the_same_decision_score_as_depth():
+    grades = {key: 7.5 for key in cs.QUALITY_DIMENSIONS}
+    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
+    assert result["quality_score"] == 7.5
+    assert result["decision_score"] == 8.5
+    assert result["quality_label"] == "完整深读"
+    assert result["ljg_range"] == [1, 2]
 
 
 def test_relevance_failure_falls_back_to_quality():

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import hashlib
+import math
 import json
 import os
 import re
@@ -33,6 +34,45 @@ POLICY_PATH = Path(__file__).parents[1] / ".agents/skills/content-scoring/refere
 _TUNABLE_KEYS = {"route", "quality_bands", "priority_bands", "relevance_bonus"}
 
 
+def _validate_runtime_policy(policy):
+    route = policy.get("route")
+    if not isinstance(route, dict):
+        raise ValueError("base config route is invalid")
+    floor, threshold = route.get("quality_floor"), route.get("long_read_threshold")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value)
+           for value in (floor, threshold)) or floor < 0 or threshold < 0 or floor >= threshold:
+        raise ValueError("base config route thresholds are invalid")
+
+    for key in ("quality_bands", "priority_bands"):
+        bands = policy.get(key)
+        if not isinstance(bands, list) or not bands:
+            raise ValueError(f"base config {key} is invalid")
+        for band in bands:
+            if not isinstance(band, dict):
+                raise ValueError(f"base config {key} contains an invalid band")
+            minimum = band.get("minimum")
+            if (not isinstance(minimum, (int, float, Decimal)) or isinstance(minimum, bool) or not math.isfinite(minimum)
+                    or not isinstance(band.get("label"), str) or not band["label"].strip()):
+                raise ValueError(f"base config {key} contains an invalid band")
+        if bands[-1]["minimum"] > 0:
+            raise ValueError(f"base config {key} is invalid")
+        if any(bands[index]["minimum"] < bands[index + 1]["minimum"] for index in range(len(bands) - 1)):
+            raise ValueError(f"base config {key} is not sorted")
+    for band in policy["quality_bands"]:
+        depth = band.get("ljg_range")
+        if (not isinstance(depth, list) or len(depth) != 2 or any(isinstance(value, bool) or not isinstance(value, int) for value in depth)
+                or depth[0] < 0 or depth[0] > depth[1] or not isinstance(band.get("ljg_card"), bool)):
+            raise ValueError("base config quality depth is invalid")
+    bonus = policy.get("relevance_bonus")
+    if not isinstance(bonus, dict):
+        raise ValueError("base config relevance bonus is invalid")
+    values = [bonus.get(key) for key in ("max", "relevance_max", "interest_max")]
+    if any(isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("base config relevance bonus is invalid")
+    if values[1] + values[2] > values[0]:
+        raise ValueError("base config relevance bonus exceeds max")
+
+
 def _load_policy(external_config_path: str | None = None):
     """Load policy.json, optionally overriding tunable fields from external config."""
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"), parse_float=Decimal)
@@ -41,13 +81,16 @@ def _load_policy(external_config_path: str | None = None):
         if not ext_path.is_file():
             raise ValueError(f"external config not found: {external_config_path}")
         ext = json.loads(ext_path.read_text(encoding="utf-8"), parse_float=Decimal)
+        if not isinstance(ext, dict) or not _TUNABLE_KEYS.issubset(ext):
+            raise ValueError("base config is incomplete")
         for key in _TUNABLE_KEYS:
-            if key in ext:
-                policy[key] = ext[key]
+            policy[key] = ext[key]
+        _validate_runtime_policy(policy)
     return policy
 
 
 POLICY = _load_policy()
+POLICY_SOURCE = "local"
 SCORE_VERSION = POLICY["versions"]["score"]
 QUALITY_VERSION = POLICY["versions"]["quality"]
 RELEVANCE_VERSION = POLICY["versions"]["relevance"]
@@ -83,8 +126,9 @@ CJK = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 
 def _reload_policy(external_config_path: str | None = None):
     """Reload policy from external config, updating module-level globals."""
-    global POLICY
+    global POLICY, POLICY_SOURCE
     POLICY = _load_policy(external_config_path)
+    POLICY_SOURCE = "base" if external_config_path else "local"
 
 
 def round1(value) -> float:
@@ -291,6 +335,7 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
     questions = output.get("questions")
     return {
         "score_version": SCORE_VERSION,
+        "policy_source": POLICY_SOURCE,
         "quality_version": QUALITY_VERSION,
         "relevance_version": RELEVANCE_VERSION,
         "content_fingerprint": fp,
@@ -462,6 +507,7 @@ def score(
     if relevance_needed and relevance_output is None and not relevance_unavailable:
         return {
             "score_version": SCORE_VERSION,
+            "policy_source": POLICY_SOURCE,
             "quality_version": QUALITY_VERSION,
             "relevance_version": RELEVANCE_VERSION,
             "content_fingerprint": fp,
@@ -472,7 +518,7 @@ def score(
             "relevance_score": None,
             "relevance_confidence": "unavailable",
             "decision_score": None,
-            "quality_label": _quality_label(quality_score),
+            "quality_label": "待计算",
             "priority_label": "待计算",
             "interest_label": "待计算",
             "route": None,
@@ -512,6 +558,7 @@ def score(
     depth, cast_card = _depth(decision_score)
     return {
         "score_version": SCORE_VERSION,
+        "policy_source": POLICY_SOURCE,
         "quality_version": QUALITY_VERSION,
         "relevance_version": RELEVANCE_VERSION,
         "content_fingerprint": fp,
@@ -523,7 +570,8 @@ def score(
         "interest_score": interest_score,
         "relevance_confidence": relevance_confidence,
         "decision_score": decision_score,
-        "quality_label": _quality_label(quality_score),
+        # Final quality bands use the same decision-score scale as routing/depth.
+        "quality_label": _quality_label(decision_score),
         "priority_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _priority_label(relevance_score),
         "interest_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _interest_label(interest_score),
         "route": route,
@@ -577,6 +625,7 @@ def main():
             _reload_policy(args.config_from_base)
         except (ValueError, OSError) as exc:
             print(f"warning: base config load failed ({exc}), falling back to policy.json", file=sys.stderr)
+            _reload_policy()
     if not args.quality_output or not args.source:
         parser.error("quality_output and source are required")
     if bool(args.relevance_output) != bool(args.context):
