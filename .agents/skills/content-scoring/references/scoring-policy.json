@@ -35,7 +35,8 @@
   },
   "route": {
     "quality_floor": 6.0,
-    "long_read_threshold": 7.0
+    "long_read_threshold": 7.0,
+    "chatgpt_munger_threshold": 8.5
   },
   "quality_bands": [
     {

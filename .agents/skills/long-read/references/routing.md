@@ -24,7 +24,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 符合评分数量或用户明确要求时：Evidence -> `article-decode` + 文字 ljg 隔离运行 -> 拼接成文档。
 
-文字数量直接使用 content-scoring 的 `scoring_result.ljg_range`；是否生成图片直接使用 `scoring_result.ljg_card`。本 Skill 不复制分档，也不使用相关性改变深度。
+文字数量直接使用 content-scoring 的 `scoring_result.ljg_range`；是否生成图片直接使用 `scoring_result.ljg_card`；是否调用 ChatGPT 芒格后处理直接使用 `scoring_result.chatgpt_munger_doc`。本 Skill 不复制分档，也不使用相关性改变深度。
 
 ## 3. 文字 Skill 选择
 
@@ -61,7 +61,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 5. 文档拼接
 
-主 Agent 串行维护 `.wx_doc.xml`：
+主 Agent 串行维护 `.wx_doc.xml`；ChatGPT 芒格结果必须先落为本轮临时 Markdown，再由同一 Markdown 渲染器生成 XML，禁止把 bridge 纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进 ChatGPT 请求：
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；
@@ -97,7 +97,7 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
   --jq '.data.message_id'
 ```
 
-只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。
+只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。ChatGPT 芒格文档属于主文档交付前的可选后处理；失败时保留主文档交付，不得重试或切换模型。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
 
 ### ljg-card 后置任务
 
@@ -135,5 +135,6 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 - `.wx_doc.xml`
 - `/tmp/link_card.json`
 - `/tmp/ljg_cast_*.html`
+- `chatgpt-munger.md`、`chatgpt-munger-summary.json` 和芒格 XML
 
 不要删除与本轮无关的既有文件。

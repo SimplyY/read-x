@@ -5,7 +5,7 @@ description: "文章内容评分引擎：抓取到正文后，先基于匿名正
 
 # Content Scoring v3.15
 
-把三个问题分开：文章本身好不好、此刻与读者是否相关、是否值得投入 long-read。模型一次按中文语义选择有原文支撑的三维数值档；结构性规则来自 `references/scoring-policy.json`，每次运行的路由、档位和相关性可调参数优先由已校验的 Base 快照覆盖。
+把三个问题分开：文章本身好不好、此刻与读者是否相关、是否值得投入 long-read。模型一次按中文语义选择有原文支撑的三维数值档；结构性规则来自 `references/scoring-policy.json`，每次运行的路由、档位、ChatGPT 芒格门槛和相关性可调参数优先由已校验的 Base 快照覆盖。
 
 ## 不可违反的边界
 
@@ -97,13 +97,14 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 
 决策分公式（第一性，加法）：`decision_score = quality_score + relevance_score + interest_score`。`relevance_score` 与 `interest_score` 各 clamp 到 0.5，总 bonus 自然 ≤ 1.0（仅 `quality_score ≥ quality_floor` 时生效，否则两轴为 0.0）；相关性不可用时 `decision_score = quality_score`。最终 `quality_label`、`ljg_range`、`ljg_card` 与 `long_read_threshold` 全部使用 `decision_score`，统一为同一套总分口径。`quality_floor` 仅是原始质量安全准入门，防止低质量文章靠相关性加分晋级。
 
-完整字段见 `references/schema.md`。调用方只消费 `score_status`、三个分数、`route`、`ljg_range`、`ljg_card` 和展示字段：
+完整字段见 `references/schema.md`。调用方只消费 `score_status`、三个分数、`route`、`ljg_range`、`ljg_card`、`chatgpt_munger_doc` 和展示字段：
 
 - `needs_full_text` / `needs_review`：卡片不显示数字，不进入 long-read。
 - `needs_relevance`：仅作为内部暂停态；`decision_score`、`route`、`ljg_range` 为空，不得分派。
 - `scored`：按 `route` 分派；不得人工覆盖。
 - `quality_score < quality_floor` 的文章 `relevance_score=null`、`interest_score=null`、`decision_score=quality_score`、`quality_label=快速阅读/跳过（按总分档位）`、`priority_label=未计算（不影响本次路由）`、`interest_label=未计算（不影响本次路由）`；`≥ quality_floor` 一律计算相关性。
 - `quality_label`、`ljg_range` 与 `ljg_card` 均按 `decision_score` 计算，和 `long_read_threshold` 使用同一数值尺度。bonus 非负故单向提档不降档；`< quality_floor` 时双满档也拉不进精读。long-read 直接消费脚本算出的 `ljg_range` 与 `ljg_card`，不得自行用相关性二次抬高。
+- `chatgpt_munger_doc` 由脚本按运行时 `chatgpt_munger_threshold` 确定性输出；消费者不得复制该门槛或自行按分数触发。
 
 ## 隔离重评协议
 

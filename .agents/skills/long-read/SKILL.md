@@ -11,9 +11,10 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
 
 ```text
 原文 -> Evidence
-     -> 消费 content-scoring 的 scoring_result（直接使用 ljg_range）
+     -> 消费 content-scoring 的 scoring_result（直接使用 ljg_range 与 chatgpt_munger_doc）
      -> article-decode + 0~3 个文字 ljg（独立 HTTP 请求，并行）
-     -> 主 Agent 摘取、去重、排版为 Docx XML
+     -> ChatGPT Markdown（仅 chatgpt_munger_doc=true）
+     -> Markdown 渲染为 Docx XML 与 Card 2.0
      -> 创建文档并发送卡片（群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次）
      -> ljg_card=true 时再运行 ljg-card，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）
 ```
@@ -26,7 +27,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 ## 2. 消费评分结果与文字深度数量
 
-评分在 `link-card` 阶段由 `content-scoring` 完成一次。`long-read` 只接受 `score_status=scored` 且 `route=long_read` 的 `scoring_result v3`，直接消费 `ljg_range` 与 `ljg_card`，**不得重新评分或复制阈值**。区间内只有存在互不重复的独立问题才取上限；`scoring_result.questions` 优先作为问题来源。`ljg_card=true` 时必须等主文档创建和通知成功后才开始。
+评分在 `link-card` 阶段由 `content-scoring` 完成一次。`long-read` 只接受 `score_status=scored` 且 `route=long_read` 的 `scoring_result v3`，直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`，**不得重新评分或复制阈值**。区间内只有存在互不重复的独立问题才取上限；`scoring_result.questions` 优先作为问题来源。`ljg_card=true` 时必须等主文档创建和通知成功后才开始。
 
 ### 三档齐全门（硬性）
 
@@ -35,6 +36,8 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 ## 3. 隔离运行
 
 只通过 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 发送独立 `glm-5.2` 请求，固定 `store=false`，最多四请求并行。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
+
+当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前通过 `chatgpt-web-bridge` 运行 `scripts/run_chatgpt_munger.py`。编排器只提供原文、完整运行时 `munger-soul` 提示词和最小任务边界：要求先还原文章真正的问题，按内容自然组织 Markdown，不额外强制标题数量、标题顺序或固定章节模板。ChatGPT bridge 必须返回 `format=markdown`、有效 `conversationUrl`、`historyVerified=true` 和匹配的 `outputSha256`；Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。bridge 失败、历史复核失败、限流、冷却、超长或输出校验失败均失败关闭，不重试、不切换 MoonBridge，主精读文档仍照常交付。
 
 为每条文字 ljg 创建只含唯一问题的独立文件，然后运行：
 
@@ -98,9 +101,9 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 6. 交付顺序
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
-1. 用 `.wx_doc.xml` 创建飞书文档；
-2. 发送文档卡片：群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
-3. 确认文档卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
+1. 用 `.wx_doc.xml` 创建主精读文档；若 `chatgpt_munger_doc=true` 且后处理成功，再用 `markdown_to_feishu_xml.py` 创建独立的芒格洞察 Docx XML；
+2. 用 `scripts/render_long_read_delivery_card.py` 生成并校验唯一 Card 2.0 交付卡。成功时同时放主文档和芒格文档链接；ChatGPT 或第二篇文档失败时只放主文档链接并注明待复核。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
+3. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
    ```bash
    lark-cli base +record-upsert --base-token ASdsbB3Gka9OKNsD7YhcJ9rZnjd --table-id tbltqJwdmOmcbFlI --as user --json '{"日期":"<当天 00:00:00>","标题":"<原文标题>","来源链接":"[<原文 URL>](<原文 URL>)","云文档链接":"[<飞书文档 URL>](<飞书文档 URL>)","评分":"<quality_score>/10","是否已读":true}'
@@ -120,6 +123,11 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 自检
 
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
+- [ ] `chatgpt_munger_doc=true` 时是否先运行 bridge，再创建第二篇文档并与主文档合并为一张交付卡？
+- [ ] ChatGPT bridge 失败时是否失败关闭、未重试或切换模型，且主精读文档仍可交付？
+- [ ] bridge 是否返回 Markdown、有效会话 URL，并在同一 Ego Lite 会话中复开验证？
+- [ ] 芒格 Markdown 是否只在本轮临时目录存在，且文档/卡片读回后清理？
+- [ ] 交付卡是否由渲染脚本生成，读回时没有字面量 `\\n`？
 - [ ] `quality_score ≥ quality_floor` 时，交付卡是否在相关性、兴趣两轴都算完后才一起发出，未只带质量分单发？
 - [ ] `article-decode` 与每条文字 ljg 是否由脚本发出独立 `store=false` HTTP 请求？
 - [ ] 主 Agent 是否未读取分析 Skill、未角色扮演生成、未在失败时回退？

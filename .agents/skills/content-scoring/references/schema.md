@@ -100,6 +100,7 @@
   "route": "card|long_read|null",
   "ljg_range": [2, 3],
   "ljg_card": true,
+  "chatgpt_munger_doc": true,
   "claims": [],
   "quality_dimensions": {},
   "relevance_dimensions": {"relevance_score": 0.5, "interest_score": 0.5, "matched_mainlines": [], "matched_interests": [], "rationale": ""},
@@ -110,6 +111,8 @@
 ```
 
 `needs_full_text` 与 `needs_review` 时，三个分数为空、`route=card`、深度字段为空或 false。消费者不得自行补分。
+
+`chatgpt_munger_doc` 仅在 `score_status=scored`、`route=long_read` 且运行时 ChatGPT 芒格门槛满足时为 true；其他状态固定为 false。消费者只消费该字段，不复制门槛。
 
 `needs_relevance` 是质量已确定、只有相关性可改变路由时的内部暂停态。它可携带 `quality_score`，但 `decision_score`、`route`、`ljg_range` 必须为 null，不得发卡或分派。完成相关性，或用 `--relevance-unavailable` 明确不可用后，才会返回 `scored`。
 

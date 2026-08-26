@@ -14,7 +14,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 link-card 流程：
 1. **抓取**：按链接类型选择抓取方式；微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`，内部使用纯 HTTP，不启动或回退浏览器
-2. **内容质量判断**：统一调 `content-scoring` v3.15，不分来源；质量模型只读去身份正文与通用三维数值语义，锚点仅用于事后闭卷回归；脚本应用反证封顶并计算总分与路由；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
+2. **内容质量判断**：统一调 `content-scoring` v3.15，不分来源；质量模型只读去身份正文与通用三维数值语义，锚点仅用于事后闭卷回归；脚本应用反证封顶并计算总分与路由；只按脚本返回的 `score_status`、`route`、`quality_label` 和 `chatgpt_munger_doc` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
 这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。显式例外有二：`仅评分 <URL>` 保留真实路由，但发完评分卡后不进入精读；已知专项文体（如阮一峰《科技爱好者周刊》）走快通道，跳过评分直接按专项规则生成卡片（见 link-card SKILL.md [0.5]）。
@@ -34,7 +34,7 @@ link-card 流程：
 
 **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
 
-`scoring_result` 原样传给 long-read。任何消费者不得复制阈值、重算路由或把相关性混称为质量。完整规则见 `.agents/skills/content-scoring/SKILL.md`。
+`scoring_result` 原样传给 long-read。任何消费者不得复制阈值、重算路由、把相关性混称为质量或自行触发 ChatGPT。完整规则见 `.agents/skills/content-scoring/SKILL.md`。
 
 ### `route=long_read` → long-read 全流程
 
@@ -44,7 +44,8 @@ link-card 流程：
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
 3. **独立解码**：Evidence 完成后，通过 `run_isolated_analyses.py` 向 MoonBridge 发出独立 `store=false` HTTP 请求运行 `article-decode`；脚本必须严格校验 Evidence、禁用环境代理并写本轮 summary；不输出骨架或单独 X 光四层
 4. **文字深度链路**：各 ljg 由同一脚本并行发出互不可见的独立 HTTP 请求；命令、路径或交付残留必须失败关闭且不落盘；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
-5. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；生成飞书文档后私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`，只发一次）
+5. **ChatGPT 芒格后处理**：仅当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前运行 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`；bridge 必须返回规范 Markdown、有效 `conversationUrl`、`historyVerified=true` 和匹配 hash，再由 `markdown_to_feishu_xml.py` 生成独立芒格洞察 XML。bridge 失败关闭、不重试、不切换模型，主精读文档仍照常交付
+6. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；成功时创建主文档与芒格洞察文档，并合并为一张私聊交付卡（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
    - `ljg_card=true` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
 
 ## 关键目录
@@ -121,6 +122,9 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] 内容质量判断已完成（字数、论点、金句、结构、亲历者）
 - [ ] 高质量：Evidence / article-decode / 隔离文字 ljg / XML 飞书文档已完成，主文与附录无重复结论
 - [ ] `ljg_card=true`：文档已先交付，ljg-card PNG 私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
+- [ ] `chatgpt_munger_doc=true`：ChatGPT bridge 成功后创建第二篇芒格洞察文档，与主文档共用一张交付卡；失败关闭且主文档仍交付
+- [ ] ChatGPT 输出先转规范 Markdown，并在同一 Ego Lite 会话复开验证后才创建第二篇文档
+- [ ] 交付卡由渲染脚本生成，读回内容没有字面量 `\\n`
 - [ ] 中低质量：摘要已生成
 - [ ] 卡片 JSON 格式正确（schema 2.0，markdown 标签）
 - [ ] 卡片以 `--as bot` 发送

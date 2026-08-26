@@ -39,8 +39,9 @@ def _validate_runtime_policy(policy):
     if not isinstance(route, dict):
         raise ValueError("base config route is invalid")
     floor, threshold = route.get("quality_floor"), route.get("long_read_threshold")
+    chatgpt_threshold = route.get("chatgpt_munger_threshold", 8.5)
     if any(isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value)
-           for value in (floor, threshold)) or floor < 0 or threshold < 0 or floor >= threshold:
+           for value in (floor, threshold, chatgpt_threshold)) or floor < 0 or threshold < 0 or chatgpt_threshold < 0 or chatgpt_threshold > 10 or floor >= threshold:
         raise ValueError("base config route thresholds are invalid")
 
     for key in ("quality_bands", "priority_bands"):
@@ -351,6 +352,7 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
         "route": "card",
         "ljg_range": None,
         "ljg_card": False,
+        "chatgpt_munger_doc": False,
         "claims": output.get("claim_ledger") if isinstance(output.get("claim_ledger"), list) else [],
         "quality_dimensions": output.get("dimensions") if isinstance(output.get("dimensions"), dict) else {},
         "relevance_dimensions": {},
@@ -503,6 +505,7 @@ def score(
 
     floor = float(POLICY["route"]["quality_floor"])
     threshold = float(POLICY["route"]["long_read_threshold"])
+    chatgpt_threshold = float(POLICY["route"].get("chatgpt_munger_threshold", 8.5))
     relevance_needed = quality_score >= floor
     if relevance_needed and relevance_output is None and not relevance_unavailable:
         return {
@@ -524,6 +527,7 @@ def score(
             "route": None,
             "ljg_range": None,
             "ljg_card": False,
+            "chatgpt_munger_doc": False,
             "claims": effective_quality_output["claim_ledger"],
             "quality_dimensions": effective_quality_output["dimensions"],
             "relevance_dimensions": {},
@@ -577,6 +581,7 @@ def score(
         "route": route,
         "ljg_range": depth if route == "long_read" else None,
         "ljg_card": cast_card and route == "long_read",
+        "chatgpt_munger_doc": route == "long_read" and decision_score >= chatgpt_threshold,
         "claims": effective_quality_output["claim_ledger"],
         "quality_dimensions": effective_quality_output["dimensions"],
         "relevance_dimensions": relevance_info,

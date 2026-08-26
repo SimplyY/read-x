@@ -122,6 +122,8 @@ def rebuild_policy(records):
                 route["quality_floor"] = _number(num, "质量下限")
             elif name == "长读门槛":
                 route["long_read_threshold"] = _number(num, "长读门槛")
+            elif name == "ChatGPT 芒格门槛":
+                route["chatgpt_munger_threshold"] = _number(num, "ChatGPT 芒格门槛")
         elif g == "相关性加分":
             if name == "加分上限":
                 relevance_max = _number(num, "加分上限")
@@ -155,9 +157,10 @@ def _validate(route, relevance_max, quality_bands, priority_bands):
         raise ValueError("相关性加分上限缺失或非正")
     if "quality_floor" not in route or "long_read_threshold" not in route:
         raise ValueError("路由门槛不完整")
+    route.setdefault("chatgpt_munger_threshold", 8.5)
     if route["quality_floor"] >= route["long_read_threshold"]:
         raise ValueError("质量下限须小于长读门槛")
-    if route["quality_floor"] < 0 or route["long_read_threshold"] < 0:
+    if any(route[name] < 0 or route[name] > 10 for name in ("quality_floor", "long_read_threshold", "chatgpt_munger_threshold")):
         raise ValueError("路由门槛不能为负")
     for bands, name in [(quality_bands, "质量"), (priority_bands, "优先级")]:
         if not bands:

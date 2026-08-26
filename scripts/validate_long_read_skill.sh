@@ -11,8 +11,14 @@ require() {
 }
 
 require '`score_status=scored` 且 `route=long_read`'
-require '直接消费 `ljg_range` 与 `ljg_card`'
+require '直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`'
 require 'scripts/run_isolated_analyses.py'
+require 'scripts/run_chatgpt_munger.py'
+require 'markdown_to_feishu_xml.py'
+require 'render_long_read_delivery_card.py'
+require '`chatgpt_munger_doc=true`'
+require 'chatgpt-web-bridge'
+require '失败关闭'
 require '`store=false`'
 require '不得在脚本失败时回退角色扮演'
 require '显式禁用环境 HTTP 代理'

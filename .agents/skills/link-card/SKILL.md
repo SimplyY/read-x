@@ -1,9 +1,10 @@
 ---
 name: link-card
 description: "群内收到任何链接，自动抓取→内容质量判断→决定深度分析或轻量摘要→以卡片形式回复。卡片用 bot 身份发送。内容质量而非链接类型决定分析深度。"
-description_zh: 链接自动抓取、内容质量判断、卡片回复
-when_to_use: "群内收到任何 HTTP/HTTPS 链接时自动触发。所有链接类型统一走内容质量判断，不分来源。"
-dispatch_intent: "link-card"
+metadata:
+  description_zh: 链接自动抓取、内容质量判断、卡片回复
+  when_to_use: "群内收到任何 HTTP/HTTPS 链接时自动触发。所有链接类型统一走内容质量判断，不分来源。"
+  dispatch_intent: "link-card"
 ---
 
 # link-card: 链接卡片回复
@@ -222,7 +223,7 @@ fi
 
 ### route=long_read -> 走 long-read 全流程
 
-转交时把 `scoring_result` 一并传入。long-read 直接消费 `ljg_range` 与 `ljg_card`，不再重评或按相关性抬高深度。`ljg_card=true` 时在文档交付后独立运行，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）。
+转交时把 `scoring_result` 一并传入。long-read 直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`，不再重评或按相关性抬高深度。`ljg_card=true` 时在文档交付后独立运行，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）。
 
 ### quality_label=快速阅读 -> 走轻量精读
 
@@ -267,9 +268,13 @@ fi
 
 **长摘要 / 含 ljg**：生成飞书文档 → 私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`）。
 
+`scoring_result.chatgpt_munger_doc=true` 时，long-read 在主文档交付卡之前额外完成 ChatGPT 芒格洞察文档；成功时两篇文档共用一张交付卡，失败时只交付主文档并注明待复核。
+
+长文交付卡统一使用 `/Users/yuwei/code/read-x/scripts/render_long_read_delivery_card.py` 生成 CardKit 2.0 JSON，再用 `json.loads` 校验后发送。禁止手工拼接 JSON；卡片正文必须使用真实换行，发送后读回消息确认不存在字面量 `\\n`。
+
 > ⚠️ `ljg-card` 不属于文档链路。`scoring_result.ljg_card=true` 时，先创建并发送主文档卡片，再独立生成 PNG，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）；禁止插入文档。
 
-> ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接。
+> ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接；`chatgpt_munger_doc=true` 时同一张卡追加芒格洞察文档链接。
 >
 > ⚠️ **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完（`relevance_score`/`interest_score` 为 `null`/「待计算」/「不可用」）时，禁止发精读完成卡或文档交付卡。先补算两轴，三档全部算完才一起发卡；禁止只带质量分单发交付卡。
 

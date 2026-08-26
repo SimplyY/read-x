@@ -111,19 +111,26 @@ def valid_base_records():
         base_record("跳过", "质量档位", 0, "0-1篇/无卡片", 0, 1, None),
         base_record("相关", "优先级档位", 0.4, "相关"),
         base_record("低相关", "优先级档位", 0, "低相关"),
+        base_record("ChatGPT 芒格门槛", "路由门槛", 8.5),
     ]
     return records
 
 
 def test_base_records_build_runtime_policy_from_typed_fields():
     policy = policy_sync.rebuild_policy(valid_base_records())
-    assert policy["route"] == {"quality_floor": 6.0, "long_read_threshold": 7.0}
+    assert policy["route"] == {"quality_floor": 6.0, "long_read_threshold": 7.0, "chatgpt_munger_threshold": 8.5}
     assert policy["quality_bands"][0]["ljg_range"] == [2, 3]
     assert policy["quality_bands"][0]["ljg_card"] is True
     assert policy["priority_bands"] == [
         {"minimum": 0.4, "label": "相关"},
         {"minimum": 0.0, "label": "低相关"},
     ]
+
+
+def test_base_records_without_chatgpt_threshold_keep_safe_default():
+    records = [record for record in valid_base_records() if record["配置项"] != "ChatGPT 芒格门槛"]
+    policy = policy_sync.rebuild_policy(records)
+    assert policy["route"]["chatgpt_munger_threshold"] == 8.5
 
 
 def test_base_typed_fields_must_match_legacy_display_text():
@@ -171,6 +178,7 @@ def test_base_records_reject_non_finite_numbers():
 def test_base_snapshot_changes_route_and_depth():
     external = policy_sync.rebuild_policy(valid_base_records())
     external["route"]["long_read_threshold"] = 9.0
+    external["route"]["chatgpt_munger_threshold"] = 9.0
     external["quality_bands"][1] = {
         "minimum": 8.0, "label": "Base 精读", "ljg_range": [0, 0], "ljg_card": False,
     }
@@ -183,6 +191,7 @@ def test_base_snapshot_changes_route_and_depth():
             assert result["policy_source"] == "base"
             assert result["route"] == "card"
             assert result["quality_label"] == "Base 精读"
+            assert result["chatgpt_munger_doc"] is False
         finally:
             cs._reload_policy()
 
@@ -997,6 +1006,23 @@ def test_depth_ljg_merged_into_quality_bands():
     assert cs._depth(8.9) == ([1, 2], True)
     assert cs._depth(8.4) == ([1, 1], True)
     assert cs._depth(7.4) == ([0, 1], False)
+
+
+def test_chatgpt_munger_document_uses_runtime_decision_threshold():
+    grades = {key: 8.5 for key in cs.QUALITY_DIMENSIONS}
+    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
+    assert result["decision_score"] == 8.5 and result["route"] == "long_read"
+    assert result["chatgpt_munger_doc"] is True
+
+    grades = {key: 8.0 for key in cs.QUALITY_DIMENSIONS}
+    result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
+    assert result["decision_score"] == 8.0 and result["chatgpt_munger_doc"] is False
+
+    result = cs.score(quality(grades), SOURCE, relevance_unavailable=True)
+    assert result["chatgpt_munger_doc"] is False
+
+    waiting = cs.score(quality({key: 8.5 for key in cs.QUALITY_DIMENSIONS}), SOURCE)
+    assert waiting["score_status"] == "needs_relevance" and waiting["chatgpt_munger_doc"] is False
 
 
 
