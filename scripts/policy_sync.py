@@ -2,7 +2,7 @@
 """读取并解析精读配置多维表格。
 
 读飞书多维表格「精读配置」表，重建动态字段并校验。
-静态字段（versions / dimension_scores / quality_dimensions / evidence_caps / claims / retry）
+静态字段（versions / dimension_scores / quality_dimensions / importance_weight / evidence_caps / claims / retry）
 保留本地 policy 的值。评分运行时使用 Base 快照；本文件的 pull 命令仍可用于人工预览或写回。
 写回靠 git 回退；--dry-run 先看 diff 再决定。
 

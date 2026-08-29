@@ -22,7 +22,7 @@ def test_success_card_has_two_links_and_real_newline():
 
 
 def test_failure_card_only_has_main_link():
-    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", failure_reason="history-verification-failed")
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", failure_reason="bridge-output-unverified")
     content = json.dumps(value, ensure_ascii=False)
     assert "main" in content and "munger" not in content and "待复核" in content
 

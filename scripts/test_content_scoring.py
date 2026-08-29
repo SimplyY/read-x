@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Content Scoring v3.15 unit and adversarial checks."""
+"""Content Scoring v3.16 unit and adversarial checks."""
 from __future__ import annotations
 
 import os
@@ -14,11 +14,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import content_scoring as cs
 import fetch_base_config
 import generate_quality as quality_generator
+import generate_relevance as relevance_generator
 import policy_sync
 import render_score_card as card
 import prepare_anchor_view as anchor_view
 import prepare_scoring_run as scoring_run
 import wx_fast as wechat_fetcher
+import verify_source_authority as authority_checker
 
 
 QUOTES = [f"原文核心句{i}。" for i in range(1, 13)]
@@ -33,6 +35,25 @@ CONTEXT = """# 核心上下文
 ## 暂不做什么
 边界。
 """
+REPO_CONTEXT = """# 仓库上下文
+
+> 刷新于：2026-08-28（Asia/Shanghai）
+> 配置快照：evidence/2026-W35.config.json
+> Memory 来源摘要：sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+> 仓库：read-x
+
+## 适用任务
+
+- 阅读兴趣、内容相关性与价值判断。
+
+## 禁止用途
+
+- 不影响客观评分、引用和交付证据。
+
+## 当前切片
+
+- 只改变相关性与价值排序。
+"""
 
 
 def dimension_input(key, score):
@@ -40,8 +61,10 @@ def dimension_input(key, score):
     return {"level": float(value), "disqualifiers": []}
 
 
-def quality(dimension_scores=None, confidence="high", source_status="complete", claim_count=5):
+def quality(dimension_scores=None, confidence="high", source_status="complete", claim_count=5, importance_score=None):
     dimension_scores = dimension_scores or {key: 8.0 for key in cs.QUALITY_DIMENSIONS}
+    if importance_score is None:
+        importance_score = next(iter(dimension_scores.values())) if len(set(dimension_scores.values())) == 1 else 8.0
     claims = [
         {
             "id": f"C{i}", "type": "causal", "importance": "core",
@@ -60,6 +83,10 @@ def quality(dimension_scores=None, confidence="high", source_status="complete", 
                 "rationale": f"{key} 理由", "ceiling_reason": f"{key} 上限",
             }
             for key in cs.QUALITY_DIMENSIONS
+        },
+        "problem_significance": {
+            "level": float(importance_score),
+            "claim_ids": ["C1"], "rationale": "问题影响范围与长期杠杆", "ceiling_reason": "未展示全部系统边界",
         },
         "domain_confidence": confidence,
         "conclusion": "结论",
@@ -80,8 +107,22 @@ def relevance(relevance_score=0.5, interest_score=0.5, confidence="high"):
     }
 
 
+def importance(authority_score=9.0, confidence="high", evidence=None):
+    return {
+        "schema_version": cs.SCORE_VERSION,
+        "authority_score": authority_score,
+        "evidence": evidence or [
+            {"kind": "publisher", "label": "专业出版物", "url": "https://example.com/publisher", "verified": True},
+            {"kind": "interview", "label": "一手采访", "url": "https://example.com/interview", "verified": True},
+        ],
+        "confidence": confidence,
+        "rationale": "出处链完整且有一手材料",
+    }
+
+
 def test_policy_is_single_consistent_scale():
     assert sum(Decimal(str(item["weight"])) for item in cs.QUALITY_DIMENSIONS.values()) == Decimal("1")
+    assert Decimal(str(cs.POLICY["importance_weight"])) == Decimal("0.30")
     assert float(cs.POLICY["relevance_bonus"]["max"]) > 0
     assert cs.POLICY["claims"]["standard_counts"] == [5, 8, 12]
     assert cs.DIMENSION_SCORES == {Decimal(str(value)) for value in (0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10)}
@@ -432,6 +473,14 @@ def test_partial_source_never_gets_a_number():
     assert cs.score(invalid_status, SOURCE)["score_status"] == "needs_review"
 
 
+def test_invalid_source_type_fails_closed_without_throwing():
+    for source in (None, 123, [], {}):
+        result = cs.score(quality(), source)
+        assert result["score_status"] == "needs_review"
+        assert result["quality_score"] is None
+        assert result["issues"] == ["source text must be a string"]
+
+
 def test_invalid_quote_and_claim_count_fail_closed():
     bad = quality()
     bad["claim_ledger"][0]["source_quote"] = "不存在的引文"
@@ -593,11 +642,22 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert all(quality_runtime.count(f"| {score:.1f} |") >= 3 for score in (6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10))
 
 
+def test_fixed_scoring_tail_cannot_skip_importance_verification():
+    skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
+    start = skill.index("python3 /Users/yuwei/code/read-x/scripts/verify_source_authority.py")
+    end = skill.index("\n```", start)
+    fixed_tail = skill[start:end]
+    assert "verify_source_authority.py" in fixed_tail
+    assert "--source \"<source.md>\"" in fixed_tail
+    assert "--importance-output" in fixed_tail
+
+
 def test_quality_generator_is_closed_book_and_schema_bound():
     schema = quality_generator.quality_run_schema()
     assert "budget" in schema["required"] and "dimensions" in schema["required"]
     dimensions = schema["properties"]["dimensions"]
     assert set(dimensions["required"]) == set(cs.QUALITY_DIMENSIONS)
+    assert "problem_significance" in schema["required"]
     assert all(item["required"] == ["level", "unit_ids", "disqualifiers"] for item in dimensions["properties"].values())
     assert quality_generator.MODEL == "glm-5.2" and quality_generator.ENDPOINT.startswith("http://127.0.0.1:")
     generator_source = Path(quality_generator.__file__).read_text(encoding="utf-8")
@@ -641,6 +701,25 @@ def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
         assert "needs_relevance" in str(exc)
     else:
         raise AssertionError("needs_relevance must not render")
+
+
+def test_unavailable_importance_does_not_render_partial_problem_score():
+    """Composite importance is atomic at the user-facing boundary."""
+    result = cs.score(
+        quality({"evidence_quality": 6.0, "insight_explanatory": 7.0, "transfer_durability": 7.0}),
+        SOURCE,
+        relevance_output=relevance(0.4, 0.0),
+        context_text=REPO_CONTEXT,
+    )
+    assert result["importance_score"] is None
+    assert result["importance_dimensions"]["problem_significance_score"] == 8.0
+    rendered = card.render_card(result, title="标题", author="作者", date="2026-01-12", url="https://example.com", score_only=True)
+    payload = json.dumps(rendered, ensure_ascii=False)
+    assert "**权威性**  不可用" in payload
+    assert "**大问题思考**  不可用" in payload
+    assert "未找到可核验的非微信原始出处" in payload
+    assert "**大问题思考**  8.0" not in payload
+    assert "unavailable" not in payload
 
 
 def test_seven_anchor_profiles_match_user_ranges():
@@ -767,12 +846,12 @@ def test_relevance_can_rescue_only_boundary_quality():
     assert result["ljg_card"] is False
 
 
-def test_quality_label_uses_the_same_decision_score_as_depth():
+def test_quality_label_uses_quality_score_while_depth_uses_decision_score():
     grades = {key: 7.5 for key in cs.QUALITY_DIMENSIONS}
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
     assert result["quality_score"] == 7.5
     assert result["decision_score"] == 8.5
-    assert result["quality_label"] == "完整深读"
+    assert result["quality_label"] == "选择性深读"
     assert result["ljg_range"] == [1, 2]
 
 
@@ -800,6 +879,21 @@ def test_relevance_failure_falls_back_to_quality():
     no_conclusion_no_rationale["rationale"] = ""
     result = cs.score(boundary, SOURCE, relevance_output=no_conclusion_no_rationale, context_text=CONTEXT)
     assert result["relevance_score"] is None and "relevance conclusion is required" in result["issues"]
+
+
+def test_validated_read_x_slice_is_accepted_for_relevance():
+    assert cs._validate_repo_context(REPO_CONTEXT)
+    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=REPO_CONTEXT)
+    assert result["score_status"] == "scored"
+    assert result["relevance_score"] == 0.5 and result["context_fingerprint"] is not None
+
+
+def test_unmarked_repo_slice_is_rejected_for_relevance():
+    unmarked = REPO_CONTEXT.replace("> 仓库：read-x", "> 仓库：other")
+    assert not cs._validate_repo_context(unmarked)
+    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=unmarked)
+    assert result["relevance_score"] is None
+    assert "relevance_context_unavailable" in result["issues"]
 
 
 def test_fingerprints_ignore_layout_but_track_content_and_context():
@@ -837,6 +931,14 @@ def test_relevance_and_interest_scores_clamped_per_axis():
     # 双零回质量基线
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
     assert result["relevance_score"] == 0.0 and result["interest_score"] == 0.0 and result["decision_score"] == 6.8
+
+
+def test_non_finite_relevance_scores_fail_closed_without_decimal_crash():
+    for value in (float("nan"), float("inf"), -float("inf")):
+        result = cs.score(quality(), SOURCE, relevance_output=relevance(value, 0), context_text=CONTEXT)
+        assert result["relevance_score"] is None
+        assert result["relevance_confidence"] == "unavailable"
+        assert result["decision_score"] == result["quality_score"]
 
 
 def test_depth_uses_joint_decision_score():
@@ -1044,6 +1146,108 @@ def test_reading_category_is_optional_for_backward_compat():
     assert result.get("reading_category") is None
 
 
+def test_importance_axis_uses_fixed_thirty_percent_formula():
+    result = cs.score(quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0), SOURCE,
+                      importance_output=importance(), relevance_output=relevance(), context_text=CONTEXT)
+    assert result["quality_score"] == 7.0
+    assert result["importance_score"] == 9.0
+    assert result["base_priority"] == 7.6
+    assert result["decision_score"] == 8.6
+    assert result["quality_label"] == "选择性深读"
+
+
+def test_authority_metadata_does_not_change_quality_score():
+    q = quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
+    first = cs.score(q, SOURCE, importance_output=importance(9.0), relevance_unavailable=True)
+    second = cs.score(q, SOURCE, importance_output=importance(4.0, evidence=[{"kind": "publisher", "label": "匿名转载", "verified": False}]), relevance_unavailable=True)
+    assert first["quality_score"] == second["quality_score"] == 7.0
+    assert first["importance_score"] == 9.0 and second["importance_score"] == 6.5
+    q["problem_significance"]["level"] = 10.0
+    assert cs.score(q, SOURCE, relevance_unavailable=True)["quality_score"] == 7.0
+
+
+def test_high_authority_trivial_problem_cannot_be_high_importance():
+    q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=4.0)
+    result = cs.score(q, SOURCE, importance_output=importance(), relevance_unavailable=True)
+    assert result["importance_score"] == 6.5
+    assert result["importance_dimensions"]["authority_score"] == 9.0
+
+
+def test_unknown_source_limits_authority_even_for_systemic_problem():
+    q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
+    result = cs.score(q, SOURCE, importance_output=importance(4.0, evidence=[{"kind": "self_assertion", "label": "来源不明", "verified": False}]), relevance_unavailable=True)
+    assert result["importance_score"] == 6.5
+    assert result["importance_dimensions"]["authority_score"] == 4.0
+
+
+def test_missing_or_unverifiable_importance_is_explicitly_unavailable():
+    q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
+    missing = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert missing["importance_score"] is None and missing["importance_confidence"] == "unavailable"
+    assert "importance_unavailable" in missing["issues"]
+    unavailable_artifact = {
+        "schema_version": cs.SCORE_VERSION,
+        "authority_score": 4.0,
+        "evidence": [],
+        "confidence": "unavailable",
+        "rationale": "原始出处链接不可用",
+    }
+    clean = cs.score(q, SOURCE, importance_output=unavailable_artifact, relevance_unavailable=True)
+    assert clean["importance_score"] is None and "importance_unavailable" in clean["issues"]
+    assert "relevance_context_unavailable" in clean["issues"]
+    invalid = cs.score(q, SOURCE, importance_output=importance(9.0, evidence=[{"kind": "publisher", "label": "未核验", "verified": False}]), relevance_unavailable=True)
+    assert invalid["importance_score"] is None and "importance_unavailable" in invalid["issues"]
+
+
+def test_quality_floor_still_blocks_low_quality_despite_importance():
+    grades = {key: 10.0 for key in cs.QUALITY_DIMENSIONS}
+    grades["evidence_quality"] = 2.0
+    result = cs.score(quality(grades, importance_score=9.0), SOURCE, importance_output=importance(), relevance_unavailable=True)
+    assert result["quality_score"] == 5.9 and result["decision_score"] == 6.8
+    assert result["route"] == "card" and result["chatgpt_munger_doc"] is False
+
+
+def test_v315_quality_output_is_rejected_without_migration():
+    stale = quality()
+    stale["schema_version"] = "3.15"
+    result = cs.score(stale, SOURCE, relevance_unavailable=True)
+    assert result["score_status"] == "needs_review"
+    assert result["quality_score"] is None and "3.16" in result["issues"][0]
+
+
+def test_source_authority_check_is_read_only_and_requires_verified_provenance():
+    with tempfile.TemporaryDirectory() as directory:
+        page = Path(directory) / "source.html"
+        page.write_text("<title>MIT Technology Review interview Bill Gates</title><p>first-party interview</p>", encoding="utf-8")
+        result = authority_checker.verify(page.as_uri(), [("publisher", "MIT Technology Review"), ("interview", "Bill Gates")])
+        assert result["schema_version"] == cs.SCORE_VERSION
+        assert result["authority_score"] == 9.0 and all(item["verified"] for item in result["evidence"])
+        assert page.read_text(encoding="utf-8").startswith("<title>")
+        unavailable = authority_checker.verify(page.as_uri(), [("publisher", "Unknown Publisher")])
+        assert unavailable["confidence"] == "unavailable"
+
+
+def test_source_authority_accepts_explicit_chinese_repost_aliases():
+    with tempfile.TemporaryDirectory() as directory:
+        page = Path(directory) / "source.html"
+        page.write_text("<title>MIT Technology Review interview Bill Gates</title>", encoding="utf-8")
+        source = "（来源：麻省理工科技评论）\n比尔·盖茨（Bill Gates）"
+        checks = [("publisher", "麻省理工科技评论"), ("interview", "比尔·盖茨")]
+        result = authority_checker.verify(page.as_uri(), checks, label_aliases=authority_checker.source_label_aliases(source, checks))
+        assert result["authority_score"] == 9.0
+        assert all(item["verified"] for item in result["evidence"])
+
+
+def test_original_url_from_source_ignores_wechat_repost_url():
+    source = """> 原文链接: https://mp.weixin.qq.com/s/repost
+
+原文链接：
+
+https://www.technologyreview.com/interview/bill-gates/。
+"""
+    assert authority_checker.original_url_from_source(source) == "https://www.technologyreview.com/interview/bill-gates/"
+    assert authority_checker.original_url_from_source("> 原文链接: https://mp.weixin.qq.com/s/repost") is None
+
 
 def test_reading_category_free_text_is_normalized():
     cases = {"科技/技术": "AI/技术", "人工智能": "AI/技术", "投资与金融": "投资/财经", "energy": "投资/财经", "认知与成长": "认知/成长", "other": "未分类"}
@@ -1071,6 +1275,17 @@ def test_reading_category_invalid_is_nonfatal_and_not_passed_through():
     assert result["score_status"] == "scored"
     assert result.get("reading_category") == "未分类"
     assert result.get("reading_category_confidence") is None
+
+
+def test_relevance_generator_rejects_non_finite_scores():
+    payload = relevance(0.5, 0.5)
+    payload["relevance_score"] = float("nan")
+    try:
+        relevance_generator.validate_relevance(payload)
+    except RuntimeError as exc:
+        assert "finite" in str(exc)
+    else:
+        raise AssertionError("non-finite relevance score must be rejected")
 
 
 TESTS = [value for name, value in sorted(globals().items()) if name.startswith("test_")]

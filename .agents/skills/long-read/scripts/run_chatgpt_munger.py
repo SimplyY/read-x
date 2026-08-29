@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 
 MIN_VISIBLE_CHARS = 500
 MAX_PROMPT_CHARS = 120_000
-BRIDGE_TIMEOUT_SECONDS = 180
 
 
 def _skill_candidates(name: str) -> list[Path]:
@@ -86,8 +85,8 @@ def _validate_text(result: dict) -> str:
         raise RuntimeError(result.get("reason") or f"bridge status: {result.get('status')}")
     if result.get("format") != "markdown":
         raise RuntimeError("bridge format must be markdown")
-    if result.get("historyVerified") is not True:
-        raise RuntimeError("chatgpt history was not verified")
+    if result.get("verification") != "live-dom+snapshot":
+        raise RuntimeError("bridge output was not verified by live DOM and snapshot")
     conversation_url = result.get("conversationUrl")
     parsed_url = urlparse(conversation_url or "")
     if parsed_url.scheme not in {"http", "https"} or "/c/" not in parsed_url.path:
@@ -132,17 +131,21 @@ def run(source_path: Path, output_path: Path, skill_path: Path | None = None, br
     bridge = bridge_path or resolve_skill("chatgpt-web-bridge").parent / "scripts/bridge.mjs"
     if not bridge.is_file():
         raise FileNotFoundError(f"chatgpt bridge is not installed: {bridge}")
-    try:
-        completed = subprocess.run(
-            ["node", str(bridge)], input=prompt, text=True, capture_output=True,
-            check=False, timeout=BRIDGE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        return {"status": "needs_review", "reason": "bridge-timeout"}
+    # The Bridge owns its submit/observe/cleanup deadlines. A shorter parent
+    # watchdog can kill Node before it releases its lock and task space.
+    completed = subprocess.run(
+        ["node", str(bridge)], input=prompt, text=True, capture_output=True,
+        check=False,
+    )
     try:
         result = _parse_bridge(completed.stdout)
     except Exception as exc:
-        return {"status": "needs_review", "reason": str(exc)}
+        reason = str(exc)
+        if completed.returncode != 0:
+            reason = f"bridge-exit-{completed.returncode}: {reason}"
+        return {"status": "needs_review", "reason": reason}
+    if completed.returncode != 0 and result.get("status") == "succeeded":
+        return {"status": "needs_review", "reason": f"bridge-exit-{completed.returncode}"}
     try:
         text = _validate_text(result)
     except Exception as exc:
@@ -152,7 +155,7 @@ def run(source_path: Path, output_path: Path, skill_path: Path | None = None, br
         "output": str(output_path),
         "runId": result.get("runId"),
         "conversationUrl": result.get("conversationUrl"),
-        "historyVerified": True,
+        "verification": result.get("verification"),
         "outputSha256": result.get("outputSha256"),
         "sourceSha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "mungerSkillSha256": hashlib.sha256(skill.encode("utf-8")).hexdigest(),

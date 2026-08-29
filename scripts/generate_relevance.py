@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import socket
 import sys
@@ -16,6 +17,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import content_scoring as scoring
 
 ENDPOINT = "http://127.0.0.1:38441/v1/responses"
 MODEL = "glm-5.2"
@@ -33,6 +36,8 @@ def snap_score(value, default: float = 0.0) -> float:
         v = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(v):
+        raise RuntimeError("relevance score must be finite")
     v = max(0.0, min(0.5, v))
     return min(SCORE_ENUM, key=lambda x: abs(x - v))
 
@@ -164,6 +169,8 @@ def main() -> int:
     meta = extract_metadata(args.source.read_text(encoding="utf-8"))
 
     context_text = args.context.read_text(encoding="utf-8")
+    if not scoring._validate_repo_context(context_text):
+        raise RuntimeError("context is not a validated read-x slice")
     refresh_match = re.search(r">\s*刷新于[：:]\s*([^\n<]+)", context_text)
     refresh_date = refresh_match.group(1).strip() if refresh_match else "未知"
 
@@ -174,7 +181,7 @@ def main() -> int:
         f"只输出同形状单行 JSON：{example}\n\n"
         "飞鱼元主线（relevance_score 轴，max 0.5）：AI 产业认知、价值投资、教育+AI、AI 时代探索。\n"
         "relevance_score 锚点：0 未命中；0.2~0.3 轻命中（蹭热点/泛泛提及）；0.4 实质命中一个元主线；0.5 多主线或深度推进且极高相关（满档，谨慎给）。\n"
-        "interest_score 轴（max 0.5）：按文章内容对飞鱼「领域兴趣」区块的命中程度给分。"
+        "interest_score 轴（max 0.5）：只按提供的受限上下文中明确列出的兴趣信息给分；上下文没有具体兴趣清单时不得臆造，给 0。"
         "锚点：0 未命中；0.2~0.3 边缘兴趣（沾边）；0.4 明确兴趣领域；0.5 核心兴趣领域且极高兴趣或当下强好奇（满档，仅极高兴趣才给）。\n"
         "判定原则（第一性）：看内容吻合度与相关性，不以作者身份/名气单独判断。"
         "李开复谈 AI 产业命中，李开复谈无关话题不命中。内容须实质推进飞鱼对该元主线或兴趣领域的认知，蹭热点或泛泛提及给低分或 0。"

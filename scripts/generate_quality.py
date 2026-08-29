@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one closed-book three-dimension quality output."""
+"""Generate one closed-book quality output plus an independent problem-significance score."""
 from __future__ import annotations
 
 import argparse
@@ -18,7 +18,7 @@ import content_scoring as scoring
 ENDPOINT = "http://127.0.0.1:38441/v1/responses"
 MODEL = "glm-5.2"
 RUNTIME = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/quality-runtime.md"
-CLAIM_TYPE = {"evidence_quality": "empirical", "insight_explanatory": "causal", "transfer_durability": "method"}
+CLAIM_TYPE = {"evidence_quality": "empirical", "insight_explanatory": "causal", "transfer_durability": "method", "problem_significance": "normative"}
 
 
 RETRY_ATTEMPTS = 3
@@ -97,8 +97,14 @@ def quality_run_schema(short_text: bool = False) -> dict:
             "reading_category_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
             "budget": {"type": "integer", "enum": [2, 3, 4, 5] if short_text else [5, 8, 12]},
             "dimensions": {"type": "object", "properties": dimensions, "required": list(dimensions), "additionalProperties": False},
+            "problem_significance": {
+                "type": "object", "properties": {
+                    "level": {"type": "number", "enum": sorted(float(value) for value in scoring.DIMENSION_SCORES)},
+                    "unit_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 5, "uniqueItems": True},
+                }, "required": ["level", "unit_ids"], "additionalProperties": False,
+            },
         },
-        "required": ["source_status", "primary_domain", "secondary_domain", "domain_confidence", "reading_category", "reading_category_confidence", "budget", "dimensions"],
+        "required": ["source_status", "primary_domain", "secondary_domain", "domain_confidence", "reading_category", "reading_category_confidence", "budget", "dimensions", "problem_significance"],
         "additionalProperties": False,
     }
 
@@ -133,7 +139,8 @@ def source_units(source: str) -> list[str]:
 
 
 def select_units(dimensions: dict, budget: int) -> list[int]:
-    candidates = [dimensions[key]["unit_ids"][rank] for rank in range(5) for key in scoring.QUALITY_DIMENSIONS if rank < len(dimensions[key]["unit_ids"])]
+    keys = tuple(key for key in tuple(scoring.QUALITY_DIMENSIONS) + ("problem_significance",) if key in dimensions)
+    candidates = [dimensions[key]["unit_ids"][rank] for rank in range(5) for key in keys if rank < len(dimensions[key]["unit_ids"])]
     selected = list(dict.fromkeys(candidates))[:budget]
     if len(selected) != budget:
         raise RuntimeError(f"dimensions produced {len(selected)} unique claims for budget {budget}")
@@ -153,7 +160,7 @@ def generate(parts: list[Path], timeout: float) -> dict:
     numbered = "\n".join(f"[{index}] {unit}" for index, unit in enumerate(units, 1))
     short_text = len(source) < 1000
     example_dimensions = ",".join(f'"{key}":{{"level":7.0,"unit_ids":[1],"disqualifiers":[]}}' for key in scoring.QUALITY_DIMENSIONS)
-    example = '{"source_status":"complete","primary_domain":"技术","secondary_domain":"","domain_confidence":"high","reading_category":"ai","reading_category_confidence":"high","budget":' + str(2 if short_text else 5) + f',"dimensions":{{{example_dimensions}}}}}'
+    example = '{"source_status":"complete","primary_domain":"技术","secondary_domain":"","domain_confidence":"high","reading_category":"ai","reading_category_confidence":"high","budget":' + str(2 if short_text else 5) + f',"dimensions":{{{example_dimensions}}},"problem_significance":{{"level":7.0,"unit_ids":[1]}}}}'
     category_spec = (
         "reading_category 严格按正文核心主题归类（不以标题关键词、出现频率最高的词或作者身份归类），"
         "只允许输出以下六个键之一（键名本身，不要写中文类目）："
@@ -165,7 +172,7 @@ def generate(parts: list[Path], timeout: float) -> dict:
         "other=以上均不匹配。若正文以AI或技术为背景、但核心是教育/认知，归cognition；核心是投资，归invest。"
     )
     prompt = (
-        "一次判断三个质量维度。三维严格按数值语义各判一次，不读取或推断用户画像。"
+        "一次判断三个内容质量维度和一个独立的大问题思考维度。三维质量严格按数值语义各判一次，不读取或推断用户画像；problem_significance 只判断正文所思考问题的影响范围、系统性、长期性、不可逆性和决策杠杆，不受作者身份影响。"
         "每维 unit_ids 只保留直接决定该分数的原文单元；不要输出过程、事实枚举、理由、上限或总分。"
         f"{category_spec}"
         f"只输出同形状单行 JSON：{example}\n<quality_rubric>\n{rubric}\n</quality_rubric>"
@@ -186,22 +193,32 @@ def generate(parts: list[Path], timeout: float) -> dict:
             raise RuntimeError(f"{key} disqualifier is invalid")
         if any(not isinstance(value, int) or not 1 <= value <= len(units) for value in item["unit_ids"]):
             raise RuntimeError(f"{key} unit_id is invalid")
-    chosen = select_units(dimensions, result["budget"])
+    if set(result["problem_significance"]) != {"level", "unit_ids"}:
+        raise RuntimeError("problem_significance returned invalid fields")
+    if result["problem_significance"]["level"] not in scoring.DIMENSION_SCORES:
+        raise RuntimeError("problem_significance level is invalid")
+    if any(not isinstance(value, int) or not 1 <= value <= len(units) for value in result["problem_significance"]["unit_ids"]):
+        raise RuntimeError("problem_significance unit_id is invalid")
+    all_dimensions = {**dimensions, "problem_significance": result["problem_significance"]}
+    chosen = select_units(all_dimensions, result["budget"])
     ledger = []
     for index, unit_id in enumerate(chosen, 1):
         quote = units[unit_id - 1]
-        owner = next((key for key in scoring.QUALITY_DIMENSIONS if unit_id in dimensions[key]["unit_ids"]), "evidence_quality")
+        owner = next((key for key in all_dimensions if unit_id in all_dimensions[key]["unit_ids"]), "evidence_quality")
         ledger.append({"id": f"c{index}", "type": CLAIM_TYPE[owner], "importance": "core" if index <= 3 else "supporting", "claim": quote.strip("#>*- "), "source_quote": quote, "support": "direct", "uncertainty": None})
     unit_to_claim = {unit_id: f"c{index}" for index, unit_id in enumerate(chosen, 1)}
     output_dimensions = {}
     for key, item in dimensions.items():
         ids = [unit_to_claim[value] for value in item["unit_ids"] if value in unit_to_claim][:5]
         output_dimensions[key] = {"level": item["level"], "disqualifiers": item["disqualifiers"], "claim_ids": ids or ["c1"], "rationale": f"达到{item['level']}分语义", "ceiling_reason": "未完整满足下一档语义"}
+    problem_ids = [unit_to_claim[value] for value in result["problem_significance"]["unit_ids"] if value in unit_to_claim][:5]
     return {
         "schema_version": scoring.QUALITY_VERSION, "source_status": result["source_status"],
         "detected_domain": {"primary": result["primary_domain"], "secondary": result["secondary_domain"]},
         "reading_category": result["reading_category"], "reading_category_confidence": result["reading_category_confidence"],
-        "claim_ledger": ledger, "dimensions": output_dimensions, "domain_confidence": result["domain_confidence"],
+        "claim_ledger": ledger, "dimensions": output_dimensions,
+        "problem_significance": {"level": result["problem_significance"]["level"], "claim_ids": problem_ids or ["c1"], "rationale": f"达到{result['problem_significance']['level']}分语义", "ceiling_reason": "未完整满足下一档语义"},
+        "domain_confidence": result["domain_confidence"],
         "conclusion": ledger[0]["claim"], "questions": [],
     }
 

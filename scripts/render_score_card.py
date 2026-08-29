@@ -13,6 +13,7 @@ DIMENSIONS = (
     ("insight_explanatory", "洞察解释"),
     ("transfer_durability", "长期迁移"),
 )
+IMPORTANCE_LABEL = "权威性与大问题思考"
 
 
 def _metric(label: str, value: str) -> dict:
@@ -40,6 +41,19 @@ def _dimension_text(result: dict, keys: tuple[tuple[str, str], ...]) -> str:
     return "\n".join(lines)
 
 
+def _importance_text(result: dict) -> str:
+    # The two sub-scores are only user-facing when the composite is valid.
+    # A missing authority artifact must not look like a partially scored axis.
+    importance = result.get("importance_score")
+    if not isinstance(importance, (int, float)) or isinstance(importance, bool):
+        return "**权威性**  不可用\n**大问题思考**  不可用\n\n_未找到可核验的非微信原始出处，未计重要性加成。_"
+    dimensions = result.get("importance_dimensions") or {}
+    authority = dimensions.get("authority_score")
+    problem = dimensions.get("problem_significance_score")
+    fmt = lambda value: f"{value:.1f}" if isinstance(value, (int, float)) else "不可用"
+    return f"**权威性**  {fmt(authority)}\n**大问题思考**  {fmt(problem)}"
+
+
 def render_card(result: dict, *, title: str, author: str, date: str, url: str, score_only: bool) -> dict:
     if urlparse(url).scheme not in {"http", "https"}:
         raise ValueError("url must use http or https")
@@ -63,6 +77,8 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
     interest = result.get("interest_score")
     interest_value = f"+{interest:.1f}" if isinstance(interest, (int, float)) else result.get("interest_label", "-")
     interest_label = "兴趣"
+    importance = result.get("importance_score")
+    importance_value = f"{importance:.1f}" if isinstance(importance, (int, float)) and not isinstance(importance, bool) else "不可用"
     elements = [
         {
             "tag": "column_set",
@@ -71,6 +87,7 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
             "margin": "0px 0px 12px 0px",
             "columns": [
                 _metric("质量", f"{result['quality_score']:.1f}"),
+                _metric(IMPORTANCE_LABEL, importance_value),
                 _metric(relevance_label, relevance_value),
                 _metric(interest_label, interest_value),
                 _metric("决策", f"{result['decision_score']:.1f}"),
@@ -83,7 +100,7 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
             "margin": "0px 0px 12px 0px",
             "columns": [
                 _text_column(_dimension_text(result, DIMENSIONS[:2])),
-                _text_column(_dimension_text(result, DIMENSIONS[2:])),
+                _text_column(_dimension_text(result, DIMENSIONS[2:]) + "\n\n" + _importance_text(result)),
             ],
         },
         _highlight(f"{result['quality_label']} · {result['quality_score']:.1f}/10", result.get("conclusion") or "无结论"),

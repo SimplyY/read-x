@@ -4,6 +4,7 @@
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
     [--retry-quality-output retry.json] \
+    [--importance-output importance.json] \
     [--relevance-output relevance.json --context context.md] \
     [--config-from-base <base-config.json>]
   python3 scripts/content_scoring.py --self-check
@@ -25,6 +26,7 @@ import os
 import re
 import sys
 import unicodedata
+from urllib.parse import urlparse
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
@@ -72,6 +74,10 @@ def _validate_runtime_policy(policy):
         raise ValueError("base config relevance bonus is invalid")
     if values[1] + values[2] > values[0]:
         raise ValueError("base config relevance bonus exceeds max")
+    importance_weight = policy.get("importance_weight")
+    if (isinstance(importance_weight, bool) or not isinstance(importance_weight, (int, float, Decimal))
+            or not math.isfinite(importance_weight) or not 0 < importance_weight < 1):
+        raise ValueError("importance weight is invalid")
 
 
 def _load_policy(external_config_path: str | None = None):
@@ -95,12 +101,14 @@ POLICY_SOURCE = "local"
 SCORE_VERSION = POLICY["versions"]["score"]
 QUALITY_VERSION = POLICY["versions"]["quality"]
 RELEVANCE_VERSION = POLICY["versions"]["relevance"]
+IMPORTANCE_WEIGHT = Decimal(str(POLICY["importance_weight"]))
 DIMENSION_SCORES = {Decimal(str(value)) for value in POLICY["dimension_scores"]}
 QUALITY_DIMENSIONS = POLICY["quality_dimensions"]
 QUALITY_DISQUALIFIERS = POLICY["quality_disqualifiers"]
 CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
+REPO_CONTEXT_SECTIONS = {"适用任务", "禁止用途", "当前切片"}
 READING_CATEGORY_KEYS = ("invest", "ai", "cognition", "business", "culture", "other")
 READING_CATEGORY_LABELS = {"invest": "投资/财经", "ai": "AI/技术", "cognition": "认知/成长", "business": "商业/产业", "culture": "人文/生活", "other": "未分类"}
 _CATEGORY_SYNONYMS = [
@@ -130,6 +138,7 @@ def _reload_policy(external_config_path: str | None = None):
     global POLICY, POLICY_SOURCE
     POLICY = _load_policy(external_config_path)
     POLICY_SOURCE = "base" if external_config_path else "local"
+    globals()["IMPORTANCE_WEIGHT"] = Decimal(str(POLICY["importance_weight"]))
 
 
 def round1(value) -> float:
@@ -282,6 +291,73 @@ def _validate_dimensions(dimensions, expected: dict, claim_ids: set[str], releva
     return errors
 
 
+def _validate_problem_significance(item, claim_ids: set[str]) -> list[str]:
+    if not isinstance(item, dict):
+        return ["problem_significance must be an object"]
+    errors = []
+    level = item.get("level")
+    if isinstance(level, bool) or not isinstance(level, (int, float)) or Decimal(str(level)) not in DIMENSION_SCORES:
+        errors.append("problem_significance.level is invalid")
+    if "score" in item:
+        errors.append("problem_significance.score is script-owned")
+    ids = item.get("claim_ids")
+    if not isinstance(ids, list) or not ids or any(claim_id not in claim_ids for claim_id in ids):
+        errors.append("problem_significance.claim_ids is invalid")
+    if not _nonempty(item.get("rationale")):
+        errors.append("problem_significance.rationale is required")
+    if not _nonempty(item.get("ceiling_reason")):
+        errors.append("problem_significance.ceiling_reason is required")
+    return errors
+
+
+def _validate_importance_output(output: dict) -> tuple[dict | None, list[str]]:
+    """Validate read-only provenance evidence; scoring never invents authority."""
+    if output is None:
+        return None, ["importance_unavailable"]
+    if not isinstance(output, dict):
+        return None, ["importance output must be an object", "importance_unavailable"]
+    errors = []
+    if output.get("schema_version") != SCORE_VERSION:
+        errors.append(f"importance schema_version must be {SCORE_VERSION}")
+    authority = output.get("authority_score")
+    if isinstance(authority, bool) or not isinstance(authority, (int, float)) or Decimal(str(authority)) not in DIMENSION_SCORES:
+        errors.append("authority_score is invalid")
+    unavailable_artifact = output.get("confidence") == "unavailable" and authority == 4.0
+    evidence = output.get("evidence")
+    if not isinstance(evidence, list) or not evidence or any(not isinstance(item, dict) for item in evidence):
+        if not unavailable_artifact:
+            errors.append("importance evidence must be a non-empty array")
+        evidence = []
+    verified = [item for item in evidence if item.get("verified") is True]
+    for index, item in enumerate(evidence):
+        if item.get("kind") not in {"publisher", "author", "interview", "primary_source", "self_assertion"}:
+            errors.append(f"importance evidence[{index}].kind is invalid")
+        if not _nonempty(item.get("label")):
+            errors.append(f"importance evidence[{index}].label is required")
+        parsed_url = urlparse(str(item.get("url", "")))
+        if item.get("verified") is True and (parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc):
+            errors.append(f"importance evidence[{index}].url is required for verified evidence")
+    if isinstance(authority, (int, float)) and not isinstance(authority, bool):
+        if authority >= 9 and (len(verified) < 2 or not any(item.get("kind") in {"interview", "primary_source"} for item in verified)):
+            errors.append("authority_score>=9 requires two verified sources including interview or primary_source")
+        elif authority > 6 and not verified:
+            errors.append("authority_score>6 requires verified evidence")
+    if output.get("confidence") not in {"high", "medium", "unavailable"}:
+        errors.append("importance confidence must be high or medium")
+    if not _nonempty(output.get("rationale")):
+        errors.append("importance rationale is required")
+    if unavailable_artifact and not errors and not verified:
+        return None, ["importance_unavailable"]
+    if errors:
+        return None, errors + ["importance_unavailable"]
+    return {
+        "authority_score": round1(authority),
+        "evidence": evidence,
+        "confidence": output["confidence"],
+        "rationale": output["rationale"],
+    }, []
+
+
 def _quality_attempt(output: dict, source_text: str) -> dict:
     if not isinstance(output, dict):
         raise ValueError("quality output must be an object")
@@ -300,6 +376,7 @@ def _quality_attempt(output: dict, source_text: str) -> dict:
         if isinstance(claim, dict) and isinstance(claim.get("id"), str)
     } if isinstance(claims, list) else set()
     errors += _validate_dimensions(output.get("dimensions"), QUALITY_DIMENSIONS, claim_ids)
+    errors += _validate_problem_significance(output.get("problem_significance"), claim_ids)
     if "calibration" in output:
         errors.append("calibration is forbidden in closed-book quality output")
     confidence = output.get("domain_confidence")
@@ -321,7 +398,14 @@ def _quality_attempt(output: dict, source_text: str) -> dict:
     retry_reasons = []
     if confidence == "low":
         retry_reasons.append("low_domain_confidence")
-    return {"score": score_value, "raw": raw, "output": output, "retry_reasons": retry_reasons}
+    problem = output["problem_significance"]
+    return {
+        "score": score_value,
+        "raw": raw,
+        "output": output,
+        "problem_significance": {"score": round1(problem["level"]), **problem},
+        "retry_reasons": retry_reasons,
+    }
 
 
 def _quality_band(value: float) -> str:
@@ -344,6 +428,9 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
         "score_status": status,
         "quality_score": None,
         "quality_confidence": "low",
+        "importance_score": None,
+        "importance_confidence": "unavailable",
+        "importance_dimensions": {},
         "relevance_score": None,
         "relevance_confidence": "unavailable",
         "decision_score": None,
@@ -362,8 +449,17 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
     }
 
 
+def _validate_repo_context(context_text: str) -> bool:
+    return bool(re.search(r"^>\s*仓库：read-x\s*$", context_text, re.MULTILINE)) and all(
+        re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE)
+        for section in REPO_CONTEXT_SECTIONS
+    )
+
+
 def _validate_context(context_text: str) -> bool:
-    return all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in CONTEXT_SECTIONS)
+    if all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in CONTEXT_SECTIONS):
+        return True
+    return _validate_repo_context(context_text)
 
 
 def _relevance_result(output, context_text: str | None):
@@ -380,7 +476,8 @@ def _relevance_result(output, context_text: str | None):
         rel_raw = output.get("relevance_score")
         int_raw = output.get("interest_score")
         for name, raw in (("relevance_score", rel_raw), ("interest_score", int_raw)):
-            if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            if (not isinstance(raw, (int, float)) or isinstance(raw, bool)
+                    or not math.isfinite(raw)):
                 errors.append(f"relevance {name} must be a number")
         matched = output.get("matched_mainlines")
         if not isinstance(matched, list) or any(not isinstance(m, str) or not m.strip() for m in matched):
@@ -455,7 +552,10 @@ def score(
     relevance_output=None,
     context_text=None,
     relevance_unavailable=False,
+    importance_output=None,
 ):
+    if not isinstance(source_text, str):
+        return _needs_result("needs_review", content_fingerprint(""), ["source text must be a string"])
     fp = content_fingerprint(source_text)
     if not isinstance(quality_output, dict):
         return _needs_result("needs_review", fp, ["quality output must be an object"])
@@ -481,6 +581,7 @@ def score(
 
     quality_score = first["score"]
     effective_quality_output = first["output"]
+    problem = first["problem_significance"]
     raw_category = _normalize_reading_category(effective_quality_output.get("reading_category"))
     reading_category = READING_CATEGORY_LABELS.get(raw_category) if raw_category else None
     reading_category_confidence = effective_quality_output.get("reading_category_confidence")
@@ -500,6 +601,7 @@ def score(
         if second["retry_reasons"] or delta > maximum_delta or _quality_band(first["score"]) != _quality_band(second["score"]):
             return _needs_result("needs_review", fp, issues + second["retry_reasons"] + [f"retry_delta={round1(delta)}"], quality_output)
         quality_score = round1((Decimal(str(first["score"])) + Decimal(str(second["score"]))) / Decimal("2"))
+        problem = second["problem_significance"]
         quality_confidence = "medium"
         issues.append("isolated_retry_resolved")
 
@@ -507,6 +609,25 @@ def score(
     threshold = float(POLICY["route"]["long_read_threshold"])
     chatgpt_threshold = float(POLICY["route"].get("chatgpt_munger_threshold", 8.5))
     relevance_needed = quality_score >= floor
+    authority, importance_issues = _validate_importance_output(importance_output)
+    importance_score = None
+    importance_confidence = "unavailable"
+    importance_dimensions = {
+        "authority_score": None,
+        "problem_significance_score": problem["score"],
+        "evidence": [],
+    }
+    issues += importance_issues
+    if authority is not None:
+        importance_score = round1((Decimal(str(authority["authority_score"])) + Decimal(str(problem["score"]))) / Decimal("2"))
+        importance_confidence = authority["confidence"]
+        importance_dimensions = {
+            "authority_score": authority["authority_score"],
+            "problem_significance_score": problem["score"],
+            "evidence": authority["evidence"],
+            "authority_rationale": authority["rationale"],
+            "problem_significance_rationale": problem["rationale"],
+        }
     if relevance_needed and relevance_output is None and not relevance_unavailable:
         return {
             "score_version": SCORE_VERSION,
@@ -518,6 +639,9 @@ def score(
             "score_status": "needs_relevance",
             "quality_score": quality_score,
             "quality_confidence": quality_confidence,
+            "importance_score": importance_score,
+            "importance_confidence": importance_confidence,
+            "importance_dimensions": importance_dimensions,
             "relevance_score": None,
             "relevance_confidence": "unavailable",
             "decision_score": None,
@@ -546,15 +670,18 @@ def score(
     else:
         rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(relevance_output, context_text)
     issues += relevance_issues
+    base_priority = quality_score if importance_score is None else round1(
+        Decimal("0.70") * Decimal(str(quality_score)) + IMPORTANCE_WEIGHT * Decimal(str(importance_score))
+    )
     if rel_bonus is None:
-        decision_score = quality_score
+        decision_score = base_priority
         relevance_score = None
         interest_score = None
         context_fp = None
     else:
         rel_eff = float(rel_bonus) if quality_score >= floor else 0.0
         int_eff = float(int_bonus) if quality_score >= floor else 0.0
-        decision_score = round1(Decimal(str(quality_score)) + Decimal(str(rel_eff)) + Decimal(str(int_eff)))
+        decision_score = round1(Decimal(str(base_priority)) + Decimal(str(rel_eff)) + Decimal(str(int_eff)))
         relevance_score = rel_eff
         interest_score = int_eff
         context_fp = context_fingerprint(fp, context_text)
@@ -570,12 +697,14 @@ def score(
         "score_status": "scored",
         "quality_score": quality_score,
         "quality_confidence": quality_confidence,
+        "importance_score": importance_score,
+        "importance_confidence": importance_confidence,
         "relevance_score": relevance_score,
         "interest_score": interest_score,
         "relevance_confidence": relevance_confidence,
         "decision_score": decision_score,
-        # Final quality bands use the same decision-score scale as routing/depth.
-        "quality_label": _quality_label(decision_score),
+        "base_priority": base_priority,
+        "quality_label": _quality_label(quality_score),
         "priority_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _priority_label(relevance_score),
         "interest_label": "未计算（不影响本次路由）" if relevance_intentionally_skipped else _interest_label(interest_score),
         "route": route,
@@ -584,6 +713,7 @@ def score(
         "chatgpt_munger_doc": route == "long_read" and decision_score >= chatgpt_threshold,
         "claims": effective_quality_output["claim_ledger"],
         "quality_dimensions": effective_quality_output["dimensions"],
+        "importance_dimensions": importance_dimensions,
         "relevance_dimensions": relevance_info,
         "conclusion": effective_quality_output.get("conclusion", ""),
         "reading_category": reading_category,
@@ -597,6 +727,8 @@ def self_check() -> bool:
     assert round1(6.25) == 6.3
     assert content_fingerprint("a \n b") == content_fingerprint("a b")
     assert sum(Decimal(str(item["weight"])) for item in QUALITY_DIMENSIONS.values()) == Decimal("1.00")
+    assert IMPORTANCE_WEIGHT == Decimal("0.30")
+    assert sum(Decimal(str(item["weight"])) for item in QUALITY_DIMENSIONS.values()) + IMPORTANCE_WEIGHT == Decimal("1.30")
     assert Decimal(str(POLICY["relevance_bonus"]["max"])) > Decimal("0")
     assert Decimal(str(POLICY["relevance_bonus"]["relevance_max"])) > Decimal("0")
     assert Decimal(str(POLICY["relevance_bonus"]["interest_max"])) > Decimal("0")
@@ -615,6 +747,7 @@ def main():
     parser.add_argument("quality_output", nargs="?")
     parser.add_argument("source", nargs="?")
     parser.add_argument("--retry-quality-output")
+    parser.add_argument("--importance-output")
     parser.add_argument("--relevance-output")
     parser.add_argument("--context")
     parser.add_argument("--relevance-unavailable", action="store_true")
@@ -644,6 +777,7 @@ def main():
         _read_json(args.relevance_output) if args.relevance_output else None,
         Path(args.context).read_text(encoding="utf-8") if args.context else None,
         args.relevance_unavailable,
+        _read_json(args.importance_output) if args.importance_output else None,
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.output:

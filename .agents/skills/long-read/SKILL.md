@@ -37,7 +37,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 只通过 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 发送独立 `glm-5.2` 请求，固定 `store=false`，最多四请求并行。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
 
-当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前通过 `chatgpt-web-bridge` 运行 `scripts/run_chatgpt_munger.py`。编排器只提供原文、完整运行时 `munger-soul` 提示词和最小任务边界：要求先还原文章真正的问题，按内容自然组织 Markdown，不额外强制标题数量、标题顺序或固定章节模板。ChatGPT bridge 必须返回 `format=markdown`、有效 `conversationUrl`、`historyVerified=true` 和匹配的 `outputSha256`；Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。bridge 失败、历史复核失败、限流、冷却、超长或输出校验失败均失败关闭，不重试、不切换 MoonBridge，主精读文档仍照常交付。
+当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前通过 `chatgpt-web-bridge` 运行 `scripts/run_chatgpt_munger.py`。编排器只提供原文、完整运行时 `munger-soul` 提示词和最小任务边界：要求先还原文章真正的问题，按内容自然组织 Markdown，不额外强制标题数量、标题顺序或固定章节模板。ChatGPT bridge 必须返回 `format=markdown`、有效 `conversationUrl`、`verification=live-dom+snapshot` 和匹配的 `outputSha256`；Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。bridge 失败、限流、冷却、超长或输出校验失败均失败关闭，不重试、不切换 MoonBridge，主精读文档仍照常交付。
 
 为每条文字 ljg 创建只含唯一问题的独立文件，然后运行：
 
@@ -82,7 +82,7 @@ python3 .agents/skills/long-read/scripts/run_isolated_analyses.py \
 
 顺序固定：
 
-1. 三列评分表：`quality_score + quality_label`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
+1. 评分表：`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
 2. 原文金句 + 原文链接（紧跟评分表，作为溯源入口的独立段落）；
 3. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
 4. 文章真正的核心；
@@ -125,7 +125,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
 - [ ] `chatgpt_munger_doc=true` 时是否先运行 bridge，再创建第二篇文档并与主文档合并为一张交付卡？
 - [ ] ChatGPT bridge 失败时是否失败关闭、未重试或切换模型，且主精读文档仍可交付？
-- [ ] bridge 是否返回 Markdown、有效会话 URL，并在同一 Ego Lite 会话中复开验证？
+- [ ] bridge 是否返回 Markdown、有效会话 URL，并由当前 assistant DOM + accessibility snapshot 验证？
 - [ ] 芒格 Markdown 是否只在本轮临时目录存在，且文档/卡片读回后清理？
 - [ ] 交付卡是否由渲染脚本生成，读回时没有字面量 `\\n`？
 - [ ] `quality_score ≥ quality_floor` 时，交付卡是否在相关性、兴趣两轴都算完后才一起发出，未只带质量分单发？

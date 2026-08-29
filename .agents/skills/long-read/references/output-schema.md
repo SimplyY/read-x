@@ -74,7 +74,7 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 ### ChatGPT Markdown 渲染
 
-ChatGPT bridge 的 `text` 必须是规范 Markdown，且同时返回有效 `conversationUrl`、`historyVerified=true` 与 `outputSha256`。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
+ChatGPT bridge 的 `text` 必须是规范 Markdown，且同时返回有效 `conversationUrl`、`verification=live-dom+snapshot` 与 `outputSha256`。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
 
 **`<title>` 硬约束（避免重复文档）**：文档根 `<doc>` 下首个元素必须是 `<title>文档标题</title>`，这是 `lark-cli docs +create` 的标题来源；正文标题仍用 `<h1>`，二者并存。缺 `<title>` 会被标记 `missing_document_title`。文档创建是不可逆外部写：创建前确认 XML 含 `<title>`，创建后从完整 JSON 提取 `document_id`/`url` 再继续；若 stdout 被截断，重读落盘的 JSON 文件取 `url`，绝不重跑 `docs +create` 产生第二个文档。
 
@@ -119,7 +119,7 @@ ChatGPT bridge 的 `text` 必须是规范 Markdown，且同时返回有效 `conv
 </table>
 ```
 
-分数与档位来自 link-card 传入的 `scoring_result`（`quality_score + quality_label`、`relevance_score + priority_label`）。`decision_score` 只用于路由，不冒充质量；long-read 不得重新评分。
+分数与档位来自 link-card 传入的 `scoring_result`（`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`）。`decision_score` 只用于路由，不冒充质量；long-read 不得重新评分。
 
 ### 唯一核心结论
 
