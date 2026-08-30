@@ -387,6 +387,9 @@ def test_runtime_contract_prevents_observed_shape_regressions():
     assert "多个具名事件与结果形成可复核链" in runtime
     assert "一次调用直接选择证据、洞察、迁移三个维度" in runtime
     assert "直接选择第一条完整满足的合法 `level`" in runtime
+    assert "#### 大问题思考分档语义" in runtime
+    assert "文明/系统级影响" in runtime and "至少两条具体干预路径及其取舍" in runtime
+    assert "名人、出版物或宏大标题只影响独立的 `authority_score`" in runtime
     assert "三维必须独立判级" in runtime and "只按自己的通用数值语义判断" in runtime
     assert "锚点只用于评分完成后的外部闭卷回归" in runtime
     assert "规则、注意力、行为" not in runtime
