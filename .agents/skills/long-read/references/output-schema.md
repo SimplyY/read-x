@@ -76,6 +76,16 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 ChatGPT bridge 的 `text` 必须是规范 Markdown，且同时返回有效 `conversationUrl`、`verification=live-dom+snapshot` 与 `outputSha256`。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
 
+`markdown_to_feishu_xml.py` 是 read-x 的兼容入口，排版核心复用共享 `feishu-doc-renderer` Skill。共享层只做纯 Markdown → Feishu XML 转换，不调用 Bridge、不访问飞书、不创建文档，也不改变 Markdown 语义。read-x 仅在提供 `conversation_url` 时由兼容层追加现有的来源核对提示块，其他调用方不继承该专用文案。
+
+共享排版规则：
+
+- 以输入中最浅标题作为正文 `h1`，整体保留相对层级；当前 `h2/h3` 文章会连续化为 `h1/h2`。
+- 保留显式 `---`；在后续顶层章节之间自动插入一条 `<hr/>`，不在普通段落或三级标题间加线。
+- 保留原有加粗、引用、列表、代码块和表格；不启发式新增重点、不自动制造分栏或高亮块。
+- 元数据 URL 使用短链接标签展示；长段落按自然标点拆分，单个 `<p>` 不超过 100 个可见字符。
+- `source_url` / `conversation_url` 只接受绝对 `http(s)` URL，非法元数据必须失败关闭。
+
 **`<title>` 硬约束（避免重复文档）**：文档根 `<doc>` 下首个元素必须是 `<title>文档标题</title>`，这是 `lark-cli docs +create` 的标题来源；正文标题仍用 `<h1>`，二者并存。缺 `<title>` 会被标记 `missing_document_title`。文档创建是不可逆外部写：创建前确认 XML 含 `<title>`，创建后从完整 JSON 提取 `document_id`/`url` 再继续；若 stdout 被截断，重读落盘的 JSON 文件取 `url`，绝不重跑 `docs +create` 产生第二个文档。
 
 ### 固定顺序

@@ -149,7 +149,7 @@
 
 旧版“决策分等同质量分”的描述不适用于 v3.16：重要性可用时按上述双轴公式计算；重要性缺失时只回退质量基线。
 
-指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `runtime/repo-context/read-x.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
+指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `runtime/core-context/full.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
 
 ## CLI
 
@@ -159,7 +159,7 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 python3 scripts/content_scoring.py quality_output.json source.md \
   --retry-quality-output retry.json \
   --relevance-output relevance_output.json \
-  --context /Users/yuwei/code/skills/ywnext/runtime/repo-context/read-x.md \
+  --context /Users/yuwei/code/skills/ywnext/runtime/core-context/full.md \
   --config-from-base <run_dir>/base-config.json
 ```
 

@@ -61,7 +61,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 5. 文档拼接
 
-主 Agent 串行维护 `.wx_doc.xml`；ChatGPT 芒格结果必须先落为本轮临时 Markdown，再由同一 Markdown 渲染器生成 XML，禁止把 bridge 纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进 ChatGPT 请求：
+主 Agent 串行维护 `.wx_doc.xml`；ChatGPT 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把 bridge 纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进 ChatGPT 请求：
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；

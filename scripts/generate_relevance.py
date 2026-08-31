@@ -169,8 +169,8 @@ def main() -> int:
     meta = extract_metadata(args.source.read_text(encoding="utf-8"))
 
     context_text = args.context.read_text(encoding="utf-8")
-    if not scoring._validate_repo_context(context_text):
-        raise RuntimeError("context is not a validated read-x slice")
+    if not scoring._validate_full_context(context_text):
+        raise RuntimeError("context is not a validated YWNext full core context")
     refresh_match = re.search(r">\s*刷新于[：:]\s*([^\n<]+)", context_text)
     refresh_date = refresh_match.group(1).strip() if refresh_match else "未知"
 

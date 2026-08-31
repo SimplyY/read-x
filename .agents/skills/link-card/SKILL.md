@@ -142,14 +142,14 @@ else:
 
 ## [1] 内容质量判断（统一标准）
 
-抓取后，不论来源，统一调用 `content-scoring` v3.16。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`；来源权威性仅接受一次只读核验产物。七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和经校验的 YWNext `read-x` 受限切片；切片不可用时不读取更宽上下文，直接回到质量分，不得读取 `full-full.md`。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
+抓取后，不论来源，统一调用 `content-scoring` v3.16。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`；来源权威性仅接受一次只读核验产物。七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和经校验的 YWNext `runtime/core-context/full.md`；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
 
 ### 调用 content-scoring
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过既有本地 MoonBridge 直接调用相同 `glm-5.2`，不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。命令失败、超时或未生成文件时失败关闭，禁止回退主上下文、启动子 Agent 或嵌套 `codex exec`。
 3. 质量命令成功后，对 `source.md` 中明确标注的非微信原始出处只读执行 `python3 scripts/verify_source_authority.py --source <source.md> --publisher <publisher> --interview <subject> --output <run_dir>/importance-output.json`（核验不可用则保留 `importance_unavailable`），再运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --importance-output <run_dir>/importance-output.json --output <run_dir>/scoring-result.json`，拿第一个 `scoring_result v3.16`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
-4. 若 `score_status=needs_relevance`，先运行 `node /Users/yuwei/code/skills/ywnext/scripts/check-find-next-repo-context.mjs /Users/yuwei/code/skills/ywnext 8`；通过时在独立上下文读取 `runtime/repo-context/read-x.md`，失败、过期或缺失时不读取更宽上下文，直接使用 `--relevance-unavailable` 确定性结束。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`；相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
+4. 若 `score_status=needs_relevance`，先运行 `node /Users/yuwei/code/skills/ywnext/scripts/check-find-next-core-context.mjs /Users/yuwei/code/skills/ywnext 8`；通过时在独立上下文读取 `runtime/core-context/full.md`，失败、过期或缺失时不读取 `full-full.md` 或其他个人材料，直接使用 `--relevance-unavailable` 确定性结束。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`；相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
 第 3 步不是“先评分、下轮再发卡”。质量 JSON 之后必须在同一次 `exec_command` 内按下列固定尾部执行；只替换路径、卡片元数据和发送目标，不改分支：

@@ -108,7 +108,7 @@ QUALITY_DISQUALIFIERS = POLICY["quality_disqualifiers"]
 CLAIM_TYPES = {"empirical", "causal", "experiential", "normative", "method"}
 SUPPORT_LEVELS = {"direct", "partial", "asserted"}
 CONTEXT_SECTIONS = {"当前主线", "当前张力", "长期校准", "暂不做什么"}
-REPO_CONTEXT_SECTIONS = {"适用任务", "禁止用途", "当前切片"}
+FULL_CONTEXT_SECTIONS = CONTEXT_SECTIONS | {"领域兴趣"}
 READING_CATEGORY_KEYS = ("invest", "ai", "cognition", "business", "culture", "other")
 READING_CATEGORY_LABELS = {"invest": "投资/财经", "ai": "AI/技术", "cognition": "认知/成长", "business": "商业/产业", "culture": "人文/生活", "other": "未分类"}
 _CATEGORY_SYNONYMS = [
@@ -449,17 +449,15 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
     }
 
 
-def _validate_repo_context(context_text: str) -> bool:
-    return bool(re.search(r"^>\s*仓库：read-x\s*$", context_text, re.MULTILINE)) and all(
-        re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE)
-        for section in REPO_CONTEXT_SECTIONS
-    )
+def _validate_full_context(context_text: str) -> bool:
+    if not all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in FULL_CONTEXT_SECTIONS):
+        return False
+    interest = re.search(r"^##\s+领域兴趣\s*$([\s\S]*?)(?=^##\s+|\Z)", context_text, re.MULTILINE)
+    return bool(interest and re.search(r"^###\s+.*(?:长期|持续关注|持久|核心兴趣)", interest.group(1), re.MULTILINE))
 
 
 def _validate_context(context_text: str) -> bool:
-    if all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in CONTEXT_SECTIONS):
-        return True
-    return _validate_repo_context(context_text)
+    return _validate_full_context(context_text)
 
 
 def _relevance_result(output, context_text: str | None):

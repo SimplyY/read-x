@@ -119,7 +119,8 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
 | `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 独立 HTTP 并行运行 article-decode 与文字 ljg |
 | `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 达到运行时门槛时调用 ChatGPT bridge 生成芒格洞察原稿 |
-| `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 将本轮 Markdown 保真渲染为芒格洞察 Feishu XML |
+| `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
+| `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |
 | `scripts/render_long_read_delivery_card.py` | 生成唯一长文交付 Card 2.0 JSON，避免换行转义错误 |
 | `.agents/skills/long-read/scripts/evaluate_analyses.py` | 对比隔离产物的机械完整性，并以 summary 验证同任务性能非回退 |
 

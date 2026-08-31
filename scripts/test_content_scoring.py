@@ -34,6 +34,9 @@ CONTEXT = """# 核心上下文
 尚待决定。
 ## 暂不做什么
 边界。
+## 领域兴趣
+### 长期兴趣
+价值投资；教育与 AI；AI 时代的人与组织。
 """
 REPO_CONTEXT = """# 仓库上下文
 
@@ -611,6 +614,7 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
     scoring_skill = (Path(cs.__file__).parents[1] / ".agents/skills/content-scoring/SKILL.md").read_text(encoding="utf-8")
     quality_runtime = (Path(cs.__file__).parents[1] / ".agents/skills/content-scoring/references/quality-runtime.md").read_text(encoding="utf-8")
+    relevance_generator_source = Path(relevance_generator.__file__).read_text(encoding="utf-8")
     assert "评分期间不发送任何用户可见过程消息" in skill
     assert "每次处理链接的第一步都必须重新读取本文件当前版本" in skill
     assert "mktemp -d /tmp/readx-score.XXXXXX" in skill
@@ -637,6 +641,10 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "三维数值语义一次发送" in scoring_skill and "直接返回证据、洞察、迁移三维等级" in scoring_skill
     assert "既有本地 MoonBridge" in scoring_skill and "脚本不传推理覆盖" in scoring_skill
     assert "不得退回主上下文评分" in scoring_skill
+    assert "runtime/core-context/full.md" in scoring_skill
+    assert "runtime/repo-context/read-x.md" not in scoring_skill
+    assert "_validate_full_context" in relevance_generator_source
+    assert "_validate_repo_context" not in relevance_generator_source
     assert "三维必须正交" in quality_runtime and "只影响 `evidence_quality`" in quality_runtime
     assert "source_quote in source_text" in quality_runtime
     assert "只读完整 `blind-source.md`" in quality_runtime and "与 `anchor-view.md`" not in quality_runtime
@@ -884,17 +892,16 @@ def test_relevance_failure_falls_back_to_quality():
     assert result["relevance_score"] is None and "relevance conclusion is required" in result["issues"]
 
 
-def test_validated_read_x_slice_is_accepted_for_relevance():
-    assert cs._validate_repo_context(REPO_CONTEXT)
-    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=REPO_CONTEXT)
+def test_validated_full_context_is_accepted_for_relevance():
+    assert cs._validate_context(CONTEXT)
+    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
     assert result["score_status"] == "scored"
     assert result["relevance_score"] == 0.5 and result["context_fingerprint"] is not None
 
 
-def test_unmarked_repo_slice_is_rejected_for_relevance():
-    unmarked = REPO_CONTEXT.replace("> 仓库：read-x", "> 仓库：other")
-    assert not cs._validate_repo_context(unmarked)
-    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=unmarked)
+def test_repo_context_is_rejected_for_relevance():
+    assert not cs._validate_context(REPO_CONTEXT)
+    result = cs.score(quality(), SOURCE, relevance_output=relevance(), context_text=REPO_CONTEXT)
     assert result["relevance_score"] is None
     assert "relevance_context_unavailable" in result["issues"]
 
