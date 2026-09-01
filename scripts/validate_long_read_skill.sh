@@ -17,7 +17,7 @@ require 'scripts/run_chatgpt_munger.py'
 require 'markdown_to_feishu_xml.py'
 require 'render_long_read_delivery_card.py'
 require '`chatgpt_munger_doc=true`'
-require 'chatgpt-web-bridge'
+require 'deepseek-v4-flash'
 require '失败关闭'
 require '`store=false`'
 require '不得在脚本失败时回退角色扮演'
@@ -27,8 +27,11 @@ require '--user-id <bridge_context.senderId>'
 require '--chat-id <bridge_context.chatId>'
 require '`senderType=bot` 时回退'
 require '禁止 `view_image`'
+require '值得研究的相关问题'
+require '≤300 字'
 
 ! grep -Fq 'final_score' "$skill"
 ! grep -Fq 'public_wiki' "$skill"
 ! grep -Fq 'Skill("article-decode")' "$skill"
+! grep -Fq '对飞鱼的意义' "$skill"
 echo 'long-read scoring and delivery rules: ok'

@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 ANCHORS = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/anchors.md"
 HEADING = re.compile(r"^## A\d+｜.*$", re.MULTILINE)
-SOURCE_METADATA = re.compile(r"^>\s*(?:公众号|发布时间|原文链接|作者|日期)\s*[:：]")
+SOURCE_METADATA = re.compile(r"^>\s*(?:公众号|发布时间|原文链接|原始出处候选|作者|日期)(?:\s*[:：].*|\s+.+)?\s*$")
 MARKDOWN_IMAGE = re.compile(r"^!\[[^]]*\]\([^)]*\).*$")
 REFERENCE_URL = re.compile(r"^(`?\[\d+\]`?\s*[^:：]*?)\s*[:：]\s*https?://\S+\s*$")
 VIDEO_NOISE = (

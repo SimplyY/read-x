@@ -29,11 +29,11 @@ def render_card(*, title: str, main_url: str, munger_url: str | None = None, fai
         columns.append({
             "tag": "column", "width": "weighted", "weight": 1,
             "background_style": "purple-50", "padding": "12px",
-            "elements": [{"tag": "markdown", "content": f"**ChatGPT 芒格洞察**\n[打开芒格文档]({munger_url})"}],
+            "elements": [{"tag": "markdown", "content": f"**DeepSeek 芒格洞察**\n[打开芒格文档]({munger_url})"}],
         })
     elements = [{"tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px", "columns": columns}]
     if not success:
-        elements.append({"tag": "markdown", "content": f"ChatGPT 芒格洞察待复核：{failure_reason or '未生成'}"})
+        elements.append({"tag": "markdown", "content": f"DeepSeek 芒格洞察待复核：{failure_reason or '未生成'}"})
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "default", "summary": {"content": f"长文精读完成：{title}"}},

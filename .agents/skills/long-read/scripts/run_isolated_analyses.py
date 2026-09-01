@@ -21,7 +21,8 @@ from validate_output import check_quotes_substring, check_structure
 
 
 ENDPOINT = "http://127.0.0.1:38441/v1/responses"
-MODEL = "glm-5.2"
+MODEL = "deepseek-v4-flash"
+MODEL_CANDIDATES = (MODEL,)
 MAX_TASKS = 4
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 5.0
@@ -204,11 +205,12 @@ def _call_once(
     endpoint: str,
     timeout: float,
     max_output_tokens: int,
+    model: str = MODEL,
 ) -> dict:
     """Single MoonBridge attempt; raises on any failure so the caller can retry."""
     task_input = build_input(source, evidence, task.question)
     payload = {
-        "model": MODEL,
+        "model": model,
         "instructions": task.skill_text,
         "input": task_input,
         "max_output_tokens": max_output_tokens,
@@ -246,13 +248,7 @@ def call_task(
     timeout: float,
     max_output_tokens: int,
 ) -> dict:
-    """Run a task with bounded retry on transient MoonBridge failures.
-
-    MoonBridge may time out, return malformed JSON, or yield an incomplete or
-    too-short output on a single call; a fresh attempt usually succeeds. Mirrors
-    the retry strategy in generate_quality.py instead of treating every
-    transient blip as a hard failure.
-    """
+    """Run a task with bounded retries on the fixed local model."""
     task_input = build_input(source, evidence, task.question)
     digests = {
         "skill_sha256": task.skill_sha256,
@@ -260,11 +256,21 @@ def call_task(
         "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
     }
     last_error = None
+    deadline = time.monotonic() + max(float(timeout), 0.01)
+    attempts = 0
     started = time.perf_counter()
     for attempt in range(1, RETRY_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        model = MODEL_CANDIDATES[min(attempt - 1, len(MODEL_CANDIDATES) - 1)]
+        next_model = MODEL_CANDIDATES[min(attempt, len(MODEL_CANDIDATES) - 1)]
+        attempt_timeout = remaining / (RETRY_ATTEMPTS - attempt + 1)
+        attempts = attempt
         try:
-            result = _call_once(task, source, evidence, endpoint, timeout, max_output_tokens)
+            result = _call_once(task, source, evidence, endpoint, attempt_timeout, max_output_tokens, model=model)
             result["attempts"] = attempt
+            result["model"] = model
             return result
         except (
             urllib.error.URLError,
@@ -275,14 +281,17 @@ def call_task(
         ) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_BACKOFF_SECONDS)
+                wait = min(RETRY_BACKOFF_SECONDS, max(0.0, deadline - time.monotonic()))
+                if wait:
+                    time.sleep(wait)
     return {
         "task": task.name,
         "status": "failed",
         "elapsed_seconds": round(time.perf_counter() - started, 3),
-        "attempts": RETRY_ATTEMPTS,
+        "attempts": attempts,
         **digests,
         "error": last_error,
+        "model": model if attempts else MODEL,
     }
 
 

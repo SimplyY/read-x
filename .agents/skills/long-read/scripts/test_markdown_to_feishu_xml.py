@@ -11,6 +11,10 @@ SPEC = importlib.util.spec_from_file_location("markdown_to_feishu_xml", Path(__f
 renderer = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(renderer)
+VALIDATOR_SPEC = importlib.util.spec_from_file_location("validate_output", Path(__file__).with_name("validate_output.py"))
+validator = importlib.util.module_from_spec(VALIDATOR_SPEC)
+assert VALIDATOR_SPEC and VALIDATOR_SPEC.loader
+VALIDATOR_SPEC.loader.exec_module(validator)
 
 
 def test_common_markdown_is_native_xml():
@@ -41,12 +45,38 @@ print('ok')
     assert 'emoji="⭐"' in xml and 'border-color="yellow"' in xml
 
 
+def test_research_questions_section_survives_render_and_validation():
+    markdown = """## 基石 / 边缘 / 暗流
+文章的核心结构。
+
+## 值得研究的相关问题
+1. **问题：**因果链在哪里断裂？ **上下文：**文章只证明相关性。
+2. **问题：**这个判断何时失效？ **上下文：**边界条件没有展开。
+
+## 与作者对话
+保留具体对话。
+"""
+    xml = renderer.render_markdown(
+        markdown,
+        title="标题",
+        source_url="https://example.com/article",
+        conversation_url="https://chatgpt.com/c/1",
+    )
+    assert validator.check_document_xml(xml) == []
+
+
 def test_unsafe_html_is_escaped_and_large_tables_are_preserved():
     markdown = "<script>alert(1)</script>\n\n| " + " | ".join(f"c{i}" for i in range(9)) + " |\n| " + " | ".join("---" for _ in range(9)) + " |\n| " + " | ".join("x" for _ in range(9)) + " |"
     xml = renderer.render_markdown(markdown, title="标题", source_url="", conversation_url="")
     ET.fromstring(f"<root>{xml}</root>")
     assert "<script>" not in xml
     assert "表格超出原生表格限制" in xml and '<pre lang="markdown"><code>' in xml
+
+
+def test_local_deepseek_output_gets_provenance_callout_without_session_url():
+    xml = renderer.render_markdown("正文。", title="标题", source_url="https://example.com/article", conversation_url="")
+    assert 'emoji="⭐"' in xml
+    assert "DeepSeek 基于完整原文生成" in xml
 
 
 def test_metadata_rejects_unsafe_urls():

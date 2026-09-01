@@ -47,15 +47,13 @@ def render_markdown(markdown: str, *, title: str, source_url: str, conversation_
         source_url=source_url,
         conversation_url=conversation_url,
     )
-    if not conversation_url:
-        return xml
     blocks = xml.rstrip("\n").split("\n")
     insertion = 1
     if len(blocks) > 1 and blocks[1].startswith("<p>溯源："):
         insertion = 2
     blocks.insert(
         insertion,
-        '<callout emoji="⭐" background-color="light-yellow" border-color="yellow"><p>以下内容由 ChatGPT 基于完整原文生成，并按芒格之魂提示词组织；事实、推断与未知应分别核对。</p></callout>',
+        '<callout emoji="⭐" background-color="light-yellow" border-color="yellow"><p>以下内容由 DeepSeek 基于完整原文生成，并按芒格之魂提示词组织；事实、推断与未知应分别核对。</p></callout>',
     )
     return "\n".join(blocks) + "\n"
 

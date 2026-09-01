@@ -158,7 +158,7 @@ def self_check() -> bool:
         baseline_summary = root / "baseline.json"
         candidate_summary = root / "candidate.json"
         tasks = [{"task": name, "status": "completed", "skill_sha256": name, "instructions_sha256": name, "input_sha256": name} for name in ("article-decode", "ljg-think")]
-        contract = {"status": "completed", "model": "glm-5.2", "store": False, "endpoint": "local", "timeout_seconds": 240, "max_output_tokens": 8000, "tasks": tasks}
+        contract = {"status": "completed", "model": "deepseek-v4-flash", "store": False, "endpoint": "local", "timeout_seconds": 240, "max_output_tokens": 8000, "tasks": tasks}
         baseline_summary.write_text(json.dumps({**contract, "max_workers": 1, "wall_seconds": 20}), encoding="utf-8")
         candidate_summary.write_text(json.dumps({**contract, "max_workers": 2, "wall_seconds": 10}), encoding="utf-8")
         result = compare(candidate, baseline, candidate_summary, baseline_summary)

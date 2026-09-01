@@ -128,7 +128,7 @@ def test_parallel_payload_boundary_and_atomic_outputs():
             assert not list((root / "out").glob(".*.md.*"))
             assert len(recorder.payloads) == 3
             for payload in recorder.payloads:
-                assert payload["model"] == "glm-5.2" and payload["store"] is False
+                assert payload["model"] == "deepseek-v4-flash" and payload["store"] is False
                 assert set(payload) == {"model", "instructions", "input", "max_output_tokens", "store"}
                 assert "FORBIDDEN_PROFILE_SENTINEL" not in json.dumps(payload, ensure_ascii=False)
                 parsed = json.loads(payload["input"].split("\n", 1)[1])
@@ -205,6 +205,56 @@ def test_short_model_output_fails_closed():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_retry_budget_is_total_per_task():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        calls = []
+
+        def slow_call(*args, **kwargs):
+            calls.append(args[4])
+            time.sleep(0.02)
+            raise RuntimeError("simulated timeout")
+
+        runner._call_once = slow_call
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 0.01, 1)
+        finally:
+            runner._call_once = original
+        assert result["status"] == "failed" and result["attempts"] == 1
+        assert len(calls) == 1 and calls[0] <= 0.01
+
+
+def test_model_retries_keep_one_fixed_model_after_failure():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        original_backoff = runner.RETRY_BACKOFF_SECONDS
+        seen = []
+
+        def fail_once_then_succeed(*args, **kwargs):
+            seen.append(kwargs["model"])
+            if len(seen) == 1:
+                raise RuntimeError("primary unavailable")
+            return {"task": task.name, "status": "completed"}
+
+        runner._call_once = fail_once_then_succeed
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 0.2, 1)
+        finally:
+            runner._call_once = original
+            runner.RETRY_BACKOFF_SECONDS = original_backoff
+        assert result["status"] == "completed"
+        assert seen == ["deepseek-v4-flash", "deepseek-v4-flash"]
 
 
 def test_article_failure_is_fatal_but_keeps_independent_ljg_output():

@@ -24,7 +24,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 符合评分数量或用户明确要求时：Evidence -> `article-decode` + 文字 ljg 隔离运行 -> 拼接成文档。
 
-文字数量直接使用 content-scoring 的 `scoring_result.ljg_range`；是否生成图片直接使用 `scoring_result.ljg_card`；是否调用 ChatGPT 芒格后处理直接使用 `scoring_result.chatgpt_munger_doc`。本 Skill 不复制分档，也不使用相关性改变深度。
+文字数量直接使用 content-scoring 的 `scoring_result.ljg_range`；是否生成图片直接使用 `scoring_result.ljg_card`；是否调用 DeepSeek 芒格后处理直接使用 `scoring_result.chatgpt_munger_doc`。本 Skill 不复制分档，也不使用相关性改变深度。
 
 ## 3. 文字 Skill 选择
 
@@ -50,7 +50,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 4. 隔离协议
 
-主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_isolated_analyses.py`。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill、显式禁用环境代理，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别发送独立 MoonBridge 请求；每个请求固定 `model=glm-5.2`、`store=false`，不传会话 ID 或前序响应 ID。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
+主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_isolated_analyses.py`。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill、显式禁用环境代理，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别发送独立 MoonBridge 请求；每个请求固定 `model=deepseek-v4-flash`、`store=false`，不传会话 ID 或前序响应 ID。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
 
 - 用户画像；
 - `article-decode` 或其他 ljg 的结果；
@@ -61,7 +61,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 5. 文档拼接
 
-主 Agent 串行维护 `.wx_doc.xml`；ChatGPT 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把 bridge 纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进 ChatGPT 请求：
+主 Agent 串行维护 `.wx_doc.xml`；DeepSeek 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把模型纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进模型请求：
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；
@@ -97,7 +97,7 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
   --jq '.data.message_id'
 ```
 
-只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。ChatGPT 芒格文档属于主文档交付前的可选后处理；失败时保留主文档交付，不得重试或切换模型。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
+只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。DeepSeek 芒格文档属于主文档交付前的可选后处理；失败时保留主文档交付。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
 
 ### ljg-card 后置任务
 

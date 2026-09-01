@@ -20,7 +20,11 @@ VALID_EVIDENCE_TYPES = {"quote", "data", "example", "reasoning"}
 VALID_CONFIDENCE = {"high", "medium", "low"}
 MAX_QUOTES = 8
 MAX_PARAGRAPH_CHARS = 100
-MAX_PERSONALIZATION_CHARS = 50
+RESEARCH_HEADING = "值得研究的相关问题"
+LEGACY_HEADING = "对飞鱼的意义"
+RESEARCH_MIN_ITEMS = 2
+RESEARCH_MAX_ITEMS = 3
+MAX_RESEARCH_CHARS = 300
 
 
 def normalize(s):
@@ -169,21 +173,57 @@ def check_document_xml(xml_text):
             findings.append(f"forbidden heading: {visible_text(heading)}")
 
     children = list(root)
-    for i, node in enumerate(children):
-        if node.tag not in {"h1", "h2", "h3"}:
+    headings = [
+        (i, visible_text(node).replace(" ", ""))
+        for i, node in enumerate(children)
+        if node.tag in {"h1", "h2", "h3"}
+    ]
+    legacy = [i for i, title in headings if title == LEGACY_HEADING]
+    if legacy:
+        findings.append(f"forbidden heading: {LEGACY_HEADING}")
+
+    research = [i for i, title in headings if title == RESEARCH_HEADING]
+    if len(research) != 1:
+        findings.append(
+            f"document must contain exactly one {RESEARCH_HEADING} heading; "
+            f"found {len(research)}")
+        return findings
+
+    research_index = research[0]
+    previous_titles = [title for i, title in headings if i < research_index]
+    next_headings = [i for i, _ in headings if i > research_index]
+    next_index = next_headings[0] if next_headings else len(children)
+    if "基石/边缘/暗流" not in previous_titles:
+        findings.append("research questions must follow 基石 / 边缘 / 暗流")
+    if next_index == len(children) or visible_text(children[next_index]).replace(" ", "") != "与作者对话":
+        findings.append("research questions must precede 与作者对话")
+
+    section_nodes = children[research_index + 1:next_index]
+    lists = [node for node in section_nodes if node.tag == "ol"]
+    if len(lists) != 1:
+        findings.append(
+            f"research questions must contain exactly one ordered list; found {len(lists)}")
+        return findings
+
+    items = lists[0].findall("li")
+    if not RESEARCH_MIN_ITEMS <= len(items) <= RESEARCH_MAX_ITEMS:
+        findings.append(
+            f"research questions has {len(items)} items; expected "
+            f"{RESEARCH_MIN_ITEMS}-{RESEARCH_MAX_ITEMS}")
+    for i, item in enumerate(items):
+        text = visible_text(item)
+        if "问题：" not in text or "上下文：" not in text:
+            findings.append(f"research item[{i}] must contain 问题 and 上下文")
             continue
-        if visible_text(node).replace(" ", "") != "对飞鱼的意义":
-            continue
-        text_parts = []
-        for following in children[i + 1:]:
-            if following.tag in {"h1", "h2", "h3"}:
-                break
-            text_parts.append(visible_text(following))
-        length = len("".join(text_parts))
-        if length > MAX_PERSONALIZATION_CHARS:
-            findings.append(
-                f"personalization has {length} chars; maximum is "
-                f"{MAX_PERSONALIZATION_CHARS}")
+        question = text.split("上下文：", 1)[0]
+        if "？" not in question and "?" not in question:
+            findings.append(f"research item[{i}] is not phrased as a question")
+
+    section_length = len("".join(visible_text(node) for node in section_nodes))
+    if section_length > MAX_RESEARCH_CHARS:
+        findings.append(
+            f"research questions has {section_length} chars; maximum is "
+            f"{MAX_RESEARCH_CHARS}")
     return findings
 
 
@@ -246,23 +286,84 @@ def self_check():
     good_doc = (
         '<title>t</title><table><tbody><tr><td>x</td></tr></tbody></table>'
         '<callout background-color="light-yellow"><p>sharp</p></callout>'
-        '<h1>真正的核心</h1><p>short paragraph</p>'
-        '<h1>对飞鱼的意义</h1><p>有增量才写。</p>'
+        '<h1>基石 / 边缘 / 暗流</h1>'
+        '<h1>值得研究的相关问题</h1>'
+        '<ol><li><b>问题：</b>因果链在哪里断裂？<b>上下文：</b>文章只证明相关性。</li>'
+        '<li><b>问题：</b>这个判断何时失效？<b>上下文：</b>边界条件没有展开。</li></ol>'
+        '<h1>与作者对话</h1><p>short paragraph</p>'
         '<h1>Evidence</h1><blockquote>quote</blockquote>')
     f = check_document_xml(good_doc)
     cases.append(("pass: valid document layout", f == [], f))
+
+    three_item_doc = good_doc.replace(
+        '</ol><h1>与作者对话</h1>',
+        '<li><b>问题：</b>什么证据能推翻它？<b>上下文：</b>文中没有反例。</li></ol><h1>与作者对话</h1>')
+    f = check_document_xml(three_item_doc)
+    cases.append(("pass: three research questions", f == [], f))
+
+    exact_300_doc = (
+        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
+        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
+        '<li><b>问题：</b>何时失效？<b>上下文：</b>' + ('长' * 274) + '</li></ol>'
+        '<h1>与作者对话</h1>')
+    f = check_document_xml(exact_300_doc)
+    cases.append(("pass: research questions exactly 300 chars", f == [], f))
 
     # document layout failures
     bad_doc = (
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<callout background-color="light-yellow"><p>two</p></callout>'
         '<h1>文章骨架</h1><h2>X 光阅读</h2><p>' + ('长' * 101) + '</p>'
-        '<h1>对飞鱼的意义</h1><p>' + ('多' * 51) + '</p>')
+        '<h1>基石 / 边缘 / 暗流</h1>'
+        '<h1>值得研究的相关问题</h1><ol><li><b>问题：</b>只有一个？<b>上下文：</b>不够。</li></ol>'
+        '<h1>与作者对话</h1><h1>对飞鱼的意义</h1>')
     f = check_document_xml(bad_doc)
-    cases.append(("fail: invalid document layout", len(f) == 5, f))
+    cases.append(("fail: invalid document layout", len(f) == 6, f))
+
+    too_long_research = (
+        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
+        '<li><b>问题：</b>这个问题足够长吗？<b>上下文：</b>' + ('长' * 280) + '</li>'
+        '<li><b>问题：</b>另一个问题是什么？<b>上下文：</b>补充。</li></ol>'
+        '<h1>与作者对话</h1>')
+    f = check_document_xml(too_long_research)
+    cases.append(("fail: research questions over 300 chars", len(f) == 1, f))
+
+    wrong_order = (
+        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>值得研究的相关问题</h1><ol>'
+        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
+        '<li><b>问题：</b>何时失效？<b>上下文：</b>边界。</li></ol>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
+    f = check_document_xml(wrong_order)
+    cases.append(("fail: research questions wrong order", len(f) == 2, f))
+
+    missing_research = (
+        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
+    f = check_document_xml(missing_research)
+    cases.append(("fail: missing research questions", len(f) == 1, f))
+
+    duplicate_research = good_doc.replace(
+        '<h1>与作者对话</h1>',
+        '<h1>值得研究的相关问题</h1><h1>与作者对话</h1>')
+    f = check_document_xml(duplicate_research)
+    cases.append(("fail: duplicate research questions", len(f) == 1, f))
+
+    four_item_doc = good_doc.replace(
+        '</ol><h1>与作者对话</h1>',
+        '<li><b>问题：</b>还能验证什么？<b>上下文：</b>补充。</li>'
+        '<li><b>问题：</b>还有什么边界？<b>上下文：</b>补充。</li></ol><h1>与作者对话</h1>')
+    f = check_document_xml(four_item_doc)
+    cases.append(("fail: four research questions", len(f) == 1, f))
 
     too_many_doc_quotes = (
         '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
+        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
+        '<li><b>问题：</b>何时失效？<b>上下文：</b>边界。</li></ol>'
+        '<h1>与作者对话</h1>'
         + ('<blockquote>quote</blockquote>' * 9))
     f = check_document_xml(too_many_doc_quotes)
     cases.append(("fail: more than eight document quotes", len(f) == 1, f))

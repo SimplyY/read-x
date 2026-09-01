@@ -15,6 +15,16 @@ DIMENSIONS = (
 )
 IMPORTANCE_LABEL = "权威性与大问题思考"
 
+AUTHORITY_STATUS_LABELS = {
+    "verified": "已核验",
+    "corroborated": "搜索交叉",
+    "inferred": "基于常识推断（上限 8）",
+    "source_missing": "未提供出处",
+    "fetch_failed": "暂不可达",
+    "mismatch": "未匹配",
+    "rejected": "已拒绝",
+}
+
 
 def _metric(label: str, value: str) -> dict:
     return {
@@ -42,16 +52,23 @@ def _dimension_text(result: dict, keys: tuple[tuple[str, str], ...]) -> str:
 
 
 def _importance_text(result: dict) -> str:
-    # The two sub-scores are only user-facing when the composite is valid.
-    # A missing authority artifact must not look like a partially scored axis.
-    importance = result.get("importance_score")
-    if not isinstance(importance, (int, float)) or isinstance(importance, bool):
-        return "**权威性**  不可用\n**大问题思考**  不可用\n\n_未找到可核验的非微信原始出处，未计重要性加成。_"
     dimensions = result.get("importance_dimensions") or {}
     authority = dimensions.get("authority_score")
     problem = dimensions.get("problem_significance_score")
     fmt = lambda value: f"{value:.1f}" if isinstance(value, (int, float)) else "不可用"
-    return f"**权威性**  {fmt(authority)}\n**大问题思考**  {fmt(problem)}"
+    if isinstance(authority, (int, float)) and not isinstance(authority, bool):
+        authority_text = fmt(authority)
+    else:
+        status = dimensions.get("authority_status") or result.get("authority_status")
+        authority_text = AUTHORITY_STATUS_LABELS.get(status, "待核验")
+    status = dimensions.get("authority_status") or result.get("authority_status")
+    status_text = AUTHORITY_STATUS_LABELS.get(status, "待核验")
+    suffix = "" if authority_text == status_text else f"（{status_text}）"
+    return f"**权威性**  {authority_text}{suffix}\n**大问题思考**  {fmt(problem)}"
+
+
+def _importance_label(result: dict) -> str:
+    return IMPORTANCE_LABEL if isinstance((result.get("importance_dimensions") or {}).get("authority_score"), (int, float)) else "大问题思考"
 
 
 def render_card(result: dict, *, title: str, author: str, date: str, url: str, score_only: bool) -> dict:
@@ -87,7 +104,7 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
             "margin": "0px 0px 12px 0px",
             "columns": [
                 _metric("质量", f"{result['quality_score']:.1f}"),
-                _metric(IMPORTANCE_LABEL, importance_value),
+                _metric(_importance_label(result), importance_value),
                 _metric(relevance_label, relevance_value),
                 _metric(interest_label, interest_value),
                 _metric("决策", f"{result['decision_score']:.1f}"),

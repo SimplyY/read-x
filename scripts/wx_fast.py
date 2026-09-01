@@ -27,6 +27,8 @@ class ArticleParser(HTMLParser):
         self.capture = False
         self.depth = 0
         self.in_pre = False
+        self._anchors: list[dict[str, list[str] | str]] = []
+        self.links: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key: value or "" for key, value in attrs}
@@ -38,6 +40,8 @@ class ArticleParser(HTMLParser):
             if values.get("id") == "js_content":
                 self.capture, self.depth = True, 1
             return
+        if tag == "a":
+            self._anchors.append({"href": html.unescape(values.get("href", "")), "text": []})
         if tag not in VOID_TAGS:
             self.depth += 1
         if tag in {"h1", "h2", "h3", "h4"}:
@@ -57,6 +61,12 @@ class ArticleParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if not self.capture:
             return
+        if tag == "a" and self._anchors:
+            anchor = self._anchors.pop()
+            href = str(anchor["href"])
+            text = "".join(str(part) for part in anchor["text"]).strip()
+            if href and text:
+                self.links.append((href, text))
         if tag == "pre":
             self.in_pre = False
             self.parts.append("\n```\n")
@@ -70,6 +80,8 @@ class ArticleParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if not self.capture:
             return
+        if self._anchors:
+            self._anchors[-1]["text"].append(data)  # type: ignore[union-attr]
         self.parts.append(data if self.in_pre else re.sub(r"\s+", " ", data))
 
     def markdown(self) -> str:
@@ -81,13 +93,38 @@ class ArticleParser(HTMLParser):
 
 
 def _js_string(source: str, name: str) -> str:
-    match = re.search(rf"(?:var\s+)?{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;", source, re.DOTALL)
+    match = re.search(rf"(?:var\s+)?{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*;?", source, re.DOTALL)
     if not match:
         return ""
     try:
         return json.loads(f'"{match.group(2)}"')
     except json.JSONDecodeError:
         return html.unescape(match.group(2))
+
+
+def _external_http_url(value: str) -> str | None:
+    value = html.unescape(value).strip()
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    if host == "mp.weixin.qq.com" or host.endswith(".mp.weixin.qq.com"):
+        return None
+    return value
+
+
+def _original_source_candidate(source_url: str, links: list[tuple[str, str]]) -> str | None:
+    candidate = _external_http_url(source_url)
+    if candidate:
+        return candidate
+    labels = {"原文", "原文链接", "阅读原文", "原始出处", "source", "original"}
+    for href, text in links:
+        normalized = re.sub(r"[\s：:·。.!！?？]+", "", text).casefold()
+        if normalized in labels:
+            candidate = _external_http_url(href)
+            if candidate:
+                return candidate
+    return None
 
 
 def parse_article(source: str, url: str) -> str:
@@ -110,6 +147,9 @@ def parse_article(source: str, url: str) -> str:
         metadata.append(f"> 公众号: {author}")
     if published:
         metadata.append(f"> 发布时间: {published}")
+    candidate = _original_source_candidate(_js_string(source, "source_url"), parser.links)
+    if candidate:
+        metadata.append(f"> 原始出处候选: {candidate}")
     metadata.extend([f"> 原文链接: {url}", "", "---", ""])
     return "\n".join(metadata) + body + "\n"
 
