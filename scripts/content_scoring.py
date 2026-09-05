@@ -3,8 +3,8 @@
 
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
+    --importance-output importance.json \
     [--retry-quality-output retry.json] \
-    [--importance-output importance.json] \
     [--relevance-output relevance.json --context context.md] \
     [--config-from-base <base-config.json>]
   python3 scripts/content_scoring.py --self-check
@@ -319,9 +319,9 @@ def _validate_importance_output(output: dict) -> tuple[dict | None, list[str]]:
             "confidence": "partial",
             "authority_confidence": "partial",
             "authority_status": "source_missing",
-            "reason_code": "source_missing",
+            "reason_code": "authority_artifact_missing",
             "rationale": "未提供权威核验产物",
-        }, ["authority_source_missing"]
+        }, ["authority_artifact_missing"]
     if not isinstance(output, dict):
         return {
             "authority_score": None,
@@ -658,6 +658,7 @@ def score(
         "authority_score": None,
         "problem_significance_score": problem["score"],
         "evidence": [],
+        "authority_rationale": authority.get("rationale"),
         "authority_status": authority["authority_status"],
         "authority_reason_code": authority["reason_code"],
         "authority_confidence": authority.get("authority_confidence", authority.get("confidence", "partial")),
@@ -810,7 +811,8 @@ def main():
     parser.add_argument("quality_output", nargs="?")
     parser.add_argument("source", nargs="?")
     parser.add_argument("--retry-quality-output")
-    parser.add_argument("--importance-output")
+    parser.add_argument("--importance-output",
+                        help="Required validated authority-verification artifact")
     parser.add_argument("--relevance-output")
     parser.add_argument("--context")
     parser.add_argument("--relevance-unavailable", action="store_true")
@@ -821,6 +823,8 @@ def main():
     args = parser.parse_args()
     if args.self_check:
         return 0 if self_check() else 1
+    if not args.importance_output:
+        parser.error("--importance-output is required")
     if args.config_from_base:
         try:
             _reload_policy(args.config_from_base)

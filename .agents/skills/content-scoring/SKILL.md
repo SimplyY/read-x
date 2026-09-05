@@ -77,6 +77,8 @@ link-card 抓取正文
 
 不得把 YWNext 当作文章事实，不得把其私有原文抄进用户卡片。`full.md` 缺失、过期、结构损坏、输出无效或置信度 low 时令相关性不可用；不得回退到 `full-full.md` 或其他更宽上下文。若 `full.md` 明确没有可注入兴趣，`interest_score` 才给 0，bonus 退化为纯相关（max 0.5）。
 
+异常说明是交付内容的一部分：`interest_score=0` 只表示已完成相关性判断但没有命中明确兴趣领域，不能用来掩盖缺失、无效或未执行；`interest_score=null` 必须说明是跳过计算还是上下文/输出不可用。`authority_status` 为 `mismatch`、`source_missing`、`fetch_failed`、`rejected` 或 `inferred` 时，必须同时保留 `reason_code`、具体 `rationale` 和核验尝试结果；卡片不得只显示“未匹配/不可用”，还要说明已尝试什么、下一步如何重试。
+
 ## 第六步：确定性计算
 
 Base 快照存在时，在 `source.md` 后追加 `--config-from-base <run_dir>/base-config.json`。
@@ -99,7 +101,9 @@ python3 scripts/content_scoring.py quality_output.json source.md \
 YWNext 缺失或结构损坏时，不生成相关性，确定性结束边界状态：
 
 ```bash
-python3 scripts/content_scoring.py quality_output.json source.md --relevance-unavailable
+python3 scripts/content_scoring.py quality_output.json source.md \
+  --importance-output importance.json \
+  --relevance-unavailable
 ```
 
 决策分公式：权威分可用时 `importance_score = round1((authority_score + problem_significance_score) / 2)`；权威分不可用时 `importance_score = problem_significance_score`；随后 `base_priority = round1(0.70 * quality_score + 0.30 * importance_score)`，`decision_score = round1(base_priority + relevance_score + interest_score)`。`quality_label` 只使用 `quality_score`；路由和精读深度使用 `decision_score`，但 `quality_floor` 仍是硬门槛。权威缺失不再取消重要性权重，也不隐藏大问题分。

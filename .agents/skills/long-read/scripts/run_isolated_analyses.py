@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
@@ -13,7 +14,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -167,6 +167,8 @@ def extract_output(
     if len(texts) != 1 or not isinstance(texts[0], str) or not texts[0].strip():
         raise RuntimeError(f"{task_name} returned no unique non-empty output_text")
     output = texts[0].strip()
+    if not isinstance(output, str) or not output.strip():
+        raise RuntimeError(f"{task_name} returned no unique non-empty output_text")
     visible_chars = len(re.sub(r"\s+", "", output))
     if visible_chars < min_output_chars:
         raise RuntimeError(f"{task_name} output is too short: {visible_chars} < {min_output_chars}")
@@ -247,8 +249,9 @@ def call_task(
     endpoint: str,
     timeout: float,
     max_output_tokens: int,
+    model: str = MODEL,
 ) -> dict:
-    """Run a task with bounded retries on the fixed local model."""
+    """Run one task with a bounded retry budget; a later task may continue after failure."""
     task_input = build_input(source, evidence, task.question)
     digests = {
         "skill_sha256": task.skill_sha256,
@@ -256,29 +259,20 @@ def call_task(
         "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
     }
     last_error = None
+    started = time.perf_counter()
     deadline = time.monotonic() + max(float(timeout), 0.01)
     attempts = 0
-    started = time.perf_counter()
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        model = MODEL_CANDIDATES[min(attempt - 1, len(MODEL_CANDIDATES) - 1)]
-        next_model = MODEL_CANDIDATES[min(attempt, len(MODEL_CANDIDATES) - 1)]
-        attempt_timeout = remaining / (RETRY_ATTEMPTS - attempt + 1)
         attempts = attempt
         try:
-            result = _call_once(task, source, evidence, endpoint, attempt_timeout, max_output_tokens, model=model)
+            result = _call_once(task, source, evidence, endpoint, remaining / (RETRY_ATTEMPTS - attempt + 1), max_output_tokens, model=model)
             result["attempts"] = attempt
             result["model"] = model
             return result
-        except (
-            urllib.error.URLError,
-            socket.timeout,
-            json.JSONDecodeError,
-            RuntimeError,
-            OSError,
-        ) as exc:
+        except (urllib.error.URLError, socket.timeout, json.JSONDecodeError, RuntimeError, OSError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < RETRY_ATTEMPTS:
                 wait = min(RETRY_BACKOFF_SECONDS, max(0.0, deadline - time.monotonic()))
@@ -290,7 +284,7 @@ def call_task(
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "attempts": attempts,
         **digests,
-        "error": last_error,
+        "error": last_error or "task timed out",
         "model": model if attempts else MODEL,
     }
 

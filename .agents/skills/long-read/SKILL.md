@@ -13,7 +13,7 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
 原文 -> Evidence
      -> 消费 content-scoring 的 scoring_result（直接使用 ljg_range 与 chatgpt_munger_doc）
      -> article-decode + 0~3 个文字 ljg（独立 HTTP 请求，并行）
-     -> DeepSeek Markdown（仅 chatgpt_munger_doc=true）
+     -> ChatGPT Bridge Markdown（仅 chatgpt_munger_doc=true）
      -> Markdown 渲染为 Docx XML 与 Card 2.0
      -> 创建文档并发送卡片（群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次）
      -> ljg_card=true 时再运行 ljg-card，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）
@@ -37,7 +37,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 只通过 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 固定发送独立 `deepseek-v4-flash` 请求；上游超时或传输失败时，在每个任务的同一总超时内对同一模型重试，不切换模型，固定 `store=false`，最多四请求并行。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
 
-当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前运行 `scripts/run_chatgpt_munger.py`，由本地 MoonBridge 的 `deepseek-v4-flash` 生成 Markdown。编排器只提供原文、完整运行时 `munger-soul` 提示词和最小任务边界：要求先还原文章真正的问题，按内容自然组织 Markdown，不额外强制标题数量、标题顺序或固定章节模板。脚本必须返回 `format=markdown`、`verification=local-http` 和匹配的 `outputSha256`；不伪造会话 URL。Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。DeepSeek 失败、超时、超长或输出校验失败均失败关闭，主精读文档仍照常交付。
+当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前运行 `scripts/run_chatgpt_munger.py`，通过现有 Ego Lite ChatGPT Bridge 生成 Markdown。编排器只提供原文、完整运行时 `munger-soul` 提示词和最小任务边界：要求先还原文章真正的问题，按内容自然组织 Markdown，不额外强制标题数量、标题顺序或固定章节模板。脚本必须返回 `format=markdown`、`verification=live-dom+snapshot`、有效 `conversationUrl` 和匹配的 `outputSha256`；不得接受本地模型或旧验证标记。Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。ChatGPT Bridge 失败、超时、超长或输出校验失败均失败关闭，主精读文档仍照常交付。
 
 为每条文字 ljg 创建只含唯一问题的独立文件，然后运行：
 
@@ -73,6 +73,8 @@ python3 .agents/skills/long-read/scripts/run_isolated_analyses.py \
 - 补最少的连接语；
 - 转义并排版为 Docx XML。
 
+文档根 `<title>` 只承载文章标题，正文不得再次输出同名标题。正文第一个主章节必须是 `<h1>评分</h1>`；评分、原文金句、文章真正的核心、基石 / 边缘 / 暗流、值得研究的相关问题、与作者对话、最值得深读之处、附录和必要事实均为一级主章节，附录内各文字 Skill 边界使用 `h2`，其内部标题使用 `h3` 或更低层级。
+
 不要把独立 Skill 的表达统一改写成平直白话。相同证据可以复用，相同结论只能出现一次。能套在无关文章上的泛化句删除。
 
 - 主文约 1000~2000 字。
@@ -87,7 +89,7 @@ python3 .agents/skills/long-read/scripts/run_isolated_analyses.py \
 3. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
 4. 文章真正的核心；
 5. 基石 / 边缘 / 暗流；
-6. 值得研究的相关问题（2–3 个问题及各自一句上下文，总计 ≤300 字）；
+6. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
 7. 与作者对话；
 8. 最值得深读之处；
 9. 附录：独立深度分析；
@@ -101,8 +103,8 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 6. 交付顺序
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
-1. 用 `.wx_doc.xml` 创建主精读文档；若 `chatgpt_munger_doc=true` 且后处理成功，再用 `markdown_to_feishu_xml.py` 创建独立的芒格洞察 Docx XML；
-2. 用 `scripts/render_long_read_delivery_card.py` 生成并校验唯一 Card 2.0 交付卡。成功时同时放主文档和芒格文档链接；DeepSeek 或第二篇文档失败时只放主文档链接并注明待复核。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
+1. 生成 `.wx_doc.xml` 后先运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。若 `chatgpt_munger_doc=true` 且后处理成功，再用 `markdown_to_feishu_xml.py` 创建独立的芒格洞察 Docx XML；
+2. 用 `scripts/render_long_read_delivery_card.py` 生成并校验唯一 Card 2.0 交付卡。成功时同时放主文档和芒格文档链接；ChatGPT Bridge 或第二篇文档失败时只放主文档链接并注明待复核。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
 3. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
    ```bash
@@ -123,8 +125,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 只有第三个问题具有独立且决定性的研究价值时才输出第 3 个。
 
 问题优先从完整原文、Evidence、article-decode 和本轮成功的文字 ljg 中提炼，
-聚焦因果机制、隐含前提、适用边界、证伪条件或关键取舍。每项使用“问题 +
-一句最小必要上下文”的有序列表；章节正文可见文字（含标签，不含标题）≤300 字。
+聚焦因果机制、隐含前提、适用边界、证伪条件或关键取舍。先输出 `问题` 小节：2–3 个有序列表项。每个问题必须单独包含研究对象、关系和待判断点，脱离上下文列表也能读懂，不得使用悬空的“该判断”“上述内容”“它”等指代。再输出 `上下文` 小节：一个供全部问题共同使用的无序列表，只补充文章已经建立的核心事实、证据和未证实边界，不在问题项内写“上下文：”。章节正文可见文字（不含标题）≤300 字。
 
 content-scoring 已校验的个人上下文只作为弱辅助排序信号，不能压过文章证据，
 也不得在可见文字中贴个人标签或把个人背景写成文章事实。不要新增个人文件读取。
@@ -132,9 +133,9 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 ## 自检
 
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
-- [ ] `chatgpt_munger_doc=true` 时是否先运行本地 DeepSeek 后处理，再创建第二篇文档并与主文档合并为一张交付卡？
-- [ ] DeepSeek 后处理失败时是否失败关闭，且主精读文档仍可交付？
-- [ ] DeepSeek 是否返回 Markdown、`verification=local-http` 和匹配 hash？
+- [ ] `chatgpt_munger_doc=true` 时是否先运行 ChatGPT Bridge 后处理，再创建第二篇文档并与主文档合并为一张交付卡？
+- [ ] ChatGPT Bridge 后处理失败时是否失败关闭，且主精读文档仍可交付？
+- [ ] ChatGPT Bridge 是否返回 Markdown、`verification=live-dom+snapshot`、有效会话 URL 和匹配 hash？
 - [ ] 芒格 Markdown 是否只在本轮临时目录存在，且文档/卡片读回后清理？
 - [ ] 交付卡是否由渲染脚本生成，读回时没有字面量 `\\n`？
 - [ ] `quality_score ≥ quality_floor` 时，交付卡是否在相关性、兴趣两轴都算完后才一起发出，未只带质量分单发？
@@ -142,7 +143,7 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 - [ ] 主 Agent 是否未读取分析 Skill、未角色扮演生成、未在失败时回退？
 - [ ] Evidence 是否通过严格 Schema 与逐字引文校验，summary 是否与本轮成功文件一一对应？
 - [ ] 是否无「骨架」和独立「X 光四层」？
-- [ ] 是否在「基石 / 边缘 / 暗流」之后固定输出 2–3 个带一句上下文的研究问题，且总计 ≤300 字？
+- [ ] 是否在「基石 / 边缘 / 暗流」之后输出独立问题列表与共同上下文列表，且总计 ≤300 字？
 - [ ] 研究问题是否主要来自文章与本轮分析，个人上下文仅作弱排序且未写成画像标签？
 - [ ] 主文与附录是否没有重复结论？
 - [ ] 原文金句总数是否不超过 8；英文金句是否给出信达雅中文译文并附英文原句？

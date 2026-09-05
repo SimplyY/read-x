@@ -157,7 +157,10 @@ else:
 
 ```bash
 python3 /Users/yuwei/code/read-x/scripts/build_authority_identity.py --source "<source.md>" --quality "<run_dir>/quality-output.json" --output "<run_dir>/identity.json"
-python3 /Users/yuwei/code/read-x/scripts/generate_authority.py --identity "<run_dir>/identity.json" --output "<run_dir>/search-observation.json"
+authority_observation="<run_dir>/search-observation.json"
+if [ ! -s "$authority_observation" ] || ! jq -e '.tool_status == "ok" and ((.results // []) | length > 0)' "$authority_observation" >/dev/null 2>&1; then
+  python3 /Users/yuwei/code/read-x/scripts/generate_authority.py --identity "<run_dir>/identity.json" --output "$authority_observation"
+fi
 python3 /Users/yuwei/code/read-x/scripts/verify_source_authority.py --identity "<run_dir>/identity.json" --search-observation "<run_dir>/search-observation.json" --output "<run_dir>/importance-output.json"
 score_config_args=()
 if [ -f "<base_config.json>" ]; then
@@ -272,7 +275,7 @@ fi
 
 **长摘要 / 含 ljg**：生成飞书文档 → 私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`）。
 
-`scoring_result.chatgpt_munger_doc=true` 时，long-read 在主文档交付卡之前额外完成 DeepSeek 芒格洞察文档；成功时两篇文档共用一张交付卡，失败时只交付主文档并注明待复核。
+`scoring_result.chatgpt_munger_doc=true` 时，long-read 在主文档交付卡之前额外完成 ChatGPT Bridge 芒格洞察文档；成功时两篇文档共用一张交付卡，失败时只交付主文档并注明待复核。
 
 长文交付卡统一使用 `/Users/yuwei/code/read-x/scripts/render_long_read_delivery_card.py` 生成 CardKit 2.0 JSON，再用 `json.loads` 校验后发送。禁止手工拼接 JSON；卡片正文必须使用真实换行，发送后读回消息确认不存在字面量 `\\n`。
 

@@ -286,7 +286,7 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
         status, score, reason = "corroborated", 7.0, "reputable_secondary_corroborated"
     else:
         suggested = assessment.get("suggested_score")
-        if isinstance(suggested, (int, float)) and not isinstance(suggested, bool):
+        if isinstance(suggested, (int, float)) and not isinstance(suggested, bool) and suggested > 0:
             bounded = min(max(float(suggested), 0.0), 8.0)
             score = min(DIMENSION_SCORES, key=lambda value: abs(value - bounded))
             status, reason = "inferred", "model_knowledge_inferred"

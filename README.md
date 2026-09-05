@@ -40,12 +40,12 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wx_fast.py` 纯 HTTP）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` 评分结果 v3.18（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由同一模型一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和受限搜索/知识兜底生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；脚本按 `70%质量 + 30%重要性` 合成决策分；锚点只用于事后回归，仅在相关性可改变路由时隔离计算相关性
+- **内容质量评分**：`content-scoring` 评分结果 v3.18（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由本地 `deepseek-v4-flash` 一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和受限搜索/知识兜底生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；相关性和兴趣也在隔离上下文中由本地模型计算；脚本按 `70%质量 + 30%重要性` 合成决策分
 - **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.5；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
-- **长文精读**：`long-read` 编排器，Evidence -> 独立 HTTP 并行解码/文字深度链路 -> Docx XML -> 飞书主文档；`chatgpt_munger_doc=true` 时追加芒格洞察文档
-- **格式保真**：本地 `deepseek-v4-flash` 先生成规范 Markdown，再统一渲染 Feishu XML 与 Card 2.0；编排层只提供原文和最小任务边界，不强制芒格文档套用固定标题模板，临时 Markdown 交付后清理
+- **长文精读**：`long-read` 编排器，Evidence -> 本地模型独立解码/文字深度链路 -> Docx XML -> 飞书主文档；`chatgpt_munger_doc=true` 时追加 ChatGPT Bridge 芒格洞察文档
+- **格式保真**：芒格洞察由 ChatGPT Bridge 生成规范 Markdown，再统一渲染 Feishu XML 与 Card 2.0；编排层只提供原文和最小任务边界，不强制芒格文档套用固定标题模板，临时 Markdown 交付后清理
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
 ## 数据流
@@ -63,9 +63,9 @@ content-scoring（quality -> 条件 relevance -> decision）
 └──────────────────────┴──────────────────────┘
                                               ↓
                             Evidence -> article-decode + 文字 ljg
-                                     （独立 store=false HTTP，并行）
+                                     （本地模型独立并行）
                                      -> Docx XML -> 飞书主文档
-                                     -> chatgpt_munger_doc=true 时本地 DeepSeek -> 芒格洞察文档
+                                     -> chatgpt_munger_doc=true 时 ChatGPT Bridge -> 芒格洞察文档
                                      -> 私聊卡片通知
                             （ljg_card=true 时额外私聊 PNG）
 ```
@@ -78,14 +78,14 @@ content-scoring（quality -> 条件 relevance -> decision）
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
 | `content-scoring` | **评分引擎**。三维质量、权威性与大问题思考、独立相关性与确定性路由；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence -> 独立 HTTP 并行 article-decode + 文字 ljg -> 拼接飞书主文档；可选 DeepSeek 芒格洞察文档 |
+| `long-read` | **深度编排器**。Evidence -> 本地模型独立并行 article-decode + 文字 ljg -> 拼接飞书主文档；可选 ChatGPT Bridge 芒格洞察文档 |
 | `article-decode` | **X 光解码**。只读原文与 Evidence，产出独立解码原稿 |
 
 调用关系：
 
 - `link-card` 调 `content-scoring`，按脚本返回的 `route` 走卡片或 `long-read`
 - `long-read` 调 `article-decode`（X 光），再调度外部 `ljg-*` 文字 Skill
-- `long-read` 在 `chatgpt_munger_doc=true` 时通过本地 MoonBridge 调用 `deepseek-v4-flash`，失败关闭且不阻塞主文档
+- `long-read` 在 `chatgpt_munger_doc=true` 时通过 Ego Lite ChatGPT Bridge 生成芒格洞察，失败关闭且不阻塞主文档；其他分析使用本地模型
 - `content-scoring` 结果传给 `long-read`，long-read 不重评
 
 ## 与 ljg-skills 的关系
@@ -118,8 +118,8 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
-| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 独立 HTTP 并行运行 article-decode 与文字 ljg |
-| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 达到运行时门槛时调用本地 `deepseek-v4-flash` 生成芒格洞察原稿 |
+| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 通过本地 MoonBridge 并行运行独立 article-decode 与文字 ljg |
+| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 达到运行时门槛时调用 ChatGPT Bridge 生成芒格洞察原稿 |
 | `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
 | `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |
 | `scripts/render_long_read_delivery_card.py` | 生成唯一长文交付 Card 2.0 JSON，避免换行转义错误 |
@@ -129,10 +129,11 @@ content-scoring（quality -> 条件 relevance -> decision）
 
 精读文档结论先行，使用 Docx XML 原生排版：
 
-1. 顶部：评分表 + 核心结论高亮块
-2. 主文：核心 -> 基石/边缘/暗流 -> 值得研究的相关问题（2–3 个问题及各自一句上下文，总计 ≤300 字） -> 与作者对话 -> 最值得深读之处
-3. 附录：导言 + 各文字 ljg 完整原稿
-4. 文末：Evidence 金句 + 原文链接
+1. 根 `<title>` 只保留文章标题；正文首个主章节为一级标题 `评分`
+2. 顶部：评分表 + 核心结论高亮块
+3. 主文：核心 -> 基石/边缘/暗流 -> 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字） -> 与作者对话 -> 最值得深读之处
+4. 附录：导言 + 各文字 ljg 完整原稿
+5. 文末：必要事实（若有）
 
 ## 运行环境
 

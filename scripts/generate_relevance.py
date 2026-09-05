@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Generate relevance_output v3 in an isolated context (store=false, no quality score).
-
-MoonBridge 的模型对 strict json_schema 的字段完整性约束不足，因此本脚本不依赖
-strict 强制完整，而是用 example 引导结构 + 语义校验 + 别名容错 + 分数 clamp/snap，
-校验失败统一纳入 call_model 重试（覆盖 matched 非空等硬约束）。
-"""
+"""Generate relevance_output v3 in an isolated local-model context."""
 from __future__ import annotations
 
 import argparse
@@ -32,11 +27,13 @@ MAINLINES = ["AI 产业认知", "价值投资", "教育+AI", "AI 时代探索"]
 SCORE_ENUM = [0, 0.2, 0.3, 0.4, 0.5]
 
 
-def snap_score(value, default: float = 0.0) -> float:
+def snap_score(value) -> float:
+    if isinstance(value, bool):
+        raise RuntimeError("relevance score must be a finite number")
     try:
         v = float(value)
     except (TypeError, ValueError):
-        return default
+        raise RuntimeError("relevance score must be a finite number")
     if not math.isfinite(v):
         raise RuntimeError("relevance score must be finite")
     v = max(0.0, min(0.5, v))
@@ -44,7 +41,7 @@ def snap_score(value, default: float = 0.0) -> float:
 
 
 def validate_relevance(parsed: dict) -> dict:
-    """规范化并校验模型输出；不合法则 raise，由 call_model 重试覆盖。"""
+    """规范化并校验本地模型输出；失败后在总时限内重试。"""
     if not isinstance(parsed, dict):
         raise RuntimeError("relevance output is not an object")
     rationale = parsed.get("rationale") or parsed.get("reason") or parsed.get("rationale_zh") or ""
@@ -91,9 +88,8 @@ def call_model(input_text: str, schema: dict, name: str, max_output_tokens: int,
             last_exc = exc
             if attempt >= RETRY_ATTEMPTS or time.monotonic() >= deadline:
                 break
-            wait = RETRY_BACKOFF_SECONDS * attempt
+            wait = min(RETRY_BACKOFF_SECONDS * attempt, max(0.0, deadline - time.monotonic()))
             print(json.dumps({"event": "relevance_retry", "attempt": attempt, "model": model, "next_model": next_model, "wait_seconds": wait, "error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
-            wait = min(wait, max(0.0, deadline - time.monotonic()))
             if wait:
                 time.sleep(wait)
     if last_exc is not None:
@@ -112,20 +108,23 @@ def _call_once(input_text: str, schema: dict, name: str, max_output_tokens: int,
     }
     request = urllib.request.Request(ENDPOINT, data=json.dumps(payload, ensure_ascii=False).encode(), headers={"Content-Type": "application/json"})
     started = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
         result = json.load(response)
-    elapsed = round(time.perf_counter() - started, 3)
     if result.get("status") != "completed":
-        raise RuntimeError(f"{name} generation incomplete after {elapsed}s: {result.get('incomplete_details')}")
+        raise RuntimeError(f"{name} generation incomplete: {result.get('incomplete_details')}")
     texts = [content.get("text") for item in result.get("output", []) if item.get("type") == "message" for content in item.get("content", []) if content.get("type") == "output_text"]
     if len(texts) != 1:
         raise RuntimeError(f"{name} generation returned no unique output_text")
     raw = texts[0].strip()
-    print(json.dumps({"event": "relevance_generation_completed", "attempt": attempt, "model": model, "elapsed_seconds": elapsed, "output_chars": len(raw), "usage": result.get("usage", {})}, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{name} returned invalid JSON") from exc
+    if not isinstance(parsed, dict) or set(schema["required"]) - set(parsed):
+        raise RuntimeError(f"{name} returned invalid fields")
+    elapsed = round(time.perf_counter() - started, 3)
+    print(json.dumps({"event": "relevance_generation_completed", "attempt": attempt, "model": model, "elapsed_seconds": elapsed, "output_chars": len(raw), "usage": result.get("usage", {})}, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
     return validate_relevance(parsed)
 
 

@@ -46,12 +46,20 @@ print('ok')
 
 
 def test_research_questions_section_survives_render_and_validation():
-    markdown = """## 基石 / 边缘 / 暗流
+    markdown = """## 评分
+评分表。
+
+## 基石 / 边缘 / 暗流
 文章的核心结构。
 
 ## 值得研究的相关问题
-1. **问题：**因果链在哪里断裂？ **上下文：**文章只证明相关性。
-2. **问题：**这个判断何时失效？ **上下文：**边界条件没有展开。
+### 问题
+1. 因果链在哪里断裂？
+2. 这个机制何时失效？
+
+### 上下文
+- 文章只证明相关性，没有完成因果验证。
+- 边界条件与反例尚未展开。
 
 ## 与作者对话
 保留具体对话。
@@ -65,6 +73,34 @@ def test_research_questions_section_survives_render_and_validation():
     assert validator.check_document_xml(xml) == []
 
 
+def test_duplicate_leading_title_is_removed_and_score_becomes_h1():
+    markdown = """# 标题
+
+## 评分
+评分表。
+
+## 原文金句
+一句引用。
+"""
+    xml = renderer.render_markdown(markdown, title="标题", source_url="", conversation_url="")
+    assert xml.count("<title>标题</title>") == 1
+    assert "<h1>标题</h1>" not in xml
+    assert "<h1>评分</h1>" in xml
+    assert "<h1>原文金句</h1>" in xml
+
+
+def test_non_matching_leading_title_is_preserved():
+    xml = renderer.render_markdown("# 另一标题\n\n## 评分\n内容。", title="标题", source_url="", conversation_url="")
+    assert "<h1>另一标题</h1>" in xml
+    assert "<h2>评分</h2>" in xml
+
+
+def test_whitespace_different_leading_title_is_preserved():
+    xml = renderer.render_markdown("# A   B\n\n## 评分\n内容。", title="A B", source_url="", conversation_url="")
+    assert "<h1>A   B</h1>" in xml
+    assert "<h2>评分</h2>" in xml
+
+
 def test_unsafe_html_is_escaped_and_large_tables_are_preserved():
     markdown = "<script>alert(1)</script>\n\n| " + " | ".join(f"c{i}" for i in range(9)) + " |\n| " + " | ".join("---" for _ in range(9)) + " |\n| " + " | ".join("x" for _ in range(9)) + " |"
     xml = renderer.render_markdown(markdown, title="标题", source_url="", conversation_url="")
@@ -73,10 +109,10 @@ def test_unsafe_html_is_escaped_and_large_tables_are_preserved():
     assert "表格超出原生表格限制" in xml and '<pre lang="markdown"><code>' in xml
 
 
-def test_local_deepseek_output_gets_provenance_callout_without_session_url():
+def test_chatgpt_bridge_output_gets_provenance_callout_without_session_url():
     xml = renderer.render_markdown("正文。", title="标题", source_url="https://example.com/article", conversation_url="")
     assert 'emoji="⭐"' in xml
-    assert "DeepSeek 基于完整原文生成" in xml
+    assert "ChatGPT 基于完整原文生成" in xml
 
 
 def test_metadata_rejects_unsafe_urls():

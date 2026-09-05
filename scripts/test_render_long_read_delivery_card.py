@@ -19,12 +19,13 @@ def test_success_card_has_two_links_and_real_newline():
     assert any("\n" in content for content in contents)
     assert all("\\n" not in content for content in contents)
     assert any("munger" in content for content in contents)
+    assert any("ChatGPT 芒格洞察" in content for content in contents)
 
 
 def test_failure_card_only_has_main_link():
     value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", failure_reason="bridge-output-unverified")
     content = json.dumps(value, ensure_ascii=False)
-    assert "main" in content and "munger" not in content and "待复核" in content
+    assert "main" in content and "munger" not in content and "ChatGPT 芒格洞察待复核" in content
 
 
 if __name__ == "__main__":

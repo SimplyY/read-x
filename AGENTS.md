@@ -12,7 +12,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 - 只在任务确实需要个性化相关性时读取通过校验的 YWNext `runtime/core-context/full.md`；完整核心上下文不得进入原文忠实度、质量评分、引用或交付状态判断。
 - 每次阶段转换以当前 `run_dir`、`summary.json`、哈希和来源状态为准；不以对话记忆或旧产物推断完成。
-- 文档创建、卡片发送和 DeepSeek 后处理分别保留尝试与读回证据；提交不确定时停止，禁止自动重发。
+- 文档创建、卡片发送和 ChatGPT Bridge 芒格后处理分别保留尝试与读回证据；提交不确定时停止，禁止自动重发。
 
 ## 核心规则：群消息自动分派
 
@@ -50,9 +50,9 @@ link-card 流程：
 
 1. **抓取正文**：进入 long-read 后复用 link-card 前置抓取生成的 `source.md`，禁止再次抓取
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
-3. **独立解码**：Evidence 完成后，通过 `run_isolated_analyses.py` 向 MoonBridge 发出独立 `store=false` HTTP 请求运行 `article-decode`；脚本必须严格校验 Evidence、禁用环境代理并写本轮 summary；不输出骨架或单独 X 光四层
+3. **独立解码**：Evidence 完成后，通过 `run_isolated_analyses.py` 向 MoonBridge 发出独立 `store=false` HTTP 请求运行 `article-decode`；脚本必须严格校验 Evidence 并写本轮 summary；不输出骨架或单独 X 光四层
 4. **文字深度链路**：各 ljg 由同一脚本并行发出互不可见的独立 HTTP 请求；命令、路径或交付残留必须失败关闭且不落盘；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
-5. **DeepSeek 芒格后处理**：仅当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前运行 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`；本地 MoonBridge 固定使用 `deepseek-v4-flash`，返回规范 Markdown、`verification=local-http` 和匹配 hash，再由 `markdown_to_feishu_xml.py` 生成独立芒格洞察 XML。不伪造会话 URL；失败关闭，主精读文档仍照常交付
+5. **ChatGPT Bridge 芒格后处理**：仅当 `scoring_result.chatgpt_munger_doc=true` 时，在主文档 XML 创建前运行 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`；通过 Ego Lite ChatGPT Bridge 返回规范 Markdown、`verification=live-dom+snapshot`、有效会话 URL和匹配 hash，再由 `markdown_to_feishu_xml.py` 生成独立芒格洞察 XML。不接受本地模型或旧验证标记；失败关闭，主精读文档仍照常交付
 6. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；成功时创建主文档与芒格洞察文档，并合并为一张私聊交付卡（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
    - `ljg_card=true` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
 
@@ -102,10 +102,12 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - 顶部：评分表（`quality_score + quality_label`、`importance_score`、权威性状态/分数、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
 - 原文金句 + 原文链接（紧跟评分表，作为溯源入口）
 - 全文唯一 `light-yellow` 核心结论高亮块
-- 主文：真正的核心 → 基石/边缘/暗流 → 值得研究的相关问题（2–3 个问题及各自一句上下文，总计 ≤300 字）→ 与作者对话 → 最值得深读之处
+- 正文根 `<title>` 只保留文章标题；第一个主章节必须是一级标题 `评分`，其余主章节也使用一级标题，附录内文字 Skill 边界使用二级标题
+- 主文：真正的核心 → 基石/边缘/暗流 → 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字）→ 与作者对话 → 最值得深读之处
 - 附录：先 ≤100 字导言（只做最精华的一句话概要，从第一性原理平实描述，不堆复杂概念），再各文字 ljg 完整原稿（不限字数）
 - 文末：必要事实（若有）
 - 单段可见文本不超过 100 字；并列信息用列表，真实对比或数据才用不超过 4 列的表格
+- 创建主文档前必须通过 `.agents/skills/long-read/scripts/validate_output.py --document`，失败不得写入飞书
 
 ## 写作准则（透明玻璃）
 
@@ -141,8 +143,8 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] 内容质量判断已完成（字数、论点、金句、结构、亲历者）
 - [ ] 高质量：Evidence / article-decode / 隔离文字 ljg / XML 飞书文档已完成，主文与附录无重复结论
 - [ ] `ljg_card=true`：文档已先交付，ljg-card PNG 私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
-- [ ] `chatgpt_munger_doc=true`：DeepSeek 后处理成功后创建第二篇芒格洞察文档，与主文档共用一张交付卡；失败关闭且主文档仍交付
-- [ ] DeepSeek 输出经 `local-http` 和 hash 验证为规范 Markdown，再创建第二篇文档
+- [ ] `chatgpt_munger_doc=true`：ChatGPT Bridge 后处理成功后创建第二篇芒格洞察文档，与主文档共用一张交付卡；失败关闭且主文档仍交付
+- [ ] ChatGPT Bridge 输出经 `live-dom+snapshot`、会话 URL 和 hash 验证为规范 Markdown，再创建第二篇文档
 - [ ] 交付卡由渲染脚本生成，读回内容没有字面量 `\\n`
 - [ ] 中低质量：摘要已生成
 - [ ] 卡片 JSON 格式正确（schema 2.0，markdown 标签）

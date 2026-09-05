@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 from pathlib import Path
 
 
@@ -41,6 +42,7 @@ for _name in (
 
 def render_markdown(markdown: str, *, title: str, source_url: str, conversation_url: str) -> str:
     """Keep read-x's provenance notice while delegating layout to the shared layer."""
+    markdown = _strip_leading_document_title(markdown, title)
     xml = _SHARED.render_markdown(
         markdown,
         title=title,
@@ -53,9 +55,23 @@ def render_markdown(markdown: str, *, title: str, source_url: str, conversation_
         insertion = 2
     blocks.insert(
         insertion,
-        '<callout emoji="⭐" background-color="light-yellow" border-color="yellow"><p>以下内容由 DeepSeek 基于完整原文生成，并按芒格之魂提示词组织；事实、推断与未知应分别核对。</p></callout>',
+        '<callout emoji="⭐" background-color="light-yellow" border-color="yellow"><p>以下内容由 ChatGPT 基于完整原文生成，并按芒格之魂提示词组织；事实、推断与未知应分别核对。</p></callout>',
     )
     return "\n".join(blocks) + "\n"
+
+
+def _strip_leading_document_title(markdown: str, title: str) -> str:
+    """Keep the document title in <title>, not as a duplicate body heading."""
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index == len(lines):
+        return markdown
+    match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", lines[index])
+    if not match or match.group(1).strip() != title.strip():
+        return markdown
+    return "\n".join(lines[:index] + lines[index + 1:])
 
 
 def main() -> int:

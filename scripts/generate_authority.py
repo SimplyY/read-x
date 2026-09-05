@@ -64,8 +64,13 @@ def _call_once(identity: dict, timeout: float, attempt: int) -> dict:
     if len(texts) != 1:
         raise RuntimeError("authority inference returned no unique output")
     parsed = json.loads(texts[0])
-    if not isinstance(parsed, dict) or set(authority_schema()["required"]) - set(parsed):
+    required = set(authority_schema()["required"])
+    if not isinstance(parsed, dict) or set(required) - set(parsed):
         raise RuntimeError("authority inference returned invalid fields")
+    if parsed["entity_match"] not in {"confirmed", "ambiguous", "none", "unknown"}:
+        raise RuntimeError("authority inference entity_match is invalid")
+    if parsed["topic_match"] not in {"strong", "weak", "none", "unknown"}:
+        raise RuntimeError("authority inference topic_match is invalid")
     if parsed["suggested_score"] not in SCORE_ENUM:
         raise RuntimeError("authority inference score is invalid")
     parsed["basis"] = parsed["basis"].strip()

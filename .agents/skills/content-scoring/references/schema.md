@@ -132,6 +132,8 @@
 
 `authority_status` 为 `source_missing`、`fetch_failed`、`mismatch` 或 `rejected` 时，`authority_score` 必须为 `null`；状态与分数矛盾的产物会被拒绝并回退到大问题分。
 
+异常状态必须可解释：调用方保留 `reason_code`、`rationale` 和 `search_observation`，展示层同时输出具体原因与已尝试的核验记录。`interest_score=0` 是已完成且未命中明确兴趣领域；`interest_score=null` 是未计算或不可用，二者不得混淆。
+
 ```json
 {
   "schema_version": "3.18",
@@ -169,8 +171,10 @@
 ## CLI
 
 ```bash
-python3 scripts/content_scoring.py quality_output.json source.md
-python3 scripts/content_scoring.py quality_output.json source.md --relevance-unavailable
+python3 scripts/content_scoring.py quality_output.json source.md \
+  --importance-output importance.json
+python3 scripts/content_scoring.py quality_output.json source.md \
+  --importance-output importance.json --relevance-unavailable
 python3 scripts/content_scoring.py quality_output.json source.md \
   --retry-quality-output retry.json \
   --relevance-output relevance_output.json \

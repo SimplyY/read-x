@@ -17,6 +17,7 @@ ALIASES = {
     "比尔·盖茨": ["Bill Gates"], "比尔盖茨": ["Bill Gates"],
     "林毅夫": ["Justin Yifu Lin", "Yifu Lin"],
 }
+GENERIC_SOURCE_LABELS = {"匿名", "佚名", "未知", "来源不明"}
 
 
 def _metadata(source: str) -> tuple[str, str, str, list[str]]:
@@ -51,9 +52,11 @@ def build_identity(source: str, quality: dict | None = None) -> dict:
         values.append(publisher)
     for value in values:
         value = value.strip()
-        if value and value not in seen:
+        if value and value not in GENERIC_SOURCE_LABELS and value not in seen:
             seen.add(value)
             entities.append({"type": "organization" if value == publisher else "person", "name": value, "aliases": ALIASES.get(value, [])})
+    if author and author not in seen and author not in GENERIC_SOURCE_LABELS:
+        entities.append({"type": "organization", "name": author, "aliases": ALIASES.get(author, [])})
     domain = (quality or {}).get("detected_domain") or {}
     topic = {"primary": domain.get("primary", ""), "secondary": domain.get("secondary", "")}
     event_hint = title.split(":", 1)[-1].strip() if ":" in title else title

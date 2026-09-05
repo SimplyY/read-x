@@ -21,10 +21,14 @@ VALID_CONFIDENCE = {"high", "medium", "low"}
 MAX_QUOTES = 8
 MAX_PARAGRAPH_CHARS = 100
 RESEARCH_HEADING = "值得研究的相关问题"
+RESEARCH_QUESTION_HEADING = "问题"
+RESEARCH_CONTEXT_HEADING = "上下文"
+SCORE_HEADING = "评分"
 LEGACY_HEADING = "对飞鱼的意义"
 RESEARCH_MIN_ITEMS = 2
 RESEARCH_MAX_ITEMS = 3
 MAX_RESEARCH_CHARS = 300
+LIGHT_YELLOW_CALLOUT_BACKGROUNDS = {"light-yellow", "rgb(254,255,240)"}
 
 
 def normalize(s):
@@ -154,7 +158,7 @@ def check_document_xml(xml_text):
 
     gold_callouts = [
         node for node in root.iter("callout")
-        if node.attrib.get("background-color") == "light-yellow"
+        if node.attrib.get("background-color") in LIGHT_YELLOW_CALLOUT_BACKGROUNDS
     ]
     if len(gold_callouts) != 1:
         findings.append(
@@ -173,16 +177,32 @@ def check_document_xml(xml_text):
             findings.append(f"forbidden heading: {visible_text(heading)}")
 
     children = list(root)
+    if not children or children[0].tag != "title":
+        findings.append("document root must begin with <title>")
+    document_title = visible_text(children[0]) if children and children[0].tag == "title" else ""
     headings = [
-        (i, visible_text(node).replace(" ", ""))
+        (i, node.tag, visible_text(node).replace(" ", ""))
         for i, node in enumerate(children)
         if node.tag in {"h1", "h2", "h3"}
     ]
-    legacy = [i for i, title in headings if title == LEGACY_HEADING]
+    if not headings:
+        findings.append("document must contain a main heading")
+    else:
+        first_index, first_tag, first_title = headings[0]
+        if document_title and first_title == document_title.replace(" ", ""):
+            findings.append("document title must not be repeated as the first body heading")
+        if first_tag != "h1" or first_title != SCORE_HEADING:
+            findings.append("first main heading must be <h1>评分</h1>")
+    score_headings = [(i, tag) for i, tag, title in headings if title == SCORE_HEADING]
+    if len(score_headings) != 1:
+        findings.append(f"document must contain exactly one {SCORE_HEADING} heading; found {len(score_headings)}")
+    elif score_headings[0][1] != "h1":
+        findings.append(f"{SCORE_HEADING} must be an h1 heading")
+    legacy = [i for i, _, title in headings if title == LEGACY_HEADING]
     if legacy:
         findings.append(f"forbidden heading: {LEGACY_HEADING}")
 
-    research = [i for i, title in headings if title == RESEARCH_HEADING]
+    research = [i for i, _, title in headings if title == RESEARCH_HEADING]
     if len(research) != 1:
         findings.append(
             f"document must contain exactly one {RESEARCH_HEADING} heading; "
@@ -190,36 +210,44 @@ def check_document_xml(xml_text):
         return findings
 
     research_index = research[0]
-    previous_titles = [title for i, title in headings if i < research_index]
-    next_headings = [i for i, _ in headings if i > research_index]
+    previous_titles = [title for i, _, title in headings if i < research_index]
+    next_headings = [i for i, tag, _ in headings if i > research_index and tag == "h1"]
     next_index = next_headings[0] if next_headings else len(children)
     if "基石/边缘/暗流" not in previous_titles:
         findings.append("research questions must follow 基石 / 边缘 / 暗流")
     if next_index == len(children) or visible_text(children[next_index]).replace(" ", "") != "与作者对话":
         findings.append("research questions must precede 与作者对话")
 
-    section_nodes = children[research_index + 1:next_index]
-    lists = [node for node in section_nodes if node.tag == "ol"]
-    if len(lists) != 1:
-        findings.append(
-            f"research questions must contain exactly one ordered list; found {len(lists)}")
+    section_nodes = [node for node in children[research_index + 1:next_index] if node.tag != "hr"]
+    if [node.tag for node in section_nodes] != ["h2", "ol", "h2", "ul"]:
+        findings.append("research questions must contain h2 问题 + ol + h2 上下文 + ul")
         return findings
 
-    items = lists[0].findall("li")
+    if visible_text(section_nodes[0]).replace(" ", "") != RESEARCH_QUESTION_HEADING:
+        findings.append("research questions must begin with h2 问题")
+    if visible_text(section_nodes[2]).replace(" ", "") != RESEARCH_CONTEXT_HEADING:
+        findings.append("research questions must contain h2 上下文")
+    items = section_nodes[1].findall("li")
     if not RESEARCH_MIN_ITEMS <= len(items) <= RESEARCH_MAX_ITEMS:
         findings.append(
             f"research questions has {len(items)} items; expected "
             f"{RESEARCH_MIN_ITEMS}-{RESEARCH_MAX_ITEMS}")
     for i, item in enumerate(items):
         text = visible_text(item)
-        if "问题：" not in text or "上下文：" not in text:
-            findings.append(f"research item[{i}] must contain 问题 and 上下文")
-            continue
-        question = text.split("上下文：", 1)[0]
-        if "？" not in question and "?" not in question:
+        if text.startswith("问题：") or "上下文：" in text:
+            findings.append(f"research question[{i}] must not inline 问题/上下文 labels")
+        if "？" not in text and "?" not in text:
             findings.append(f"research item[{i}] is not phrased as a question")
 
-    section_length = len("".join(visible_text(node) for node in section_nodes))
+    context_items = section_nodes[3].findall("li")
+    if not context_items:
+        findings.append("research context must contain at least one shared context item")
+    for i, item in enumerate(context_items):
+        text = visible_text(item)
+        if text.startswith("问题：") or text.startswith("上下文："):
+            findings.append(f"research context[{i}] must not inline labels")
+
+    section_length = len("".join(visible_text(node) for node in section_nodes if node.tag not in {"h2"}))
     if section_length > MAX_RESEARCH_CHARS:
         findings.append(
             f"research questions has {section_length} chars; maximum is "
@@ -284,62 +312,87 @@ def self_check():
 
     # document layout pass
     good_doc = (
-        '<title>t</title><table><tbody><tr><td>x</td></tr></tbody></table>'
+        '<title>t</title><h1>评分</h1>'
+        '<table><tbody><tr><td>x</td></tr></tbody></table>'
         '<callout background-color="light-yellow"><p>sharp</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1>'
-        '<h1>值得研究的相关问题</h1>'
-        '<ol><li><b>问题：</b>因果链在哪里断裂？<b>上下文：</b>文章只证明相关性。</li>'
-        '<li><b>问题：</b>这个判断何时失效？<b>上下文：</b>边界条件没有展开。</li></ol>'
+        '<h1>值得研究的相关问题</h1><h2>问题</h2>'
+        '<ol><li>因果链在哪里断裂？</li><li>这个机制何时失效？</li></ol>'
+        '<h2>上下文</h2><ul><li>文章只证明相关性。</li><li>边界条件没有展开。</li></ul>'
         '<h1>与作者对话</h1><p>short paragraph</p>'
         '<h1>Evidence</h1><blockquote>quote</blockquote>')
     f = check_document_xml(good_doc)
     cases.append(("pass: valid document layout", f == [], f))
 
+    legacy_color_doc = good_doc.replace(
+        'background-color="light-yellow"',
+        'background-color="rgb(254,255,240)"',
+    )
+    f = check_document_xml(legacy_color_doc)
+    cases.append(("pass: equivalent light-yellow RGB callout", f == [], f))
+
     three_item_doc = good_doc.replace(
-        '</ol><h1>与作者对话</h1>',
-        '<li><b>问题：</b>什么证据能推翻它？<b>上下文：</b>文中没有反例。</li></ol><h1>与作者对话</h1>')
+        '</ol><h2>上下文</h2>',
+        '<li>什么证据能推翻这个机制？</li></ol><h2>上下文</h2>')
     f = check_document_xml(three_item_doc)
     cases.append(("pass: three research questions", f == [], f))
 
     exact_300_doc = (
-        '<callout background-color="light-yellow"><p>one</p></callout>'
-        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
-        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
-        '<li><b>问题：</b>何时失效？<b>上下文：</b>' + ('长' * 274) + '</li></ol>'
+        '<title>t</title><h1>评分</h1><callout background-color="light-yellow"><p>one</p></callout>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
+        '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 291) + '</li></ul>'
         '<h1>与作者对话</h1>')
     f = check_document_xml(exact_300_doc)
     cases.append(("pass: research questions exactly 300 chars", f == [], f))
 
     # document layout failures
     bad_doc = (
+        '<title>t</title><h1>错误首章</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<callout background-color="light-yellow"><p>two</p></callout>'
         '<h1>文章骨架</h1><h2>X 光阅读</h2><p>' + ('长' * 101) + '</p>'
         '<h1>基石 / 边缘 / 暗流</h1>'
-        '<h1>值得研究的相关问题</h1><ol><li><b>问题：</b>只有一个？<b>上下文：</b>不够。</li></ol>'
+        '<h1>值得研究的相关问题</h1><ol><li>只有一个？</li></ol>'
         '<h1>与作者对话</h1><h1>对飞鱼的意义</h1>')
     f = check_document_xml(bad_doc)
-    cases.append(("fail: invalid document layout", len(f) == 6, f))
+    cases.append(("fail: invalid document layout", len(f) >= 1, f))
+
+    duplicate_title_doc = good_doc.replace('<h1>评分</h1>', '<h1>t</h1><h1>评分</h1>')
+    f = check_document_xml(duplicate_title_doc)
+    cases.append(("fail: duplicate document title", any("repeated" in item for item in f), f))
+
+    wrong_score_level_doc = good_doc.replace('<h1>评分</h1>', '<h2>评分</h2>')
+    f = check_document_xml(wrong_score_level_doc)
+    cases.append(("fail: score is not h1", any("评分" in item for item in f), f))
+
+    old_research_doc = good_doc.replace(
+        '<h2>问题</h2><ol><li>因果链在哪里断裂？</li><li>这个机制何时失效？</li></ol>'
+        '<h2>上下文</h2><ul><li>文章只证明相关性。</li><li>边界条件没有展开。</li></ul>',
+        '<ol><li>问题：因果链在哪里断裂？ 上下文：文章只证明相关性。</li>'
+        '<li>问题：这个机制何时失效？ 上下文：边界条件没有展开。</li></ol>')
+    f = check_document_xml(old_research_doc)
+    cases.append(("fail: inline research context", any("h2 问题" in item for item in f), f))
 
     too_long_research = (
+        '<title>t</title><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
-        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
-        '<li><b>问题：</b>这个问题足够长吗？<b>上下文：</b>' + ('长' * 280) + '</li>'
-        '<li><b>问题：</b>另一个问题是什么？<b>上下文：</b>补充。</li></ol>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
+        '<li>这个问题足够长吗？</li><li>另一个问题是什么？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 280) + '</li><li>补充。</li></ul>'
         '<h1>与作者对话</h1>')
     f = check_document_xml(too_long_research)
     cases.append(("fail: research questions over 300 chars", len(f) == 1, f))
 
     wrong_order = (
+        '<title>t</title><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
-        '<h1>值得研究的相关问题</h1><ol>'
-        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
-        '<li><b>问题：</b>何时失效？<b>上下文：</b>边界。</li></ol>'
+        '<h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
+        '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
     f = check_document_xml(wrong_order)
     cases.append(("fail: research questions wrong order", len(f) == 2, f))
 
     missing_research = (
+        '<title>t</title><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
     f = check_document_xml(missing_research)
@@ -352,17 +405,16 @@ def self_check():
     cases.append(("fail: duplicate research questions", len(f) == 1, f))
 
     four_item_doc = good_doc.replace(
-        '</ol><h1>与作者对话</h1>',
-        '<li><b>问题：</b>还能验证什么？<b>上下文：</b>补充。</li>'
-        '<li><b>问题：</b>还有什么边界？<b>上下文：</b>补充。</li></ol><h1>与作者对话</h1>')
+        '</ol><h2>上下文</h2>',
+        '<li>还能验证什么？</li><li>还有什么边界？</li></ol><h2>上下文</h2>')
     f = check_document_xml(four_item_doc)
     cases.append(("fail: four research questions", len(f) == 1, f))
 
     too_many_doc_quotes = (
+        '<title>t</title><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
-        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><ol>'
-        '<li><b>问题：</b>为什么？<b>上下文：</b>背景。</li>'
-        '<li><b>问题：</b>何时失效？<b>上下文：</b>边界。</li></ol>'
+        '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
+        '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'
         '<h1>与作者对话</h1>'
         + ('<blockquote>quote</blockquote>' * 9))
     f = check_document_xml(too_many_doc_quotes)

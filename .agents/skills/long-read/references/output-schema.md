@@ -74,11 +74,11 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 创建前读取当前 `lark-doc` Skill 的 XML、style、create workflow。默认写 `.wx_doc.xml`，不要退回 Markdown。
 
-### DeepSeek Markdown 渲染
+### ChatGPT Bridge Markdown 渲染
 
-DeepSeek 后处理的 `text` 必须是规范 Markdown，且返回 `verification=local-http` 与 `outputSha256`；不伪造 `conversationUrl`。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
+ChatGPT Bridge 后处理的 `text` 必须是规范 Markdown，且返回 `verification=live-dom+snapshot`、有效 `conversationUrl` 与匹配的 `outputSha256`。Bridge 的 `BEGIN_OUTPUT/END_OUTPUT` 只属于外层传输边界，不属于正文，编排 prompt 不得禁止或覆盖该协议；调用层边界应放在任务 prompt 末尾并优先于正文格式要求。不接受本地模型或旧的 `historyVerified` 标记冒充成功。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
 
-`markdown_to_feishu_xml.py` 是 read-x 的兼容入口，排版核心复用共享 `feishu-doc-renderer` Skill。共享层只做纯 Markdown → Feishu XML 转换，不调用模型、不访问飞书、不创建文档，也不改变 Markdown 语义。read-x 兼容层追加 DeepSeek 来源核对提示块；有会话 URL 时才追加会话链接，其他调用方不继承该专用文案。
+`markdown_to_feishu_xml.py` 是 read-x 的兼容入口，排版核心复用共享 `feishu-doc-renderer` Skill。共享层只做纯 Markdown → Feishu XML 转换，不调用模型、不访问飞书、不创建文档，也不改变 Markdown 语义。read-x 兼容层追加 ChatGPT 来源核对提示块；有会话 URL 时才追加会话链接，其他调用方不继承该专用文案。
 
 共享排版规则：
 
@@ -88,7 +88,7 @@ DeepSeek 后处理的 `text` 必须是规范 Markdown，且返回 `verification=
 - 元数据 URL 使用短链接标签展示；长段落按自然标点拆分，单个 `<p>` 不超过 100 个可见字符。
 - `source_url` / `conversation_url` 只接受绝对 `http(s)` URL，非法元数据必须失败关闭。
 
-**`<title>` 硬约束（避免重复文档）**：文档根 `<doc>` 下首个元素必须是 `<title>文档标题</title>`，这是 `lark-cli docs +create` 的标题来源；正文标题仍用 `<h1>`，二者并存。缺 `<title>` 会被标记 `missing_document_title`。文档创建是不可逆外部写：创建前确认 XML 含 `<title>`，创建后从完整 JSON 提取 `document_id`/`url` 再继续；若 stdout 被截断，重读落盘的 JSON 文件取 `url`，绝不重跑 `docs +create` 产生第二个文档。
+**`<title>` 硬约束（避免重复文档）**：文档根 `<doc>` 下首个元素必须是 `<title>文档标题</title>`，这是 `lark-cli docs +create` 的标题来源；正文不得再有同名首标题。正文第一个主章节必须是 `<h1>评分</h1>`，评分和其他主文章节均使用 `h1`，附录内文字 Skill 边界使用 `h2`。缺 `<title>` 或首章节层级错误时标记失败。文档创建是不可逆外部写：创建前确认 XML 通过 `validate_output.py --document`，创建后从完整 JSON 提取 `document_id`/`url` 再继续；若 stdout 被截断，重读落盘的 JSON 文件取 `url`，绝不重跑 `docs +create` 产生第二个文档。
 
 ### 固定顺序
 
@@ -107,9 +107,10 @@ DeepSeek 后处理的 `text` 必须是规范 Markdown，且返回 `verification=
 ```
 
 「值得研究的相关问题」固定放在「基石 / 边缘 / 暗流」之后、
-「与作者对话」之前，直接替换旧的「对飞鱼的意义」。章节必须包含 2–3 个
-有序列表项，每项同时写一个底层问题和一句最小必要上下文；章节正文可见文字
-（含“问题/上下文”标签，不含标题）总计不超过 300 字。
+「与作者对话」之前，直接替换旧的「对飞鱼的意义」。章节必须依次包含 `h2 问题`
+与一个 2–3 项有序列表、`h2 上下文` 与一个共享上下文无序列表。问题必须独立
+完整；上下文只补充全部问题共同需要的核心事实、证据和边界，不嵌入问题项。章节
+正文可见文字（不含标题）总计不超过 300 字。
 
 候选问题必须以文章整体和本轮分析结果为主，优先选择能改变判断的因果、前提、
 边界、证伪或取舍问题。默认只保留 2 个；第三个问题只有在与前两项独立且具有
@@ -117,8 +118,13 @@ DeepSeek 后处理的 `text` 必须是规范 Markdown，且返回 `verification=
 
 ```text
 值得研究的相关问题
-1. 问题：……？ 上下文：……
-2. 问题：……？ 上下文：……
+问题
+1. ……？
+2. ……？
+
+上下文
+- ……
+- ……
 ```
 
 附录 h1 标题后先放 ≤100 字导言（普通段落，只做最精华的一句话概要，从第一性原理平实描述，不堆复杂概念），再按 Skill 顺序放各文字 ljg 完整原稿。每条 ljg 用一个独立 h2 标题包裹，标题必须注明使用的 Skill（格式「Skill 名 · 简短定位」，如「ljg-think · 追本之箭」）；该 h2 是这条 ljg 在附录的唯一边界标记，不得与导言或其他 ljg 混排。ljg 原稿内部的小标题一律降为 h3 及以下，禁止占用 h2，避免与 Skill 边界标题混淆。导言与每条 ljg 原稿均受下文可读性约束（单段≤100字等），原稿只做排版加工不改语义。
