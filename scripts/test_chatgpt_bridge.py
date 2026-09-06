@@ -57,6 +57,21 @@ def test_command_streams_prompt_and_disables_only_success_cooldown():
     assert "successCooldownSeconds: 0" in command
 
 
+def test_process_timeout_fails_closed():
+    original = bridge.subprocess.run
+
+    def timeout(*args, **kwargs):
+        assert kwargs["timeout"] == 330
+        raise bridge.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    bridge.subprocess.run = timeout
+    try:
+        result = bridge.run_bridge("prompt", bridge=Path("/tmp/bridge.mjs"), max_wait_seconds=300)
+    finally:
+        bridge.subprocess.run = original
+    assert result == {"status": "needs_review", "reason": "bridge-process-timeout"}
+
+
 def main():
     tests = [value for name, value in globals().items() if name.startswith("test_")]
     for test in sorted(tests, key=lambda item: item.__name__):

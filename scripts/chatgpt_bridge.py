@@ -10,6 +10,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+BRIDGE_PROCESS_GRACE_SECONDS = 30
+
+
 def _bridge_candidates() -> list[Path]:
     roots = []
     configured = os.environ.get("CODEX_HOME")
@@ -67,13 +70,17 @@ def run_bridge(
 ) -> dict:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("bridge prompt must not be empty")
-    completed = subprocess.run(
-        bridge_command(bridge, max_wait_seconds=max_wait_seconds),
-        input=prompt,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            bridge_command(bridge, max_wait_seconds=max_wait_seconds),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=max(int(max_wait_seconds) + BRIDGE_PROCESS_GRACE_SECONDS, BRIDGE_PROCESS_GRACE_SECONDS),
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "needs_review", "reason": "bridge-process-timeout"}
     try:
         result = _parse_stdout(completed.stdout)
     except Exception as exc:

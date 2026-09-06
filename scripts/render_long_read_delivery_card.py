@@ -14,7 +14,7 @@ def _url(value: str) -> str:
     return value
 
 
-def render_card(*, title: str, main_url: str, munger_url: str | None = None, failure_reason: str | None = None) -> dict:
+def render_card(*, title: str, main_url: str, munger_url: str | None = None, failure_reason: str | None = None, decision_score: float | None = None, munger_threshold: float = 8.5) -> dict:
     _url(main_url)
     if munger_url:
         _url(munger_url)
@@ -33,7 +33,13 @@ def render_card(*, title: str, main_url: str, munger_url: str | None = None, fai
         })
     elements = [{"tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px", "columns": columns}]
     if not success:
-        elements.append({"tag": "markdown", "content": f"ChatGPT 芒格洞察待复核：{failure_reason or '未生成'}"})
+        if failure_reason:
+            reason = failure_reason
+        elif decision_score is not None:
+            reason = f"综合决策分 {decision_score}，未达 ChatGPT 芒格门槛 {munger_threshold}（≥{munger_threshold} 才生成）"
+        else:
+            reason = "未生成"
+        elements.append({"tag": "markdown", "content": f"ChatGPT 芒格洞察待复核：{reason}"})
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "default", "summary": {"content": f"长文精读完成：{title}"}},
@@ -53,9 +59,11 @@ def main() -> int:
     parser.add_argument("--main-url", required=True)
     parser.add_argument("--munger-url")
     parser.add_argument("--failure-reason")
+    parser.add_argument("--decision-score", type=float)
+    parser.add_argument("--munger-threshold", type=float, default=8.5)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    rendered = json.dumps(render_card(title=args.title, main_url=args.main_url, munger_url=args.munger_url, failure_reason=args.failure_reason), ensure_ascii=False, indent=2) + "\n"
+    rendered = json.dumps(render_card(title=args.title, main_url=args.main_url, munger_url=args.munger_url, failure_reason=args.failure_reason, decision_score=args.decision_score, munger_threshold=args.munger_threshold), ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")

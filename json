@@ -1,0 +1,42 @@
+{
+  "query": "Anthropic AGI 竞赛 分水岭 一直在路上的Max",
+  "follow_up_questions": null,
+  "answer": null,
+  "images": [],
+  "results": [
+    {
+      "title": "OpenAI被Anthropic踹下王座，年亏400亿巨头输给了一个会“造血”的前员工-钛媒体官方网站",
+      "url": "https://www.tmtpost.com/7998860.html",
+      "content": "在基础设施的保障上，Anthropic同样构建了一个庞大的合作伙伴生态。它已深度绑定亚马逊的AWS云服务——亚马逊承诺未来向Anthropic投资50亿至250亿美元，而Anthropic将为此投入超过1000亿美元——同时，谷歌又承诺再投资400亿美元，微软也已通过Azure向Anthropic提供下一代AI芯片Maia 200。这种多源化供应布局，为它提供了极为稳定的算力支持。\n\n从根本上讲，Anthropic的打法是一次精准的对OpenAI“全都要式竞争”策略的系统性反击。\n\n当OpenAI同时追逐视频生成、硬件设备、AI电商等多条分散战线时，Anthropic始终用最简单、最专注的策略——All in B端、All in实际产出、All in工程效率——来回应。\n\n这场博弈的胜负最终验证了一个非常浅显却容易被忽略的道理：AI领域最终不是靠谁嗓门大、战线长赢下来的，而是靠谁能真正把技术“用”出真金白银。\n\n### 当盈利本身成为最深的分水岭 [...] ### 当盈利本身成为最深的分水岭\n\n2026年3月，Anthropic达成公司史上迄今最重要的一座里程碑。它在季度维度实现盈利——在全球头部AI企业均为“营收增长、亏损扩大”的大背景下，这家公司率先打破盈利困局，成为主流AI企业中较早实现季度盈利的代表。\n\n从行业角度看，这一里程碑的意义甚至比表面的数字更加深远。今天的市场环境充满了这样的企业——年营收几十亿、数百亿美元，但依然要靠在资本市场上不断融资才能活下去。\n\n投资者对AI的耐心开始接近极限，盈利能力和现金流正取代简单的用户数成为新的估值核心。\n\n市场数据证实了这一转向。Anthropic的企业采用率在从9%狂飙到34.4%时，OpenAI的份额同期几乎原地踏步。\n\n更让OpenAI管理层焦虑的是，即便奥特曼立刻推出“企业客户两个月免费Codex访问权”以挽留客户，免费午餐带来的效应也只能是暂时的。\n\n与盈利分水岭几乎同时到来的，还有企业客户对OpenAI品牌信心的严重侵蚀。外界最大的不安来自于OpenAI快速增长的巨额亏损：2026年将亏损140亿美元，2027年现金消耗将飙升至570亿美元。 [...] tmt_logo\n\n 推荐\n 快报\n 广场\n 科股宝VIP\n 视频\n 直播\n\ntmt_menu\n\n 媒体\n 企服\n 创投\n 咨询\n 活动\n 钛空时间\n 集团时光\n 公众号\n 清朗网络行动\n 写稿视频投稿App下载ENGLISH\n\n 钛媒体\n 链得得\n 钛空时间\n 消研所\n 钛媒体创投家\n\n 品牌服务\n 专家服务\n 政府服务\n\n 融资需求\n 申请报道\n 项目数据库\n\n 创投家CLUB投资机构库\n 机构数据库\n 行研报告\n\n 钛媒体钛媒体\n 链得得链得得\n ITValueITValue\n 钛空时间钛空时间\n 消研所消研所\n 钛极客钛极客\n\ntmt_logo资讯科股宝PRO视频直播FM\n\nsearch\n\n\n\n## OpenAI被Anthropic踹下王座，年亏400亿巨头输给了一个会“造血”的前员工\n\n2026.05.22 17:07\n\n · 来自广东\n\n00:00 / 20:47\n\nAGI\n\n> 文 | 影子备忘录\n\n不是那种渐进式的差距缩小，不是后起之秀靠“差不多能赶上”勉强上位，而是一场彻底、全面、从骨头里透出来的反转。",
+      "score": 0.47928494,
+      "raw_content": null,
+      "id": "28a8b7-00"
+    },
+    {
+      "title": "OpenAI 和 Anthropic “杀”红了眼，谷歌成为最大受害者-36氪",
+      "url": "https://www.36kr.com/p/3869734872634632",
+      "content": "在哈萨比斯看来，AGI 的道路不会只穿过文本模型，也不会只由代码生成能力决定。\n\n主持人问到，通向 AGI 的路径是否会通过当下这些文本模型，尤其是可能自我改进的模型实现；哈萨比斯并未给出肯定答案，而是强调 DeepMind 一直押注多条路线。\n\n这套路线包括 Gemini 这样的多模态基础模型，也包括代码能力、视频生成、图像生成、音乐生成，以及面向科学研究的模型。\n\n他认为，要构建真正完整的 AGI 系统，模型必须理解周围世界，不只是处理文本和逻辑，还要理解物理世界、视觉世界和现实环境。这一点对于机器人、智能眼镜助手、科学发现等方向尤其重要。\n\n这实际上是在回应外界对 OpenAI 和 Anthropic 的另一层想象：如果今天的前沿竞赛被理解成“文本大模型 + 编程智能体”的竞争，那么 Anthropic 和 OpenAI 的声量确实很强。但如果终点是通用智能，哈萨比斯认为，比赛远不止这一条赛道。 [...] 哈萨比斯没有把话说成一句简单的“谷歌一定会赢”。但他的意思很明确：如果 AGI 不是单一文本模型的胜利，而是一次关于智能系统、世界理解和科学发现能力的长期竞赛，那么谷歌 DeepMind 仍然认为，自己站在最有利的位置之一。\n\n参考链接：\n\n本文来自微信公众号 “AI前线”（ID：ai-front），作者：冬梅，36氪经授权发布。\n\n该文观点仅代表作者本人，36氪平台仅提供信息存储空间服务。\n\n+1\n\n57\n\n好文章，需要你的鼓励\n\nAI前线特邀作者\n\n23收  藏+10评  论\n\n打开微信“扫一扫”，打开网页后点击屏幕右上角分享按钮微  博\n\n沉浸阅读返回顶部\n\n举报\n\n参与评论\n\n评论千万条，友善第一条\n\n登录后参与讨论\n\n提交评论0/1000\n\n你可能也喜欢这些文章\n\n一枚戒指，估值千亿元\n\n人类，越来越难理解 AI\n\n突发，OpenAI彻底断供Cursor\n\nAnthropic盯上「训练芯片」？被爆曾想70亿美元收购AI芯片公司MatX\n\n硅谷最火的新岗位，划出了 AI 时代职场的斩杀线\n\nClaude开始训练Claude，4美元一小时，跑赢150美元人类研究员 [...] 这与 OpenAI、Anthropic 近期在模型能力上不断加速形成了一种微妙对照。Anthropic 以安全和对齐起家，但正在快速强化 coding 和企业场景；OpenAI 则继续围绕通用模型、产品入口和基础设施扩张。DeepMind 在哈萨比斯的表述中，则试图把自己重新放回“长期 AGI 路线”的位置：不是只追一时的应用热度，而是同时推进多模态、科学发现和世界模型。\n\n当然，这并不能消除谷歌眼下面临的压力。\n\n在 AI 人才战进入白热化之后，顶级研究员的离开不只是组织损失，也会影响资本市场和外界信心。Noam Shazeer 和 John Jumper 这样的名字，本身就带有极强的信号意义。外界关心的不是谷歌是否还有人才，而是这些最能代表谷歌 AI 黄金时代的人，为什么正在被 OpenAI 和 Anthropic 吸走。\n\n哈萨比斯的回应，本质上是把问题从“谁走了”拉回到“谁拥有更完整的 AGI 路线”。他承认竞争异常激烈，但坚持认为，Google DeepMind 仍然有最深、最广的人才储备，仍然在输出前沿工作，也仍然押注比文本模型更长期的多模态和科学智能路线。",
+      "score": 0.44463772,
+      "raw_content": null,
+      "id": "1d7ab2-01"
+    },
+    {
+      "title": "OpenAI Declares “AGI Era” With Astra Launch. Anthropic’s Fable 5.1 More Than Doubled Its Predecessor’s Science Score. MSFT and AMZN Both Win, but One Has A Slight Edge",
+      "url": "https://finance.yahoo.com/technology/ai/articles/openai-declares-agi-era-astra-041130711.html",
+      "content": "Amazon.com, Inc. (NASDAQ:AMZN) has built an equally serious two-lab strategy. Anthropic still names AWS as its primary cloud and training provider and has committed to spend more than $100 billion on AWS technologies over ten years while securing up to five gigawatts of capacity, including Trainium chips. AMZN invested another $5 billion in Anthropic and could invest up to $20 billion more if milestones are met.\n\nStory Continues [...] All in all, that leaves two legitimate winners. Amazon may have the stronger pure infrastructure case through AWS, Trainium, and contracted demand from both labs. Microsoft gets the narrower edge because it can monetize frontier AI further above the infrastructure layer through OpenAI licensing and revenue-sharing rights and direct distribution across its enterprise software ecosystem. [...] Image 5: OpenAI Declares \"AGI Era\" With Astra Launch. Anthropic's Fable 5.1 More Than Doubled Its Predecessor's Science Score. MSFT and AMZN Both Win, but One Has A Slight Edge\n\nOpenAI Declares “AGI Era” With Astra Launch. Anthropic’s Fable 5.1 More Than Doubled Its Predecessor’s Science Score. MSFT and AMZN Both Win, but One Has A Slight Edge",
+      "score": 0.29498664,
+      "raw_content": null,
+      "id": "7aa64a-02"
+    },
+    {
+      "title": "Anthropic",
+      "url": "https://en.wikipedia.org/wiki/Anthropic",
+      "content": "46. ↑ Metz, Rachel (May 8, 2026). \"Anthropic Inks $1.8 Billion Computing Deal With Akamai\". Bloomberg.\n47. ↑ Ross Sorkin, Andrew; Warner, Bernhard; Kessler, Sarah; de la Merced, Michael J.; Gallogly, Niko; O'Keefe, Brian; Mount, Ian (May 21, 2026). \"The A.I. Race to Go Public\". The New York Times.\n48. 1 2 Primack, Dan (June 1, 2026). \"Anthropic files for its IPO\". Axios. Retrieved June 2, 2026.\n49. ↑ \"Claude Mythos\". www.anthropic.com. Retrieved August 18, 2026. [...] 43. ↑ \"Anthropic and SpaceX announce major partnership as AI arms race continues\". NBC News. May 6, 2026. Retrieved May 9, 2026.\n44. ↑ Dastin, Jeffrey; Soni, Aditya (May 6, 2026). \"Anthropic strikes SpaceX data center deal as it plows ahead on AI coding\". Reuters.\n45. ↑ Korosec, Kirsten (May 18, 2026). \"Anthropic has acquired the dev tools startup used by OpenAI, Google, and Cloudflare\". TechCrunch. Retrieved June 4, 2026. [...] at a post-money valuation of $183 billion. The round was co-led by Iconiq Capital, Fidelity Management & Research, and Lightspeed Venture Partners, with participation by the Qatar Investment Authority and other investors. On 31 December 2025, it was confirmed that Anthropic had signed a term sheet for a $10 billion funding round led by Coatue and GIC \"GIC (sovereign wealth fund)\"), at a $350 billion valuation. On February 12, 2026, Anthropic announced that it had raised $30 billion in a Series",
+      "score": 0.20481901,
+      "raw_content": null,
+      "id": "103a41-03"
+    }
+  ],
+  "response_time": 1.49,
+  "request_id": "9abf989e-6f31-4a70-841b-1ec4ce55d60c"
+}

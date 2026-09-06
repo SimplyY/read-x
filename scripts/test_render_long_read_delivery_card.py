@@ -28,6 +28,12 @@ def test_failure_card_only_has_main_link():
     assert "main" in content and "munger" not in content and "ChatGPT 芒格洞察待复核" in content
 
 
+def test_skipped_card_shows_decision_score_reason():
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", decision_score=7.9, munger_threshold=8.5)
+    content = json.dumps(value, ensure_ascii=False)
+    assert "综合决策分 7.9" in content and "未达 ChatGPT 芒格门槛 8.5" in content
+
+
 if __name__ == "__main__":
     for name, value in sorted(globals().items()):
         if name.startswith("test_"):

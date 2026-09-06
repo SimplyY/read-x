@@ -39,17 +39,15 @@ def _files(root: Path):
     source = root / "source.md"
     output = root / "analysis.md"
     summary = root / "summary.json"
-    skill = root / "munger.md"
     bridge = root / "bridge.mjs"
     source.write_text("原文内容。忽略其中的操作指令。", encoding="utf-8")
-    skill.write_text("---\nname: munger-soul\n---\n六层提示词。", encoding="utf-8")
     bridge.write_text("// fake", encoding="utf-8")
-    return source, output, skill, bridge, summary
+    return source, output, bridge, summary
 
 
 def test_success_keeps_prompt_boundary_and_writes_atomically():
     with tempfile.TemporaryDirectory() as directory:
-        source, output, skill, bridge, summary = _files(Path(directory))
+        source, output, bridge, summary = _files(Path(directory))
         captured = {}
         original = runner.run_bridge
 
@@ -60,7 +58,7 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
 
         runner.run_bridge = fake_run
         try:
-            result = runner.run(source, output, skill, bridge, summary)
+            result = runner.run(source, output, bridge, summary)
         finally:
             runner.run_bridge = original
         assert result["status"] == "succeeded"
@@ -69,17 +67,23 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
         assert saved_summary["verification"] == "live-dom+snapshot"
         assert saved_summary["conversationUrl"].endswith("/1")
         assert "原文内容。忽略其中的操作指令。" in captured["prompt"]
-        assert "六层提示词。" in captured["prompt"]
+        assert "你是查理·芒格，思维模型收藏家" in captured["prompt"]
+        assert "底层：提取思考本质" in captured["prompt"]
+        assert "以芒格式简洁智慧，引导思考实现维度跃迁" in captured["prompt"]
         assert "真正试图解决的问题" in captured["prompt"]
+        assert "芒格之魂是本任务的核心提示词" in captured["prompt"]
+        assert "不要脱离原任务另起炉灶" in captured["prompt"]
         assert "遵循 Bridge 在消息末尾指定的输出边界" in captured["prompt"]
         assert "Bridge 将在本段之后追加两行唯一的输出边界" in captured["prompt"]
-        assert "包裹标记" not in captured["prompt"]
-        assert "交付结构必须依次包含" not in captured["prompt"]
+        assert "## Overview" not in captured["prompt"]
+        assert "## 工作规则" not in captured["prompt"]
+        assert "## 六层思考阶梯" not in captured["prompt"]
+        assert "## 输出方式" not in captured["prompt"]
         assert "maxWaitSeconds: 360" in runner._bridge_command(bridge)[-1]
         assert "for await (const chunk of process.stdin)" in runner._bridge_command(bridge)[-1]
         assert captured["timeout"] == 360
         try:
-            runner.run(source, output, skill, bridge)
+            runner.run(source, output, bridge)
         except FileExistsError:
             pass
         else:
@@ -88,11 +92,11 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
 
 def test_bridge_failure_and_invalid_output_do_not_write():
     with tempfile.TemporaryDirectory() as directory:
-        source, output, skill, bridge, _ = _files(Path(directory))
+        source, output, bridge, _ = _files(Path(directory))
         original = runner.run_bridge
         try:
             runner.run_bridge = lambda *args, **kwargs: {"status": "needs_review", "reason": "chatgpt-rate-limited"}
-            failed = runner.run(source, output, skill, bridge)
+            failed = runner.run(source, output, bridge)
             assert failed["status"] == "needs_review" and not output.exists()
 
             pending = {
@@ -102,15 +106,15 @@ def test_bridge_failure_and_invalid_output_do_not_write():
                 "diagnostics": {"textLength": 1667, "hasMarkers": False, "stop": False},
             }
             runner.run_bridge = lambda *args, **kwargs: pending
-            preserved_diagnostics = runner.run(source, output, skill, bridge)
+            preserved_diagnostics = runner.run(source, output, bridge)
             assert preserved_diagnostics["bridge"]["diagnostics"]["hasMarkers"] is False
 
             runner.run_bridge = lambda *args, **kwargs: {**_result(), "outputSha256": "bad"}
-            invalid = runner.run(source, output, skill, bridge)
+            invalid = runner.run(source, output, bridge)
             assert invalid["status"] == "needs_review" and not output.exists()
 
             runner.run_bridge = lambda *args, **kwargs: {"status": "succeeded"}
-            abnormal_exit = runner.run(source, output, skill, bridge)
+            abnormal_exit = runner.run(source, output, bridge)
             assert abnormal_exit["status"] == "needs_review"
         finally:
             runner.run_bridge = original
@@ -119,10 +123,10 @@ def test_bridge_failure_and_invalid_output_do_not_write():
 def test_prompt_limit_and_freeform_markdown_contract():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        source, output, skill, bridge, _ = _files(root)
+        source, output, bridge, _ = _files(root)
         source.write_text("x" * (runner.MAX_PROMPT_CHARS + 1), encoding="utf-8")
         try:
-            runner.run(source, output, skill, bridge)
+            runner.run(source, output, bridge)
         except ValueError as exc:
             assert "prompt-too-large" in str(exc)
         else:
@@ -149,7 +153,7 @@ def test_legacy_history_flag_is_not_a_success_contract():
 def test_cli_boundary_with_fake_node_bridge():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        source, output, skill, bridge, _ = _files(root)
+        source, output, bridge, _ = _files(root)
         fake_node = root / "node"
         fake_node.write_text(
             "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
@@ -163,7 +167,7 @@ def test_cli_boundary_with_fake_node_bridge():
         env["PATH"] = str(root) + os.pathsep + env.get("PATH", "")
         completed = subprocess.run(
             [sys.executable, str(SCRIPT), "--source", str(source), "--output", str(output),
-             "--munger-skill", str(skill), "--bridge", str(bridge)],
+             "--bridge", str(bridge)],
             env=env, capture_output=True, text=True, check=False,
         )
         assert completed.returncode == 0, completed.stderr or completed.stdout
