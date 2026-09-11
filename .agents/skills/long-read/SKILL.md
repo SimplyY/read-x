@@ -84,16 +84,17 @@ python3 .agents/skills/long-read/scripts/run_isolated_analyses.py \
 
 顺序固定：
 
-1. 评分表：`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
-2. 原文金句 + 原文链接（紧跟评分表，作为溯源入口的独立段落）；
-3. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
-4. 文章真正的核心；
-5. 基石 / 边缘 / 暗流；
-6. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
-7. 与作者对话；
-8. 最值得深读之处；
-9. 附录：独立深度分析；
-10. 必要事实（若有，文末）。
+1. 原文链接（紧跟 `<title>`，独立段落，作为溯源入口）；
+2. 评分表：`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
+3. 原文金句（紧跟评分表，作为溯源入口）；
+4. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
+5. 文章真正的核心；
+6. 基石 / 边缘 / 暗流；
+7. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
+8. 与作者对话；
+9. 最值得深读之处；
+10. 附录：独立深度分析；
+11. 必要事实（若有，文末）。
 
 不输出「骨架」章节，不再输出独立的「X 光四层」。普通文章最多 5 条原文金句；确有足够密度时最多 8 条；允许更少，禁止凑数。
 原文为英文时，用户可见的金句以中文译文为主展示并遵守信达雅（忠实原意、通顺自然、文采得体），英文原句紧随其后作溯源附注，格式「译文（原文：English original）」；Evidence 层仍保留逐字英文原文供 `validate_output.py` 校验，翻译只作用于成品展示，不改变证据层。

@@ -180,6 +180,25 @@ def check_document_xml(xml_text):
     if not children or children[0].tag != "title":
         findings.append("document root must begin with <title>")
     document_title = visible_text(children[0]) if children and children[0].tag == "title" else ""
+
+    # original link must sit right after <title>, before the first main heading
+    first_heading = next(
+        (i for i, node in enumerate(children) if node.tag in {"h1", "h2", "h3"}),
+        len(children),
+    )
+    link_found = False
+    for node in children[1:first_heading]:
+        if node.tag != "p":
+            continue
+        for anchor in node.iter("a"):
+            href = anchor.attrib.get("href", "")
+            if href.startswith(("http://", "https://")):
+                link_found = True
+                break
+        if link_found:
+            break
+    if not link_found:
+        findings.append("document must keep the original link right after <title>")
     headings = [
         (i, node.tag, visible_text(node).replace(" ", ""))
         for i, node in enumerate(children)
@@ -312,7 +331,7 @@ def self_check():
 
     # document layout pass
     good_doc = (
-        '<title>t</title><h1>评分</h1>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<table><tbody><tr><td>x</td></tr></tbody></table>'
         '<callout background-color="light-yellow"><p>sharp</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1>'
@@ -338,7 +357,7 @@ def self_check():
     cases.append(("pass: three research questions", f == [], f))
 
     exact_300_doc = (
-        '<title>t</title><h1>评分</h1><callout background-color="light-yellow"><p>one</p></callout>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1><callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 291) + '</li></ul>'
         '<h1>与作者对话</h1>')
@@ -357,6 +376,11 @@ def self_check():
     f = check_document_xml(bad_doc)
     cases.append(("fail: invalid document layout", len(f) >= 1, f))
 
+    no_link_doc = good_doc.replace(
+        '<p>溯源：<a href="https://example.com/x">查看原文</a></p>', '')
+    f = check_document_xml(no_link_doc)
+    cases.append(("fail: missing original link", any("original link" in item for item in f), f))
+
     duplicate_title_doc = good_doc.replace('<h1>评分</h1>', '<h1>t</h1><h1>评分</h1>')
     f = check_document_xml(duplicate_title_doc)
     cases.append(("fail: duplicate document title", any("repeated" in item for item in f), f))
@@ -374,7 +398,7 @@ def self_check():
     cases.append(("fail: inline research context", any("h2 问题" in item for item in f), f))
 
     too_long_research = (
-        '<title>t</title><h1>评分</h1>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>这个问题足够长吗？</li><li>另一个问题是什么？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 280) + '</li><li>补充。</li></ul>'
@@ -383,7 +407,7 @@ def self_check():
     cases.append(("fail: research questions over 300 chars", len(f) == 1, f))
 
     wrong_order = (
-        '<title>t</title><h1>评分</h1>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'
@@ -392,7 +416,7 @@ def self_check():
     cases.append(("fail: research questions wrong order", len(f) == 2, f))
 
     missing_research = (
-        '<title>t</title><h1>评分</h1>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
     f = check_document_xml(missing_research)
@@ -411,7 +435,7 @@ def self_check():
     cases.append(("fail: four research questions", len(f) == 1, f))
 
     too_many_doc_quotes = (
-        '<title>t</title><h1>评分</h1>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<callout background-color="light-yellow"><p>one</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'

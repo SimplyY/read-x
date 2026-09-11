@@ -1586,8 +1586,8 @@ def test_relevance_generator_rejects_non_finite_scores():
             raise AssertionError("invalid relevance score must fail closed")
 
 
-def _identity_observation(levels=("wikipedia",), *, entity="confirmed", topic="strong", suggested=None, tool="ok"):
-    results = [{"url": f"https://example.com/{level}", "title": "Bill Gates profile", "source_level": level, "evidence_kind": "expertise", "excerpt": "公开身份与技术背景"} for level in levels]
+def _identity_observation(levels=("wikipedia",), *, entity="confirmed", topic="strong", suggested=None, tool="ok", label="Bill Gates"):
+    results = [{"url": f"https://example.com/{level}", "title": f"{label} profile", "source_level": level, "evidence_kind": "expertise", "excerpt": f"{label} 的公开身份与技术背景"} for level in levels]
     assessment = {"entity_match": entity, "topic_match": topic, "basis": "实体与 AI 主题匹配"}
     if suggested is not None:
         assessment["suggested_score"] = suggested
@@ -1629,8 +1629,11 @@ def test_mixed_script_public_account_is_preserved_for_authority_search():
 
 def test_authority_source_mapping_and_inferred_cap():
     identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
-    assert authority_checker.resolve_identity(identity, _identity_observation(("baidu",))) ["authority_score"] is None
-    assert authority_checker.resolve_identity(identity, _identity_observation(("baidu", "reputable_secondary")))["authority_status"] == "corroborated"
+    baidu_only = authority_checker.resolve_identity(identity, _identity_observation(("baidu",)))
+    assert baidu_only["authority_status"] == "verified" and baidu_only["authority_score"] == 7.0
+    assert baidu_only["reason_code"] == "baidu_entity_verified"
+    baidu_weak_topic = authority_checker.resolve_identity(identity, _identity_observation(("baidu", "reputable_secondary"), topic="weak"))
+    assert baidu_weak_topic["authority_status"] == "corroborated" and baidu_weak_topic["authority_score"] == 7.0
     inferred = authority_checker.resolve_identity(identity, _identity_observation((), suggested=10))
     assert inferred["authority_status"] == "inferred" and inferred["authority_score"] == 8.0 and inferred["authority_confidence"] == "low"
     no_evidence = authority_checker.resolve_identity(identity, _identity_observation((), entity="unknown", topic="unknown", suggested=0))
@@ -1638,6 +1641,16 @@ def test_authority_source_mapping_and_inferred_cap():
     assert no_evidence["reason_code"] == "insufficient_authority_evidence"
     mismatch = authority_checker.resolve_identity(identity, _identity_observation(entity="ambiguous"))
     assert mismatch["authority_score"] is None and mismatch["authority_status"] == "mismatch"
+
+
+def test_baidu_single_source_verifies_well_known_person():
+    source = "# 林毅夫：人工智能时代的关键品质与中国路径\n> 公众号: 林毅夫\n---\n正文只用于抓取，不进入身份包。\n"
+    packet = identity_builder.build_identity(source, {"detected_domain": {"primary": "AI/技术", "secondary": "社会影响"}})
+    assert [item["name"] for item in packet["entities"]] == ["林毅夫"]
+    result = authority_checker.resolve_identity(packet, _identity_observation(("baidu",), label="林毅夫"))
+    assert result["authority_status"] == "verified" and result["authority_score"] == 7.0
+    assert result["reason_code"] == "baidu_entity_verified"
+    assert result["authority_confidence"] == "medium"
 
 
 def test_knowledge_authority_generator_is_bounded_and_model_fixed():

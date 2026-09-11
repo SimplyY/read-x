@@ -280,6 +280,9 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
         status, score, reason = "verified", 8.0, "entity_expertise_topic_verified"
         if "official" in levels and len([item for item in evidence if item["source_level"] != "search_snippet"]) >= 2:
             score, reason = 9.0, "entity_expertise_topic_corroborated"
+    elif strong and "baidu" in levels:
+        # 百度百科单源已足够核验知名实体（实体确认 + 主题强相关）：百度百科能搜到的人权威性明显较高
+        status, score, reason = "verified", 7.0, "baidu_entity_verified"
     elif "baidu" in levels and ("official" in levels or "reputable_secondary" in levels):
         status, score, reason = "corroborated", 7.0, "baidu_corroborated"
     elif strong and len([item for item in evidence if item["source_level"] == "reputable_secondary"]) >= 2:

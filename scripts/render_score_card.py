@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -111,6 +113,15 @@ def _status_notes(result: dict) -> str:
     notes = []
     interest = result.get("interest_score")
     relevance_info = result.get("relevance_dimensions") or {}
+    refresh = relevance_info.get("context_refresh")
+    if isinstance(refresh, str):
+        match = re.search(r"\d{4}-\d{2}-\d{2}", refresh)
+        if match:
+            try:
+                if (date.today() - date.fromisoformat(match.group(0))).days > 8:
+                    notes.append(f"相关性基于 {match.group(0)} 的旧版核心上下文（超过 8 天新鲜窗口），按旧版偏好评分")
+            except ValueError:
+                pass
     if isinstance(interest, (int, float)) and not isinstance(interest, bool) and float(interest) == 0:
         reason = "未命中受限上下文明确列出的领域兴趣"
         rationale = _compact(relevance_info.get("rationale"))

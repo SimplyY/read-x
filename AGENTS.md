@@ -99,8 +99,9 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 精读文档结论先行，使用 Docx XML 原生排版，评分不得埋在文末。
 
-- 顶部：评分表（`quality_score + quality_label`、`importance_score`、权威性状态/分数、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
-- 原文金句 + 原文链接（紧跟评分表，作为溯源入口）
+- 顶部（紧跟 `<title>`）：原文链接（独立段落，作为溯源入口）
+- 评分表（`quality_score + quality_label`、`importance_score`、权威性状态/分数、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
+- 原文金句（紧跟评分表，作为溯源入口）
 - 全文唯一 `light-yellow` 核心结论高亮块
 - 正文根 `<title>` 只保留文章标题；第一个主章节必须是一级标题 `评分`，其余主章节也使用一级标题，附录内文字 Skill 边界使用二级标题
 - 主文：真正的核心 → 基石/边缘/暗流 → 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字）→ 与作者对话 → 最值得深读之处

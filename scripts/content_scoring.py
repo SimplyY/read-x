@@ -552,6 +552,8 @@ def _relevance_result(output, context_text: str | None):
         "matched_interests": output.get("matched_interests", []),
         "rationale": output.get("rationale"),
     }
+    if output.get("context_refresh"):
+        info["context_refresh"] = str(output["context_refresh"])
     return rel_bonus, int_bonus, confidence, info, []
 
 

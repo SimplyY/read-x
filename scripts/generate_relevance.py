@@ -204,6 +204,7 @@ def main() -> int:
     result = call_model(prompt, relevance_schema(), "relevance_scoring", 4000, args.timeout)
     ordered = {"schema_version": RELEVANCE_VERSION}
     ordered.update(result)
+    ordered["context_refresh"] = refresh_date
     args.output.write_text(json.dumps(ordered, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     return 0
 
