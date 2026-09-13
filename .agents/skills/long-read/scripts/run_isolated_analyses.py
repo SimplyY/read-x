@@ -268,7 +268,7 @@ def call_task(
             break
         attempts = attempt
         try:
-            result = _call_once(task, source, evidence, endpoint, remaining / (RETRY_ATTEMPTS - attempt + 1), max_output_tokens, model=model)
+            result = _call_once(task, source, evidence, endpoint, remaining, max_output_tokens, model=model)
             result["attempts"] = attempt
             result["model"] = model
             return result

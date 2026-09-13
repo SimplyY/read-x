@@ -742,6 +742,54 @@ def test_model_retries_share_one_total_deadline():
         assert len(calls) == 1 and calls[0] <= 0.01
 
 
+def test_model_first_attempt_keeps_full_budget_for_slow_generation():
+    for module in (quality_generator, relevance_generator):
+        original_call = module._call_once
+        original_backoff = module.RETRY_BACKOFF_SECONDS
+        timeouts = []
+
+        def fail_once_then_succeed(*args, **kwargs):
+            timeouts.append(kwargs.get("timeout", args[4]))
+            if len(timeouts) == 1:
+                raise RuntimeError("transient upstream failure")
+            return {"ok": True}
+
+        module._call_once = fail_once_then_succeed
+        module.RETRY_BACKOFF_SECONDS = 0
+        try:
+            assert module.call_model("input", {}, "probe", 10, 0.3) == {"ok": True}
+        finally:
+            module._call_once = original_call
+            module.RETRY_BACKOFF_SECONDS = original_backoff
+        assert len(timeouts) == 2
+        assert timeouts[0] > 0.25
+        assert timeouts[1] > 0.25
+
+
+def test_authority_first_attempt_keeps_full_budget_for_slow_generation():
+    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    original_call = authority_generator._call_once
+    original_backoff = authority_generator.RETRY_BACKOFF_SECONDS
+    timeouts = []
+
+    def fail_once_then_succeed(identity_packet, timeout, attempt):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            raise RuntimeError("transient upstream failure")
+        return {"entity_match": "confirmed", "topic_match": "strong", "suggested_score": 8.0, "basis": "公开常识"}
+
+    authority_generator._call_once = fail_once_then_succeed
+    authority_generator.RETRY_BACKOFF_SECONDS = 0
+    try:
+        assert authority_generator.infer(identity, 0.3)["tool_status"] == "ok"
+    finally:
+        authority_generator._call_once = original_call
+        authority_generator.RETRY_BACKOFF_SECONDS = original_backoff
+    assert len(timeouts) == 2
+    assert timeouts[0] > 0.25
+    assert timeouts[1] > 0.25
+
+
 def test_model_retries_keep_one_fixed_model_and_use_remaining_budget():
     for module in (quality_generator, relevance_generator):
         original_call = module._call_once

@@ -81,7 +81,7 @@ def call_model(input_text: str, schema: dict, name: str, max_output_tokens: int,
             break
         model = MODEL_CANDIDATES[min(attempt - 1, len(MODEL_CANDIDATES) - 1)]
         next_model = MODEL_CANDIDATES[min(attempt, len(MODEL_CANDIDATES) - 1)]
-        attempt_timeout = remaining / (RETRY_ATTEMPTS - attempt + 1)
+        attempt_timeout = remaining
         try:
             return _call_once(input_text, schema, name, max_output_tokens, attempt_timeout, attempt, model=model)
         except (urllib.error.URLError, socket.timeout, RuntimeError) as exc:

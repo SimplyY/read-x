@@ -230,6 +230,35 @@ def test_retry_budget_is_total_per_task():
         assert len(calls) == 1 and calls[0] <= 0.01
 
 
+def test_first_attempt_keeps_full_budget_for_slow_generation():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        original_backoff = runner.RETRY_BACKOFF_SECONDS
+        timeouts = []
+
+        def fail_once_then_succeed(*args, **kwargs):
+            timeouts.append(args[4])
+            if len(timeouts) == 1:
+                raise RuntimeError("transient upstream failure")
+            return {"task": task.name, "status": "completed"}
+
+        runner._call_once = fail_once_then_succeed
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 0.3, 1)
+        finally:
+            runner._call_once = original
+            runner.RETRY_BACKOFF_SECONDS = original_backoff
+        assert result["status"] == "completed"
+        assert len(timeouts) == 2
+        assert timeouts[0] > 0.25
+        assert timeouts[1] > 0.25
+
+
 def test_model_retries_keep_one_fixed_model_after_failure():
     with tempfile.TemporaryDirectory() as directory:
         task = runner.AnalysisTask(

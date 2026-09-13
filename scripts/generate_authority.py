@@ -93,7 +93,7 @@ def infer(identity: dict, timeout: float) -> dict:
         if remaining <= 0:
             break
         try:
-            assessment = _call_once(identity, remaining / (RETRY_ATTEMPTS - attempt + 1), attempt)
+            assessment = _call_once(identity, remaining, attempt)
             assessment.pop("model", None)
             assessment.pop("elapsed_ms", None)
             assessment.pop("attempt", None)
