@@ -901,6 +901,37 @@ def test_card_explains_zero_interest_and_unmatched_authority():
     assert "已尝试从来源标题、作者和发布机构提取身份" in payload
 
 
+def test_unmatched_authority_does_not_echo_positive_search_basis():
+    identity = {
+        "schema_version": "1",
+        "title": "标题",
+        "author": "作者",
+        "publisher": "",
+        "source_url": "https://example.com/source",
+        "entities": [{"type": "organization", "name": "未匹配实体", "aliases": []}],
+        "event_hint": "标题",
+        "topic": {"primary": "技术", "secondary": ""},
+        "source_candidates": [],
+    }
+    observation = {
+        "schema_version": "1",
+        "provider": "agent-web",
+        "tool_status": "ok",
+        "queries": [{"hash": "sha256:" + "a" * 64, "kind": "title"}],
+        "results": [{
+            "url": "https://example.com/result",
+            "title": "三条独立公开来源交叉确认",
+            "source_level": "reputable_secondary",
+            "evidence_kind": "event",
+            "excerpt": "三条独立公开来源交叉确认目标事件",
+        }],
+        "assessment": {"entity_match": "confirmed", "topic_match": "strong", "basis": "三条独立公开来源交叉确认"},
+    }
+    resolved = authority_checker.resolve_identity(identity, observation)
+    assert resolved["authority_status"] == "mismatch"
+    assert "交叉确认" not in resolved["rationale"]
+
+
 def test_non_scored_card_explains_failure_and_next_step():
     incomplete = cs.score(quality(source_status="partial"), SOURCE)
     payload = json.dumps(card.render_card(incomplete, title="标题", author="", date="", url="https://example.com", score_only=True), ensure_ascii=False)

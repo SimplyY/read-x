@@ -296,6 +296,9 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
         else:
             status, score, reason = "mismatch", None, "insufficient_authority_evidence"
     evidence = [dict(item, verified=status in {"verified", "corroborated"} and item["source_level"] != "search_snippet") for item in evidence]
+    # A non-success result must not repeat a positive search assessment;
+    # otherwise a mismatch card can read like verified evidence.
+    rationale_basis = assessment.get("basis", "") if status in {"verified", "corroborated", "inferred"} else ""
     return {
         "schema_version": SCORE_VERSION, "authority_score": score, "authority_status": status,
         "authority_confidence": "high" if status == "verified" and score == 9.0 else "medium" if status in {"verified", "corroborated"} else "low" if status == "inferred" else "partial",
@@ -303,7 +306,7 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
         "entity": {"type": identity["entities"][0]["type"], "canonical": identity["entities"][0]["name"], "ambiguity": entity_match != "confirmed"} if identity["entities"] else None,
         "topic_match": topic_match, "evidence": evidence, "reason_code": reason,
         "attempts": attempts, "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "rationale": "；".join(filter(None, [assessment.get("basis", ""), reason])),
+        "rationale": "；".join(filter(None, [rationale_basis, reason])),
         "search_observation": {"query_count": len(observation.get("queries", [])), "result_count": len(evidence), "tool_status": observation.get("tool_status")},
     }
 
