@@ -83,7 +83,7 @@ lark-cli docs +create \
 
 创建前必须读取当前 CLI 内置的 `lark-doc` XML、style、create workflow。开发验证使用 `--dry-run`，不得创建测试文档。
 
-文档成功后按 link-card 流程构建并校验 CardKit JSON，再执行：
+文档成功后必须用 link-card 生成的 `<run_dir>/score-gate.json` 和同一轮 `<run_dir>/scoring-result.json` 生成并校验交付卡 JSON，再执行：
 
 ```bash
 # 群聊场景私聊触发者

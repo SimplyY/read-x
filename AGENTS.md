@@ -42,6 +42,8 @@ link-card 流程：
 
 **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
 
+**评分卡凭据门（硬性）**：评分卡必须由 `send_score_card.py` 发送并生成 `<run_dir>/score-gate.json`；long-read 交付卡必须传该凭据和本轮 `scoring-result.json` 给渲染器，hash 不匹配或校验失败即失败关闭，不得手工造凭据。
+
 `scoring_result` 原样传给 long-read。任何消费者不得复制阈值、重算路由、把相关性混称为质量或自行触发模型。完整规则见 `.agents/skills/content-scoring/SKILL.md`。
 
 ### `route=long_read` → long-read 全流程
@@ -147,6 +149,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] `chatgpt_munger_doc=true`：ChatGPT Bridge 后处理成功后创建第二篇芒格洞察文档，与主文档共用一张交付卡；失败关闭且主文档仍交付
 - [ ] ChatGPT Bridge 输出经 `live-dom+snapshot`、会话 URL 和 hash 验证为规范 Markdown，再创建第二篇文档
 - [ ] 交付卡由渲染脚本生成，读回内容没有字面量 `\\n`
+- [ ] 评分卡凭据已生成并在交付卡渲染器中校验通过
 - [ ] 中低质量：摘要已生成
 - [ ] 卡片 JSON 格式正确（schema 2.0，markdown 标签）
 - [ ] 卡片以 `--as bot` 发送

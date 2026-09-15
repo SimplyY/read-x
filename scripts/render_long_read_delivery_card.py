@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def _load_score_evidence(path: Path, scoring_result: Path) -> dict:
+    evidence = json.loads(path.read_text(encoding="utf-8"))
+    message_id = evidence.get("message_id")
+    result_hash = evidence.get("scoring_result_sha256")
+    valid = (
+        evidence.get("schema_version") == "1"
+        and isinstance(message_id, str)
+        and message_id.startswith("om_")
+        and evidence.get("sent_at_command") is True
+        and isinstance(result_hash, str)
+        and len(result_hash) == 64
+    )
+    if not valid:
+        raise ValueError("score evidence is missing or invalid")
+    actual_hash = hashlib.sha256(scoring_result.read_bytes()).hexdigest()
+    if result_hash != actual_hash:
+        raise ValueError("score evidence does not match scoring result")
+    return evidence
 
 
 def _url(value: str) -> str:
@@ -61,8 +82,11 @@ def main() -> int:
     parser.add_argument("--failure-reason")
     parser.add_argument("--decision-score", type=float)
     parser.add_argument("--munger-threshold", type=float, default=8.5)
+    parser.add_argument("--score-evidence", type=Path, required=True)
+    parser.add_argument("--scoring-result", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    _load_score_evidence(args.score_evidence, args.scoring_result)
     rendered = json.dumps(render_card(title=args.title, main_url=args.main_url, munger_url=args.munger_url, failure_reason=args.failure_reason, decision_score=args.decision_score, munger_threshold=args.munger_threshold), ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

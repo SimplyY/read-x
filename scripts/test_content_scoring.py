@@ -632,7 +632,7 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "scripts/prepare_scoring_run.py <URL>" in skill
     assert "禁止在模型中自行 `mktemp`" in skill and "重建标题路径" in skill
     assert "主张、引用、枚举、三维输出和 JSON 自检只遵循 `quality-runtime.md`" in skill
-    assert "渲染器退出码为 0 即视为卡片结构验证通过" in skill
+    assert "wrapper 退出码为 0 且写出 `score-gate.json` 才视为发送成功" in skill
     assert "/Users/yuwei/code/read-x/scripts/content_scoring.py" in skill
     assert "quality-runtime.md" in skill and "禁止把完整 content-scoring Skill" in skill
     assert "blind-source.md" in skill and "禁止回退主上下文、启动子 Agent 或嵌套 `codex exec`" in skill
@@ -645,9 +645,9 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "score_status_value=$(jq -r '.score_status'" in skill and "status=$(jq" not in skill
     assert "临时目录交给系统回收" in skill
     assert "不手算权重" in skill
-    assert "scripts/render_score_card.py" in skill
+    assert "scripts/send_score_card.py" in skill
     assert "禁止手写卡片 JSON" in skill
-    assert "--output <run_dir>/score-card.json" in skill
+    assert "--evidence-output <run_dir>/score-gate.json" in skill
     assert "三维数值语义一次发送" in scoring_skill and "直接返回证据、洞察、迁移三维等级" in scoring_skill
     assert "既有本地 MoonBridge" in scoring_skill and "脚本不传推理覆盖" in scoring_skill
     assert "不得退回主上下文评分" in scoring_skill

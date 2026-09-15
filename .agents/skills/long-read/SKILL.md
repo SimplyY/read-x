@@ -105,7 +105,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
 1. 生成 `.wx_doc.xml` 后先运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。若 `chatgpt_munger_doc=true` 且后处理成功，再用 `markdown_to_feishu_xml.py` 创建独立的芒格洞察 Docx XML；
-2. 用 `scripts/render_long_read_delivery_card.py` 生成并校验唯一 Card 2.0 交付卡。成功时同时放主文档和芒格文档链接；ChatGPT Bridge 或第二篇文档失败时只放主文档链接并注明待复核；`chatgpt_munger_doc=false`（未达 `chatgpt_munger_threshold`）时，把 `--decision-score` 与 `--munger-threshold`（取运行级 Base 快照值，缺失时 8.5）一并传入，让卡片显示「综合决策分 X.X，未达 ChatGPT 芒格门槛 Y.Y」而不是裸「未生成」。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
+2. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。成功时同时放主文档和芒格文档链接；ChatGPT Bridge 或第二篇文档失败时只放主文档链接并注明待复核；`chatgpt_munger_doc=false`（未达 `chatgpt_munger_threshold`）时，把 `--decision-score` 与 `--munger-threshold`（取运行级 Base 快照值，缺失时 8.5）一并传入，让卡片显示「综合决策分 X.X，未达 ChatGPT 芒格门槛 Y.Y」而不是裸「未生成」。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
 3. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
    ```bash
@@ -139,6 +139,7 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 - [ ] ChatGPT Bridge 是否返回 Markdown、`verification=live-dom+snapshot`、有效会话 URL 和匹配 hash？
 - [ ] 芒格 Markdown 是否只在本轮临时目录存在，且文档/卡片读回后清理？
 - [ ] 交付卡是否由渲染脚本生成，读回时没有字面量 `\\n`？
+- [ ] 交付卡是否携带本轮 `score-gate.json`，且评分凭据校验通过？
 - [ ] `quality_score ≥ quality_floor` 时，交付卡是否在相关性、兴趣两轴都算完后才一起发出，未只带质量分单发？
 - [ ] `article-decode` 与每条文字 ljg 是否由脚本发出独立 `store=false` HTTP 请求？
 - [ ] 主 Agent 是否未读取分析 Skill、未角色扮演生成、未在失败时回退？

@@ -171,12 +171,11 @@ score_status_value=$(jq -r '.score_status' <scoring-result.json>)
 if [ "$score_status_value" = needs_relevance ]; then
   cat <scoring-result.json>
 else
-  python3 scripts/render_score_card.py <scoring-result.json> --title <title> --author <author> --date <date> --url <url> [--score-only] --output <score-card.json>
-  lark-cli im +messages-send --as bot <target> --msg-type interactive --content "$(cat <score-card.json>)" --jq '.data.message_id'
+  python3 /Users/yuwei/code/read-x/scripts/send_score_card.py <scoring-result.json> --title <title> --author <author> --date <date> --url <url> [--score-only] --chat-id <chatId 或 --user-id <senderId>> --idempotency-key "readx-score-<当前消息ID>" --evidence-output <run_dir>/score-gate.json
 fi
 ```
 
-非边界路径不允许在 `content_scoring.py` 与渲染发送之间返回模型；评分卡发送成功后，`score_only=true` 立即输出抑制标记并结束，不清理 `run_dir`、不复述结果，临时目录交给系统回收。
+非边界路径不允许在 `content_scoring.py` 与渲染发送之间返回模型；评分卡发送成功后，`score_only=true` 立即输出抑制标记并结束，不清理 `run_dir`、不复述结果，临时目录交给系统回收。`score-gate.json` 是评分卡已发送的唯一凭据；命令失败或未写出凭据时禁止进入 long-read，也不得手工造凭据。
 
 ### 评分快路径（禁止探索性往返）
 
@@ -190,8 +189,8 @@ fi
 - 不手算权重、证据封顶、档位或路由；不在运行脚本前做“预判”。
 - 评分期间不发送任何用户可见过程消息，最终只发评分卡。
 - 不为发卡再次阅读 Skill、schema 或 policy；卡片只消费已校验的 `scoring_result` 和文章元数据。
-- 禁止手写卡片 JSON 或用 heredoc 组装。用 `/Users/yuwei/code/read-x/scripts/render_score_card.py <run_dir>/scoring-result.json --title ... --author ... --date ... --url ... [--score-only] --output <run_dir>/score-card.json` 生成经验证的 CardKit 2.0 JSON，再用 `lark-cli` 发送。
-- 渲染器退出码为 0 即视为卡片结构验证通过；禁止再读取、筛选或人工核对生成的卡片 JSON。
+- 禁止手写卡片 JSON 或用 heredoc 组装。用 `/Users/yuwei/code/read-x/scripts/send_score_card.py <run_dir>/scoring-result.json --title ... --author ... --date ... --url ... [--score-only] --chat-id <chatId 或 --user-id <senderId>> --idempotency-key "readx-score-<当前消息ID>" --evidence-output <run_dir>/score-gate.json` 发送。
+- wrapper 退出码为 0 且写出 `score-gate.json` 才视为发送成功；凭据包含 lark-cli 返回的 `message_id`，后续交付卡用它做硬门。禁止再读取、筛选或人工核对生成的卡片 JSON。
 - 主张、引用、枚举、三维输出和 JSON 自检只遵循 `quality-runtime.md`，编排层不复制认知规则。
 - `score_only=true` 时评分卡发送成功即结束；不再生成文章复述、校准总结或第二张结果卡。最终回复必须只写 bridge 已支持的 `[[TIME_X_CARD_SENT]]`，复用自交付卡片抑制机制，避免 bridge 再把过程与总结包装成第二张卡。
 
