@@ -40,11 +40,11 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wx_fast.py` 纯 HTTP）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` 评分结果 v3.18（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由本地 `deepseek-v4-flash` 一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和受限搜索/知识兜底生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；相关性和兴趣也在隔离上下文中由本地模型计算；脚本按 `70%质量 + 30%重要性` 合成决策分
-- **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.5；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
+- **内容质量评分**：`content-scoring` 评分结果 v3.18（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由本地 `deepseek-v4-flash` 一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和程序固定的 `tvly` 真实搜索（最多 3 查询/4 页面，`query_count=0` 永远不会显示为已核验）生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；相关性和兴趣也在隔离上下文中由本地模型计算；脚本按 `70%质量 + 30%重要性` 合成决策分
+- **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.3；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
-- **长文精读**：`long-read` 编排器，Evidence -> 本地模型独立解码/文字深度链路 -> Docx XML -> 飞书主文档；`chatgpt_munger_doc=true` 时追加 ChatGPT Bridge 芒格洞察文档
+- **长文精读**：`long-read` 编排器，Evidence -> `run_long_read_pipeline.py` 并行独立启动本地模型解码/文字深度链路与（达标时）ChatGPT Bridge 芒格分支 -> Docx XML -> 飞书主文档；分支互不阻断，失败分支按真实状态降级交付
 - **格式保真**：芒格洞察由 ChatGPT Bridge 生成规范 Markdown，再统一渲染 Feishu XML 与 Card 2.0；编排层只提供原文和最小任务边界，不强制芒格文档套用固定标题模板，临时 Markdown 交付后清理
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
@@ -120,6 +120,7 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
 | `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 通过本地 MoonBridge 并行运行独立 article-decode 与文字 ljg |
 | `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 达到运行时门槛时调用 ChatGPT Bridge 生成芒格洞察原稿 |
+| `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 长读编排入口：并行独立启动分析分支与 ChatGPT 分支并汇总交付状态 |
 | `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
 | `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |
 | `scripts/render_long_read_delivery_card.py` | 生成唯一长文交付 Card 2.0 JSON，避免换行转义错误 |

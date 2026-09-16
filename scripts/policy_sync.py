@@ -157,7 +157,7 @@ def _validate(route, relevance_max, quality_bands, priority_bands):
         raise ValueError("相关性加分上限缺失或非正")
     if "quality_floor" not in route or "long_read_threshold" not in route:
         raise ValueError("路由门槛不完整")
-    route.setdefault("chatgpt_munger_threshold", 8.5)
+    route.setdefault("chatgpt_munger_threshold", 8.3)
     if route["quality_floor"] >= route["long_read_threshold"]:
         raise ValueError("质量下限须小于长读门槛")
     if any(route[name] < 0 or route[name] > 10 for name in ("quality_floor", "long_read_threshold", "chatgpt_munger_threshold")):

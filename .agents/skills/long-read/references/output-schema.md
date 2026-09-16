@@ -76,7 +76,7 @@ Evidence 只从原文提取，不读取用户画像、既有摘要或外部评�
 
 ### ChatGPT Bridge Markdown 渲染
 
-ChatGPT Bridge 后处理的 `text` 必须是规范 Markdown，且返回 `verification=live-dom+snapshot`、有效 `conversationUrl` 与匹配的 `outputSha256`。Bridge 的 `BEGIN_OUTPUT/END_OUTPUT` 只属于外层传输边界，不属于正文，编排 prompt 不得禁止或覆盖该协议；调用层边界应放在任务 prompt 末尾并优先于正文格式要求。不接受本地模型或旧的 `historyVerified` 标记冒充成功。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再以 `munger-soul` 作为方法叠加层；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
+ChatGPT Bridge 后处理的 `text` 必须是规范 Markdown，且返回 `verification=live-dom+snapshot`、有效 `conversationUrl` 与匹配的 `outputSha256`。Bridge 的 `BEGIN_OUTPUT/END_OUTPUT` 只属于外层传输边界，不属于正文，编排 prompt 不得禁止或覆盖该协议；调用层边界应放在任务 prompt 末尾并优先于正文格式要求。不接受本地模型或旧的 `historyVerified` 标记冒充成功。编排提示只规定分析边界和事实安全：先还原文章真正的问题，再实时读取并冻结 `common.munger-soul` 与 `read-x.munger-analysis` 作为方法叠加层；运行收据同时记录 Prompt 来源、revision、Prompt/Input/Output 哈希；不额外规定固定标题、标题数量、标题顺序或段落模板。只允许使用本轮临时 Markdown 作为芒格文档源；标题、段落、列表、引用、代码、强调、链接和简单表格由 `markdown_to_feishu_xml.py` 转换为对应 XML。原始 HTML 不持久化，复杂表格必须保留为可见的 Markdown 代码块，不得静默丢失。
 
 `markdown_to_feishu_xml.py` 是 read-x 的兼容入口，排版核心复用共享 `feishu-doc-renderer` Skill。共享层只做纯 Markdown → Feishu XML 转换，不调用模型、不访问飞书、不创建文档，也不改变 Markdown 语义。read-x 兼容层追加 ChatGPT 来源核对提示块；有会话 URL 时才追加会话链接，其他调用方不继承该专用文案。
 

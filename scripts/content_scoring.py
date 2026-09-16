@@ -41,7 +41,7 @@ def _validate_runtime_policy(policy):
     if not isinstance(route, dict):
         raise ValueError("base config route is invalid")
     floor, threshold = route.get("quality_floor"), route.get("long_read_threshold")
-    chatgpt_threshold = route.get("chatgpt_munger_threshold", 8.5)
+    chatgpt_threshold = route.get("chatgpt_munger_threshold", 8.3)
     if any(isinstance(value, bool) or not isinstance(value, (int, float, Decimal)) or not math.isfinite(value)
            for value in (floor, threshold, chatgpt_threshold)) or floor < 0 or threshold < 0 or chatgpt_threshold < 0 or chatgpt_threshold > 10 or floor >= threshold:
         raise ValueError("base config route thresholds are invalid")
@@ -339,11 +339,11 @@ def _validate_importance_output(output: dict) -> tuple[dict | None, list[str]]:
     if authority is not None and (isinstance(authority, bool) or not isinstance(authority, (int, float)) or Decimal(str(authority)) not in DIMENSION_SCORES):
         errors.append("authority_score is invalid")
     status = output.get("authority_status")
-    if status not in {"verified", "corroborated", "inferred", "source_missing", "fetch_failed", "mismatch", "rejected"}:
+    if status not in {"verified", "corroborated", "inferred", "not_run", "search_unavailable", "insufficient_evidence", "source_missing", "fetch_failed", "mismatch", "rejected"}:
         errors.append("authority_status is invalid")
     if status in {"verified", "corroborated", "inferred"} and authority is None:
         errors.append(f"{status} authority requires authority_score")
-    if status in {"source_missing", "fetch_failed", "mismatch", "rejected"} and authority is not None:
+    if status not in {"verified", "corroborated", "inferred"} and authority is not None:
         errors.append(f"{status} authority must not include authority_score")
     if status == "inferred" and authority is not None and authority > 8:
         errors.append("inferred authority_score must be <= 8")
@@ -651,7 +651,7 @@ def score(
 
     floor = float(POLICY["route"]["quality_floor"])
     threshold = float(POLICY["route"]["long_read_threshold"])
-    chatgpt_threshold = float(POLICY["route"].get("chatgpt_munger_threshold", 8.5))
+    chatgpt_threshold = float(POLICY["route"].get("chatgpt_munger_threshold", 8.3))
     relevance_needed = quality_score >= floor
     authority, importance_issues = _validate_importance_output(importance_output)
     importance_score = problem["score"]

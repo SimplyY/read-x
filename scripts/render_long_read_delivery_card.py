@@ -35,7 +35,7 @@ def _url(value: str) -> str:
     return value
 
 
-def render_card(*, title: str, main_url: str, munger_url: str | None = None, failure_reason: str | None = None, decision_score: float | None = None, munger_threshold: float = 8.5) -> dict:
+def render_card(*, title: str, main_url: str, munger_url: str | None = None, failure_reason: str | None = None, decision_score: float | None = None, munger_threshold: float = 8.3) -> dict:
     _url(main_url)
     if munger_url:
         _url(munger_url)
@@ -81,7 +81,7 @@ def main() -> int:
     parser.add_argument("--munger-url")
     parser.add_argument("--failure-reason")
     parser.add_argument("--decision-score", type=float)
-    parser.add_argument("--munger-threshold", type=float, default=8.5)
+    parser.add_argument("--munger-threshold", type=float, default=8.3)
     parser.add_argument("--score-evidence", type=Path, required=True)
     parser.add_argument("--scoring-result", type=Path, required=True)
     parser.add_argument("--output", type=Path)

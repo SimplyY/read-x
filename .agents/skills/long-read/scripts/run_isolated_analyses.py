@@ -90,6 +90,14 @@ class AnalysisTask:
     required_markers: tuple[str, ...]
 
 
+class OutputValidationError(RuntimeError):
+    """Deterministic output rejection (too short, missing form, artifacts).
+
+    Retrying cannot change the outcome, so the caller must not spend the
+    remaining budget on it.
+    """
+
+
 def read_input(path: Path, label: str) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"{label} must be a regular file: {path}")
@@ -171,15 +179,15 @@ def extract_output(
         raise RuntimeError(f"{task_name} returned no unique non-empty output_text")
     visible_chars = len(re.sub(r"\s+", "", output))
     if visible_chars < min_output_chars:
-        raise RuntimeError(f"{task_name} output is too short: {visible_chars} < {min_output_chars}")
+        raise OutputValidationError(f"{task_name} output is too short: {visible_chars} < {min_output_chars}")
     missing = [marker for marker in required_markers if marker not in output]
     if missing:
-        raise RuntimeError(f"{task_name} output misses required form markers: {missing}")
+        raise OutputValidationError(f"{task_name} output misses required form markers: {missing}")
     if task_name == "ljg-word" and re.search(r"(?m)^\s*>", output):
-        raise RuntimeError("ljg-word output contains a forbidden quote block")
+        raise OutputValidationError("ljg-word output contains a forbidden quote block")
     artifacts = [label for label, pattern in TOOL_PATTERNS.items() if pattern.search(output)]
     if artifacts:
-        raise RuntimeError(f"{task_name} output contains forbidden tool artifacts: {artifacts}")
+        raise OutputValidationError(f"{task_name} output contains forbidden tool artifacts: {artifacts}")
     return output + "\n"
 
 
@@ -251,7 +259,12 @@ def call_task(
     max_output_tokens: int,
     model: str = MODEL,
 ) -> dict:
-    """Run one task with a bounded retry budget; a later task may continue after failure."""
+    """Run one task with a bounded retry budget; a later task may continue after failure.
+
+    只重试网络、传输、服务端临时类错误；确定性的输出校验错误（OutputValidationError）
+    立即失败，不再消耗预算。每次尝试的错误类型、耗时与结果都记录进 attempts_detail，
+    不得把"尝试了两次"笼统写成"两次超时"。
+    """
     task_input = build_input(source, evidence, task.question)
     digests = {
         "skill_sha256": task.skill_sha256,
@@ -259,6 +272,8 @@ def call_task(
         "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
     }
     last_error = None
+    last_error_type = None
+    attempts_detail: list[dict] = []
     started = time.perf_counter()
     deadline = time.monotonic() + max(float(timeout), 0.01)
     attempts = 0
@@ -267,13 +282,34 @@ def call_task(
         if remaining <= 0:
             break
         attempts = attempt
+        attempt_started = time.perf_counter()
         try:
             result = _call_once(task, source, evidence, endpoint, remaining, max_output_tokens, model=model)
             result["attempts"] = attempt
             result["model"] = model
+            if attempts_detail:
+                # 成功前的失败尝试也必须留痕：attempts=2 不能掩盖第一次为什么失败。
+                result["attempts_detail"] = attempts_detail
             return result
+        except OutputValidationError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            last_error_type = "output_validation"
+            attempts_detail.append({
+                "attempt": attempt,
+                "error_type": last_error_type,
+                "error": str(exc)[:200],
+                "elapsed_seconds": round(time.perf_counter() - attempt_started, 3),
+            })
+            break
         except (urllib.error.URLError, socket.timeout, json.JSONDecodeError, RuntimeError, OSError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
+            last_error_type = type(exc).__name__
+            attempts_detail.append({
+                "attempt": attempt,
+                "error_type": last_error_type,
+                "error": str(exc)[:200],
+                "elapsed_seconds": round(time.perf_counter() - attempt_started, 3),
+            })
             if attempt < RETRY_ATTEMPTS:
                 wait = min(RETRY_BACKOFF_SECONDS, max(0.0, deadline - time.monotonic()))
                 if wait:
@@ -283,8 +319,10 @@ def call_task(
         "status": "failed",
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "attempts": attempts,
+        "attempts_detail": attempts_detail,
+        "error_type": last_error_type or "budget_exhausted",
         **digests,
-        "error": last_error or "task timed out",
+        "error": last_error or "task budget exhausted before any attempt",
         "model": model if attempts else MODEL,
     }
 

@@ -50,7 +50,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 4. 隔离协议
 
-主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_isolated_analyses.py`。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill、显式禁用环境代理，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别发送独立 MoonBridge 请求；每个请求固定 `model=deepseek-v4-flash`、`store=false`，不传会话 ID 或前序响应 ID。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
+主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_long_read_pipeline.py`；编排入口并行独立拉起分析分支（内部运行 `scripts/run_isolated_analyses.py`）与 ChatGPT 分支（`chatgpt_munger_doc=true` 时内部运行 `scripts/run_chatgpt_munger.py`）。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill、显式禁用环境代理，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别发送独立 MoonBridge 请求；每个请求固定 `model=deepseek-v4-flash`、`store=false`，不传会话 ID 或前序响应 ID。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
 
 - 用户画像；
 - `article-decode` 或其他 ljg 的结果；
@@ -61,7 +61,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 5. 文档拼接
 
-主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把模型纯文本直接拼进文档。编排层只传递原文、完整 `munger-soul` 提示词和最小边界，不把固定八标题或其他外层模板塞进模型请求：
+主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把模型纯文本直接拼进文档。编排层只传递原文、实时读取并冻结的 `common.munger-soul` 与 `read-x.munger-analysis` 资产和最小边界，不把固定八标题或其他外层模板塞进模型请求：
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；
@@ -120,8 +120,9 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 ## 7. 降级
 
 - 抓取失败：说明失败，不编造正文。
-- `article-decode` 或执行脚本失败：保留 Evidence 和一句话客观摘要交付，禁止角色扮演回退。
-- 单条文字 ljg 失败：跳过该附录，继续交付其他结果。
+- `article-decode` 或执行脚本失败：保留已成功的文字 ljg 输出和 Evidence，主文档降级交付并在交付内容中明确列出缺失的分析分支；ChatGPT 分支不受影响照常运行；禁止角色扮演回退。
+- 单条文字 ljg 失败：跳过该附录，继续交付其他结果；该分支的每次尝试错误记录保留在 `pipeline-summary.json`。
+- ChatGPT 分支失败：主文档按「主精读完成，ChatGPT 待复核」交付，整轮不得标成「精读完成」。
 - 文档创建失败：回退为高密度卡片。
 - 卡片发送失败：记录失败，不重复发送。
 - ljg-card 生成或发送失败：主文档保持成功，不重复发送。

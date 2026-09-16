@@ -13,11 +13,23 @@ CN_NAME_RE = re.compile(r"(?:对话|采访|访谈)\s*([\u4e00-\u9fff]{2,6}(?:[·
 CN_RELATION_NAME_RE = re.compile(r"(?<![\u4e00-\u9fff])(?:与|和)\s*([\u4e00-\u9fff]{2,6}(?:[·•][\u4e00-\u9fff]{1,6})?)")
 CN_TITLE_NAME_RE = re.compile(r"^\s*([\u4e00-\u9fff]{2,6})\s*[：:]")
 SOURCE_URL_RE = re.compile(r"^>\s*原始出处候选\s*[:：]\s*(https?://\S+)")
+# ponytail: 名称形状启发式——像典型人名（中文 2-4 字、中文·间隔复姓译名、拉丁名）才判 person；
+# 其余来源署名（公众号柄名、含数字/混合字母的账号名）一律先按 source_account 处理，
+# 不得自动当成人物或组织。升级路径：引入已知名账号词典或由身份模型判定后再放宽。
+PERSON_NAME_RE = re.compile(
+    r"^(?:[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3}|[\u4e00-\u9fff]{2,4}|[\u4e00-\u9fff]{1,6}[·•][\u4e00-\u9fff]{1,6})$"
+)
 ALIASES = {
     "比尔·盖茨": ["Bill Gates"], "比尔盖茨": ["Bill Gates"],
     "林毅夫": ["Justin Yifu Lin", "Yifu Lin"],
 }
 GENERIC_SOURCE_LABELS = {"匿名", "佚名", "未知", "来源不明"}
+
+
+def _entity_type(value: str, is_publisher: bool) -> str:
+    if is_publisher:
+        return "organization"
+    return "person" if PERSON_NAME_RE.match(value) else "source_account"
 
 
 def _metadata(source: str) -> tuple[str, str, str, list[str]]:
@@ -54,9 +66,9 @@ def build_identity(source: str, quality: dict | None = None) -> dict:
         value = value.strip()
         if value and value not in GENERIC_SOURCE_LABELS and value not in seen:
             seen.add(value)
-            entities.append({"type": "organization" if value == publisher else "person", "name": value, "aliases": ALIASES.get(value, [])})
+            entities.append({"type": _entity_type(value, value == publisher), "name": value, "aliases": ALIASES.get(value, [])})
     if author and author not in seen and author not in GENERIC_SOURCE_LABELS:
-        entities.append({"type": "organization", "name": author, "aliases": ALIASES.get(author, [])})
+        entities.append({"type": _entity_type(author, False), "name": author, "aliases": ALIASES.get(author, [])})
     domain = (quality or {}).get("detected_domain") or {}
     topic = {"primary": domain.get("primary", ""), "secondary": domain.get("secondary", "")}
     event_hint = title.split(":", 1)[-1].strip() if ":" in title else title

@@ -149,14 +149,14 @@ def valid_base_records():
         base_record("跳过", "质量档位", 0, "0-1篇/无卡片", 0, 1, None),
         base_record("相关", "优先级档位", 0.4, "相关"),
         base_record("低相关", "优先级档位", 0, "低相关"),
-        base_record("ChatGPT 芒格门槛", "路由门槛", 8.5),
+        base_record("ChatGPT 芒格门槛", "路由门槛", 8.3),
     ]
     return records
 
 
 def test_base_records_build_runtime_policy_from_typed_fields():
     policy = policy_sync.rebuild_policy(valid_base_records())
-    assert policy["route"] == {"quality_floor": 6.0, "long_read_threshold": 7.0, "chatgpt_munger_threshold": 8.5}
+    assert policy["route"] == {"quality_floor": 6.0, "long_read_threshold": 7.0, "chatgpt_munger_threshold": 8.3}
     assert policy["quality_bands"][0]["ljg_range"] == [2, 3]
     assert policy["quality_bands"][0]["ljg_card"] is True
     assert policy["priority_bands"] == [
@@ -168,7 +168,7 @@ def test_base_records_build_runtime_policy_from_typed_fields():
 def test_base_records_without_chatgpt_threshold_keep_safe_default():
     records = [record for record in valid_base_records() if record["配置项"] != "ChatGPT 芒格门槛"]
     policy = policy_sync.rebuild_policy(records)
-    assert policy["route"]["chatgpt_munger_threshold"] == 8.5
+    assert policy["route"]["chatgpt_munger_threshold"] == 8.3
 
 
 def test_base_typed_fields_must_match_legacy_display_text():
@@ -670,7 +670,11 @@ def test_fixed_scoring_tail_cannot_skip_importance_verification():
     assert "verify_source_authority.py" in fixed_tail
     assert "build_authority_identity.py" in fixed_tail
     assert "generate_authority.py" in fixed_tail
-    assert '.tool_status == "ok"' in fixed_tail and 'length > 0' in fixed_tail
+    # 真实 tvly 搜索必须无条件执行，不得用 jq 守卫跳过 generate_authority；
+    # 顺序固定：identity -> 真实搜索 -> 确定性核验。
+    assert fixed_tail.index("generate_authority.py") > fixed_tail.index("build_authority_identity.py")
+    assert fixed_tail.index("verify_source_authority.py") > fixed_tail.index("generate_authority.py")
+    assert "jq -e '.tool_status" not in fixed_tail
     assert "--identity \"<run_dir>/identity.json\"" in fixed_tail
     assert "--importance-output" in fixed_tail
 
@@ -764,30 +768,6 @@ def test_model_first_attempt_keeps_full_budget_for_slow_generation():
         assert len(timeouts) == 2
         assert timeouts[0] > 0.25
         assert timeouts[1] > 0.25
-
-
-def test_authority_first_attempt_keeps_full_budget_for_slow_generation():
-    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
-    original_call = authority_generator._call_once
-    original_backoff = authority_generator.RETRY_BACKOFF_SECONDS
-    timeouts = []
-
-    def fail_once_then_succeed(identity_packet, timeout, attempt):
-        timeouts.append(timeout)
-        if len(timeouts) == 1:
-            raise RuntimeError("transient upstream failure")
-        return {"entity_match": "confirmed", "topic_match": "strong", "suggested_score": 8.0, "basis": "公开常识"}
-
-    authority_generator._call_once = fail_once_then_succeed
-    authority_generator.RETRY_BACKOFF_SECONDS = 0
-    try:
-        assert authority_generator.infer(identity, 0.3)["tool_status"] == "ok"
-    finally:
-        authority_generator._call_once = original_call
-        authority_generator.RETRY_BACKOFF_SECONDS = original_backoff
-    assert len(timeouts) == 2
-    assert timeouts[0] > 0.25
-    assert timeouts[1] > 0.25
 
 
 def test_model_retries_keep_one_fixed_model_and_use_remaining_budget():
@@ -917,6 +897,7 @@ def test_unmatched_authority_does_not_echo_positive_search_basis():
         "schema_version": "1",
         "provider": "agent-web",
         "tool_status": "ok",
+        "mode": "web_search",
         "queries": [{"hash": "sha256:" + "a" * 64, "kind": "title"}],
         "results": [{
             "url": "https://example.com/result",
@@ -1351,6 +1332,15 @@ def test_depth_ljg_merged_into_quality_bands():
 
 
 def test_chatgpt_munger_document_uses_runtime_decision_threshold():
+    result = cs.score(
+        quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0),
+        SOURCE,
+        relevance_output=relevance(0, 0),
+        context_text=CONTEXT,
+    )
+    assert result["decision_score"] == 8.3 and result["route"] == "long_read"
+    assert result["chatgpt_munger_doc"] is True
+
     grades = {key: 8.5 for key in cs.QUALITY_DIMENSIONS}
     result = cs.score(quality(grades), SOURCE, relevance_output=relevance(0, 0), context_text=CONTEXT)
     assert result["decision_score"] == 8.5 and result["route"] == "long_read"
@@ -1365,6 +1355,20 @@ def test_chatgpt_munger_document_uses_runtime_decision_threshold():
 
     waiting = cs.score(quality({key: 8.5 for key in cs.QUALITY_DIMENSIONS}), SOURCE)
     assert waiting["score_status"] == "needs_relevance" and waiting["chatgpt_munger_doc"] is False
+
+
+def test_chatgpt_munger_threshold_boundary_is_exact():
+    # base = 0.7*8.0 + 0.3*9.0 = 8.3；再加相关性/兴趣 bonus 精确构造边界分（bonus 按 0.1 四舍五入）
+    for relevance_bonus, interest_bonus, expected in ((0.0, 0.0, 8.3), (0.1, 0.0, 8.4), (0.1, 0.1, 8.5), (0.2, 0.1, 8.6)):
+        result = cs.score(
+            quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0),
+            SOURCE,
+            relevance_output=relevance(relevance_bonus, interest_bonus),
+            context_text=CONTEXT,
+        )
+        assert result["decision_score"] == expected, (relevance_bonus, interest_bonus, result["decision_score"])
+        assert result["route"] == "long_read"
+        assert result["chatgpt_munger_doc"] is (expected >= 8.3)
 
 
 
@@ -1671,7 +1675,7 @@ def _identity_observation(levels=("wikipedia",), *, entity="confirmed", topic="s
     if suggested is not None:
         assessment["suggested_score"] = suggested
     return {
-        "schema_version": "1", "provider": "agent-web", "tool_status": tool,
+        "schema_version": "1", "provider": "agent-web", "tool_status": tool, "mode": "web_search",
         "queries": [{"kind": "title", "hash": "sha256:" + "a" * 64}], "results": results, "assessment": assessment,
     }
 
@@ -1690,7 +1694,7 @@ def test_chinese_title_identity_does_not_promote_topic_words_to_people():
     source = "# 林毅夫：人工智能时代的关键品质与中国路径\n> 公众号: 林毅夫\n---\n正文只用于抓取，不进入身份包。\n"
     packet = identity_builder.build_identity(source, {"detected_domain": {"primary": "AI/技术", "secondary": "社会影响"}})
     assert [item["name"] for item in packet["entities"]] == ["林毅夫"]
-    observation = _identity_observation((), topic="weak", suggested=6.5)
+    observation = _identity_observation(("search_snippet",), topic="weak", suggested=6.5, label="林毅夫")
     result = authority_checker.resolve_identity(packet, observation)
     assert result["authority_status"] == "inferred"
     assert result["authority_score"] == 6.5
@@ -1700,10 +1704,12 @@ def test_chinese_title_identity_does_not_promote_topic_words_to_people():
 def test_mixed_script_public_account_is_preserved_for_authority_search():
     source = "# 一篇技术文章\n> 公众号: 一直在路上的Max\n---\n正文不进入身份包。\n"
     packet = identity_builder.build_identity(source, {"detected_domain": {"primary": "AI/技术", "secondary": ""}})
-    assert packet["entities"] == [{"type": "organization", "name": "一直在路上的Max", "aliases": []}]
+    assert packet["entities"] == [{"type": "source_account", "name": "一直在路上的Max", "aliases": []}]
     assert "正文不进入身份包" not in json.dumps(packet, ensure_ascii=False)
     generic = identity_builder.build_identity("# 一篇技术文章\n> 公众号: 匿名\n---\n正文。\n")
     assert generic["entities"] == []
+    kennel = identity_builder.build_identity("# 一篇技术文章\n> 公众号: intlsy 的狗窝\n---\n正文。\n")
+    assert kennel["entities"] == [{"type": "source_account", "name": "intlsy 的狗窝", "aliases": []}]
 
 
 def test_authority_source_mapping_and_inferred_cap():
@@ -1713,13 +1719,41 @@ def test_authority_source_mapping_and_inferred_cap():
     assert baidu_only["reason_code"] == "baidu_entity_verified"
     baidu_weak_topic = authority_checker.resolve_identity(identity, _identity_observation(("baidu", "reputable_secondary"), topic="weak"))
     assert baidu_weak_topic["authority_status"] == "corroborated" and baidu_weak_topic["authority_score"] == 7.0
-    inferred = authority_checker.resolve_identity(identity, _identity_observation((), suggested=10))
+    inferred = authority_checker.resolve_identity(identity, _identity_observation(("search_snippet",), suggested=10))
     assert inferred["authority_status"] == "inferred" and inferred["authority_score"] == 8.0 and inferred["authority_confidence"] == "low"
-    no_evidence = authority_checker.resolve_identity(identity, _identity_observation((), entity="unknown", topic="unknown", suggested=0))
-    assert no_evidence["authority_status"] == "mismatch" and no_evidence["authority_score"] is None
+    assert inferred["reason_code"] == "evidence_insufficient_inferred"
+    no_results = authority_checker.resolve_identity(identity, _identity_observation((), suggested=10))
+    assert no_results["authority_status"] == "insufficient_evidence" and no_results["authority_score"] is None
+    assert no_results["reason_code"] == "search_no_results"
+    no_evidence = authority_checker.resolve_identity(identity, _identity_observation(("search_snippet",), entity="unknown", topic="unknown", suggested=0))
+    assert no_evidence["authority_status"] == "insufficient_evidence" and no_evidence["authority_score"] is None
     assert no_evidence["reason_code"] == "insufficient_authority_evidence"
     mismatch = authority_checker.resolve_identity(identity, _identity_observation(entity="ambiguous"))
     assert mismatch["authority_score"] is None and mismatch["authority_status"] == "mismatch"
+
+
+def test_source_account_only_identity_cannot_reach_verified():
+    identity = {"schema_version": "1", "title": "intlsy 的狗窝", "author": "intlsy 的狗窝", "publisher": "", "entities": [{"type": "source_account", "name": "intlsy 的狗窝", "aliases": []}], "event_hint": "intlsy 的狗窝", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    baidu_hit = authority_checker.resolve_identity(identity, _identity_observation(("baidu",), label="intlsy 的狗窝", suggested=8.0))
+    assert baidu_hit["authority_status"] == "inferred" and baidu_hit["authority_score"] == 8.0
+    assert baidu_hit["reason_code"] == "source_account_only_inferred"
+    official_hit = authority_checker.resolve_identity(identity, _identity_observation(("official",), label="intlsy 的狗窝", suggested=6.0))
+    assert official_hit["authority_status"] == "inferred" and official_hit["authority_score"] == 6.0
+    without_suggestion = authority_checker.resolve_identity(identity, _identity_observation(("baidu",), label="intlsy 的狗窝"))
+    assert without_suggestion["authority_status"] == "insufficient_evidence" and without_suggestion["authority_score"] is None
+
+
+def test_search_states_split_not_run_unavailable_and_insufficient():
+    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    not_run = authority_checker.resolve_identity(identity, None)
+    assert not_run["authority_status"] == "not_run" and not_run["authority_score"] is None
+    assert not_run["reason_code"] == "search_not_run"
+    unavailable = authority_checker.resolve_identity(identity, _identity_observation(tool="unavailable"))
+    assert unavailable["authority_status"] == "search_unavailable" and unavailable["authority_score"] is None
+    assert unavailable["search_observation"]["tool_status"] == "unavailable"
+    legacy = dict(_identity_observation(), mode="knowledge_only")
+    rejected = authority_checker.resolve_identity(identity, legacy)
+    assert rejected["authority_status"] == "rejected" and rejected["reason_code"] == "invalid_search_observation"
 
 
 def test_baidu_single_source_verifies_well_known_person():
@@ -1732,30 +1766,97 @@ def test_baidu_single_source_verifies_well_known_person():
     assert result["authority_confidence"] == "medium"
 
 
-def test_knowledge_authority_generator_is_bounded_and_model_fixed():
-    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
-    original = authority_generator._call_once
-    calls = []
+def test_authority_search_generator_runs_real_tvly_and_grounds_assessment():
+    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI 监管争论", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    original_tvly = authority_generator.run_tvly
+    original_call = authority_generator._call_once
+    tvly_queries = []
 
-    def fake_call(*args, **kwargs):
-        calls.append(kwargs.get("timeout", args[1]))
-        return {"entity_match": "confirmed", "topic_match": "weak", "suggested_score": 8.0, "basis": "公开常识"}
+    def fake_tvly(query, timeout):
+        tvly_queries.append(query)
+        return json.dumps({"results": [
+            {"url": "https://baike.baidu.com/item/%E6%AF%94%E5%B0%94%C2%B7%E7%9B%96%E8%8C%A8", "title": "比尔·盖茨（微软联合创始人）", "content": "比尔·盖茨 1955 年出生，微软联合创始人，近年公开讨论 AI 与能源议题。" * 4},
+            {"url": "https://zh.wikipedia.org/wiki/比尔·盖茨", "title": "比尔·盖茨 - 维基百科", "content": "比尔·盖茨，美国企业家，对人工智能话题多次发表观点。"},
+        ]}), None
 
+    def fake_call(identity_packet, results, timeout, attempt):
+        assert results and results[0]["source_level"] == "baidu"
+        return {"entity_match": "confirmed", "topic_match": "strong", "suggested_score": 8.0, "basis": "结果 1 确认实体与 AI 主题"}
+
+    authority_generator.run_tvly = fake_tvly
     authority_generator._call_once = fake_call
     try:
-        observation = authority_generator.infer(identity, 1)
+        observation = authority_generator.run(identity, 1)
     finally:
-        authority_generator._call_once = original
+        authority_generator.run_tvly = original_tvly
+        authority_generator._call_once = original_call
     assert authority_generator.MODEL == "deepseek-v4-flash"
     assert authority_generator.ENDPOINT.startswith("http://127.0.0.1:")
-    assert observation["tool_status"] == "ok" and observation["mode"] == "knowledge_only"
-    assert observation["queries"] == [] and observation["results"] == []
+    assert observation["tool_status"] == "ok" and observation["mode"] == "web_search"
+    assert [item["kind"] for item in observation["queries"]] == ["title", "entity_topic", "entity_event"]
+    assert all(item["hash"].startswith("sha256:") for item in observation["queries"])
+    assert "Bill Gates" not in json.dumps(observation["queries"], ensure_ascii=False)
+    assert observation["results"][0]["source_level"] == "baidu"
+    assert observation["results"][1]["source_level"] == "wikipedia"
+    assert all(len(item["excerpt"]) <= 200 for item in observation["results"])
     assert observation["assessment"]["suggested_score"] == 8.0
-    assert len(calls) == 1
-    invalid = authority_generator.infer({"schema_version": "1"}, 1)
-    assert invalid["tool_status"] == "error" and invalid["assessment"]["entity_match"] == "unknown"
-    scored = cs.score(quality(importance_score=9.0), SOURCE, importance_output=authority_checker.resolve_identity(identity, observation), relevance_unavailable=True)
+    resolved = authority_checker.resolve_identity(identity, observation)
+    assert resolved["authority_status"] == "verified" and resolved["authority_score"] == 8.0
+    scored = cs.score(quality(importance_score=9.0), SOURCE, importance_output=resolved, relevance_unavailable=True)
     assert scored["importance_confidence"] == "partial" and scored["importance_score"] == 8.5
+
+
+def test_authority_search_generator_reports_tvly_failures_honestly():
+    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    original_tvly = authority_generator.run_tvly
+    calls = []
+
+    def fake_tvly(query, timeout):
+        calls.append(query)
+        if query.startswith("x"):
+            return None, "auth"
+        if query.startswith("y"):
+            return None, "timeout"
+        return json.dumps({"results": [{"url": "https://example.com/bill", "title": "Bill Gates", "content": "profile"}]}), None
+
+    authority_generator.run_tvly = fake_tvly
+    try:
+        ok_observation = authority_generator.run(identity, 1)
+        auth_observation = authority_generator.run({**identity, "title": "x", "entities": [], "event_hint": ""}, 1)
+        timeout_observation = authority_generator.run({**identity, "title": "y", "entities": [], "event_hint": ""}, 1)
+    finally:
+        authority_generator.run_tvly = original_tvly
+    assert ok_observation["tool_status"] == "ok" and len(ok_observation["results"]) == 1
+    assert auth_observation["tool_status"] == "unavailable" and auth_observation["results"] == []
+    assert auth_observation["assessment"]["entity_match"] == "unknown"
+    assert timeout_observation["tool_status"] == "timeout"
+    invalid = authority_generator.run({"schema_version": "1"}, 1)
+    assert invalid["tool_status"] == "error" and invalid["assessment"]["entity_match"] == "unknown" and invalid["queries"] == []
+
+
+def test_authority_assessment_keeps_full_budget_for_slow_generation():
+    identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
+    original_call = authority_generator._call_once
+    original_backoff = authority_generator.RETRY_BACKOFF_SECONDS
+    timeouts = []
+
+    def fail_once_then_succeed(identity_packet, results, timeout, attempt):
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            raise RuntimeError("transient upstream failure")
+        return {"entity_match": "confirmed", "topic_match": "strong", "suggested_score": 8.0, "basis": "结果确认"}
+
+    authority_generator._call_once = fail_once_then_succeed
+    authority_generator.RETRY_BACKOFF_SECONDS = 0
+    try:
+        assessment = authority_generator.assess(identity, [{"url": "https://example.com", "title": "t", "source_level": "search_snippet", "evidence_kind": "identity", "excerpt": "e"}], 0.3)
+    finally:
+        authority_generator._call_once = original_call
+        authority_generator.RETRY_BACKOFF_SECONDS = original_backoff
+    assert assessment["suggested_score"] == 8.0
+    assert len(timeouts) == 2
+    assert timeouts[0] > 0.25
+    assert timeouts[1] > 0.25
 
 
 def test_search_failure_keeps_problem_score_and_card_state():

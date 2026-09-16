@@ -26,8 +26,9 @@ _PUBLISHER_ALIASES = {
     "麻省理工科技评论": ("MIT Technology Review", "Technology Review"),
     "麻省理工学院技术评论": ("MIT Technology Review", "Technology Review"),
 }
-_ENTITY_ALIASES = {"比尔·盖茨": ("Bill Gates",), "比尔盖茨": ("Bill Gates",)}
-AUTHORITY_STATUSES = {"verified", "corroborated", "inferred", "source_missing", "fetch_failed", "mismatch", "rejected"}
+_ENTITY_ALIASES = {"比尔·盖茨": ("Bill Gates",), "比尔盖茨": ("Bill Gates",), "Bill Gates": ("比尔·盖茨", "比尔盖茨")}
+AUTHORITY_STATUSES = {"verified", "corroborated", "inferred", "not_run", "search_unavailable", "insufficient_evidence", "source_missing", "fetch_failed", "mismatch", "rejected"}
+SCORED_AUTHORITY_STATUSES = {"verified", "corroborated", "inferred"}
 SOURCE_LEVELS = {"official", "wikipedia", "baidu", "reputable_secondary", "search_snippet"}
 TOPIC_MATCHES = {"strong", "weak", "none", "unknown"}
 DIMENSION_SCORES = (0.0, 2.0, 4.0, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5, 10.0)
@@ -162,6 +163,28 @@ def _fetch_page(url: str, timeout: float) -> tuple[str, int]:
         return _page_text(raw, charset), int(getattr(response, "status", 200) or 200)
 
 
+def _search_failure(
+    status: str, reason_code: str, attempts: int, started: float, rationale: str,
+    tool_status: str = "not_run", result_count: int = 0,
+) -> dict:
+    """Non-scored search outcome; the observation summary must reflect what really ran."""
+    return {
+        "schema_version": SCORE_VERSION,
+        "authority_score": None,
+        "evidence": [],
+        "entity": None,
+        "topic_match": "unknown",
+        "search_observation": {"query_count": attempts, "result_count": result_count, "tool_status": tool_status},
+        "authority_confidence": "partial",
+        "confidence": "unavailable",
+        "authority_status": status,
+        "reason_code": reason_code,
+        "attempts": attempts,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+        "rationale": rationale,
+    }
+
+
 def _failure(status: str, reason_code: str, attempts: int, started: float, rationale: str) -> dict:
     return {
         "schema_version": SCORE_VERSION,
@@ -204,7 +227,7 @@ def _identity_valid(identity: dict | None) -> bool:
         return False
     entities = identity.get("entities")
     if not isinstance(entities, list) or any(
-        not isinstance(item, dict) or item.get("type") not in {"person", "organization"} or not isinstance(item.get("name"), str)
+        not isinstance(item, dict) or item.get("type") not in {"person", "organization", "source_account"} or not isinstance(item.get("name"), str)
         or not isinstance(item.get("aliases", []), list) or any(not isinstance(alias, str) for alias in item.get("aliases", []))
         for item in entities
     ):
@@ -221,6 +244,10 @@ def _observation_valid(observation: dict | None) -> bool:
     if not isinstance(observation, dict) or observation.get("schema_version") != "1":
         return False
     if observation.get("provider") != "agent-web" or observation.get("tool_status") not in {"ok", "unavailable", "timeout", "error"}:
+        return False
+    # Only real web-search observations may enter the resolver; a legacy or
+    # knowledge-only observation must never be consumed as search evidence.
+    if observation.get("mode") != "web_search":
         return False
     queries = observation.get("queries", [])
     if not isinstance(queries, list) or len(queries) > 3 or any(
@@ -261,8 +288,11 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
         return _failure("rejected", "invalid_identity_packet", attempts, started, "身份包不符合 v1 契约")
     if observation is not None and not _observation_valid(observation):
         return _failure("rejected", "invalid_search_observation", attempts, started, "搜索观察不符合受控契约")
-    if observation is None or observation.get("tool_status") in {"unavailable", "timeout", "error"}:
-        return {**_failure("fetch_failed", "search_unavailable", attempts, started, "搜索桥不可用，未产生可核验证据"), "search_observation": {"query_count": attempts, "result_count": 0, "tool_status": (observation or {}).get("tool_status", "unavailable")}}
+    tool_status = (observation or {}).get("tool_status", "not_run")
+    if observation is None or tool_status == "not_run":
+        return _search_failure("not_run", "search_not_run", attempts, started, "搜索未执行，没有可核验证据")
+    if tool_status in {"unavailable", "timeout", "error"}:
+        return _search_failure("search_unavailable", "search_unavailable", attempts, started, "搜索桥不可用，未产生可核验证据", tool_status)
     assessment = observation["assessment"]
     evidence = _search_result_evidence(observation)
     entity_match, topic_match = assessment["entity_match"], assessment["topic_match"]
@@ -271,30 +301,39 @@ def resolve_identity(identity: dict | None, observation: dict | None) -> dict:
     evidence_text = _normalise(" ".join(f"{item['title']} {item['excerpt']}" for item in evidence))
     if entity_match == "confirmed" and evidence and entity_terms and not any(_normalise(term) in evidence_text for term in entity_terms):
         entity_match = "ambiguous"
+    # A source account name alone (公众号/账号柄名) must not be auto-promoted to
+    # a person or organization, so it can never drive verified/corroborated.
+    only_source_account = all(item["type"] == "source_account" for item in identity["entities"])
     strong = bool(identity["entities"]) and entity_match == "confirmed" and topic_match == "strong"
     if not identity["entities"]:
-        return {**_failure("mismatch", "entity_missing", attempts, started, "身份包没有可消歧实体"), "topic_match": topic_match, "search_observation": {"query_count": len(observation.get("queries", [])), "result_count": len(evidence), "tool_status": observation.get("tool_status")}}
-    if entity_match in {"ambiguous", "none"} or topic_match == "none":
+        return {**_search_failure("mismatch", "entity_missing", attempts, started, "身份包没有可消歧实体", tool_status, len(evidence)), "topic_match": topic_match}
+    if not evidence:
+        # 搜索成功但没有返回结果：证据缺失，不是冲突，绝不能记成 mismatch。
+        status, score, reason = "insufficient_evidence", None, "search_no_results"
+    elif entity_match in {"ambiguous", "none"} or topic_match == "none":
         status, score, reason = "mismatch", None, "entity_or_topic_mismatch"
-    elif strong and ("official" in levels or "wikipedia" in levels):
+    elif entity_match == "unknown" or topic_match == "unknown":
+        status, score, reason = "insufficient_evidence", None, "insufficient_authority_evidence"
+    elif strong and not only_source_account and ("official" in levels or "wikipedia" in levels):
         status, score, reason = "verified", 8.0, "entity_expertise_topic_verified"
         if "official" in levels and len([item for item in evidence if item["source_level"] != "search_snippet"]) >= 2:
             score, reason = 9.0, "entity_expertise_topic_corroborated"
-    elif strong and "baidu" in levels:
+    elif strong and not only_source_account and "baidu" in levels:
         # 百度百科单源已足够核验知名实体（实体确认 + 主题强相关）：百度百科能搜到的人权威性明显较高
         status, score, reason = "verified", 7.0, "baidu_entity_verified"
-    elif "baidu" in levels and ("official" in levels or "reputable_secondary" in levels):
+    elif not only_source_account and "baidu" in levels and ("official" in levels or "reputable_secondary" in levels):
         status, score, reason = "corroborated", 7.0, "baidu_corroborated"
-    elif strong and len([item for item in evidence if item["source_level"] == "reputable_secondary"]) >= 2:
+    elif strong and not only_source_account and len([item for item in evidence if item["source_level"] == "reputable_secondary"]) >= 2:
         status, score, reason = "corroborated", 7.0, "reputable_secondary_corroborated"
     else:
         suggested = assessment.get("suggested_score")
         if isinstance(suggested, (int, float)) and not isinstance(suggested, bool) and suggested > 0:
             bounded = min(max(float(suggested), 0.0), 8.0)
             score = min(DIMENSION_SCORES, key=lambda value: abs(value - bounded))
-            status, reason = "inferred", "model_knowledge_inferred"
+            status = "inferred"
+            reason = "source_account_only_inferred" if only_source_account else "evidence_insufficient_inferred"
         else:
-            status, score, reason = "mismatch", None, "insufficient_authority_evidence"
+            status, score, reason = "insufficient_evidence", None, "insufficient_authority_evidence"
     evidence = [dict(item, verified=status in {"verified", "corroborated"} and item["source_level"] != "search_snippet") for item in evidence]
     # A non-success result must not repeat a positive search assessment;
     # otherwise a mismatch card can read like verified evidence.

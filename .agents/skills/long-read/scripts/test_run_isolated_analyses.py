@@ -5,10 +5,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -230,6 +232,92 @@ def test_retry_budget_is_total_per_task():
         assert len(calls) == 1 and calls[0] <= 0.01
 
 
+def test_deterministic_output_validation_error_is_not_retried():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        calls = []
+
+        def too_short(*args, **kwargs):
+            calls.append(1)
+            raise runner.OutputValidationError("article-decode output is too short: 10 < 300")
+
+        runner._call_once = too_short
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
+        finally:
+            runner._call_once = original
+        assert result["status"] == "failed"
+        assert result["attempts"] == 1 and len(calls) == 1
+        assert result["error_type"] == "output_validation"
+        assert result["attempts_detail"] == [{
+            "attempt": 1, "error_type": "output_validation",
+            "error": "article-decode output is too short: 10 < 300", "elapsed_seconds": result["attempts_detail"][0]["elapsed_seconds"],
+        }]
+        assert not (Path(directory) / "article-decode.md").exists()
+
+
+def test_mixed_failure_attempts_are_recorded_individually():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        original_backoff = runner.RETRY_BACKOFF_SECONDS
+        calls = []
+
+        def fail_transport_then_validation(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise socket.timeout("first attempt hit the 240s ceiling")
+            raise runner.OutputValidationError("article-decode output misses required form markers: ['证据边界']")
+
+        runner._call_once = fail_transport_then_validation
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
+        finally:
+            runner._call_once = original
+            runner.RETRY_BACKOFF_SECONDS = original_backoff
+        assert result["status"] == "failed" and result["attempts"] == 2
+        assert [item["error_type"] for item in result["attempts_detail"]] == ["timeout", "output_validation"]
+        assert "ceiling" in result["attempts_detail"][0]["error"]
+        assert "form markers" in result["attempts_detail"][1]["error"]
+        assert result["error_type"] == "output_validation"
+
+
+def test_transport_failures_record_each_attempt_then_exhaust_budget():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        original_backoff = runner.RETRY_BACKOFF_SECONDS
+        calls = []
+
+        def always_transport(*args, **kwargs):
+            calls.append(1)
+            raise urllib.error.URLError("connection refused")
+
+        runner._call_once = always_transport
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
+        finally:
+            runner._call_once = original
+            runner.RETRY_BACKOFF_SECONDS = original_backoff
+        assert result["status"] == "failed" and result["attempts"] == 3
+        assert len(result["attempts_detail"]) == 3
+        assert all(item["error_type"] == "URLError" for item in result["attempts_detail"])
+        assert [item["attempt"] for item in result["attempts_detail"]] == [1, 2, 3]
+
+
 def test_first_attempt_keeps_full_budget_for_slow_generation():
     with tempfile.TemporaryDirectory() as directory:
         task = runner.AnalysisTask(
@@ -349,6 +437,34 @@ def test_invalid_evidence_and_agentic_outputs_fail_closed():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_success_after_transient_failure_keeps_failed_attempt_record():
+    with tempfile.TemporaryDirectory() as directory:
+        task = runner.AnalysisTask(
+            "article-decode", skill("article-decode"), "digest", None,
+            Path(directory) / "article-decode.md", 1, (),
+        )
+        original = runner._call_once
+        original_backoff = runner.RETRY_BACKOFF_SECONDS
+        calls = []
+
+        def fail_once_then_succeed(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise socket.timeout("first attempt hit the ceiling")
+            return {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "证据边界。我的判断。" * 30}]}]}
+
+        runner._call_once = fail_once_then_succeed
+        runner.RETRY_BACKOFF_SECONDS = 0
+        try:
+            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
+        finally:
+            runner._call_once = original
+            runner.RETRY_BACKOFF_SECONDS = original_backoff
+        assert result["status"] == "completed" and result["attempts"] == 2
+        # 成功不掩盖历史：第一次失败的类型与耗时必须可见
+        assert [item["error_type"] for item in result["attempts_detail"]] == ["timeout"]
 
 
 def main():
