@@ -44,8 +44,8 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 - **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.3；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
-- **长文精读**：`long-read` 编排器，Evidence -> `run_long_read_pipeline.py` 并行独立启动本地模型解码/文字深度链路与（达标时）ChatGPT Bridge 芒格分支 -> Docx XML -> 飞书主文档；分支互不阻断，失败分支按真实状态降级交付
-- **格式保真**：芒格洞察由 ChatGPT Bridge 生成规范 Markdown，再统一渲染 Feishu XML 与 Card 2.0；编排层只提供原文和最小任务边界，不强制芒格文档套用固定标题模板，临时 Markdown 交付后清理
+- **长文精读**：`long-read` 编排器，Evidence -> `run_long_read_pipeline.py` 并行独立启动本地模型解码/文字深度链路与（达标时）ChatGPT Bridge 芒格分支（结果拼入主文档）-> Docx XML -> 飞书主文档；分支互不阻断，失败分支按真实状态降级交付
+- **格式保真**：芒格洞察由 ChatGPT Bridge 生成规范 Markdown，作为一级主章节「芒格洞察」拼进主文档，统一渲染 Feishu XML；交付卡单链接并注明「含芒格洞察」；编排层只提供原文和最小任务边界，不强制芒格章节套用固定标题模板，临时 Markdown 交付后清理
 - **卡片输出**：所有结果以飞书交互卡片回复，`--as bot` 身份发送
 
 ## 数据流
@@ -65,7 +65,7 @@ content-scoring（quality -> 条件 relevance -> decision）
                             Evidence -> article-decode + 文字 ljg
                                      （本地模型独立并行）
                                      -> Docx XML -> 飞书主文档
-                                     -> chatgpt_munger_doc=true 时 ChatGPT Bridge -> 芒格洞察文档
+                                     -> chatgpt_munger_doc=true 时 ChatGPT Bridge -> 芒格洞察章节拼入主文档
                                      -> 私聊卡片通知
                             （ljg_card=true 时额外私聊 PNG）
 ```
@@ -78,14 +78,14 @@ content-scoring（quality -> 条件 relevance -> decision）
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
 | `content-scoring` | **评分引擎**。三维质量、权威性与大问题思考、独立相关性与确定性路由；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence -> 本地模型独立并行 article-decode + 文字 ljg -> 拼接飞书主文档；可选 ChatGPT Bridge 芒格洞察文档 |
+| `long-read` | **深度编排器**。Evidence -> 本地模型独立并行 article-decode + 文字 ljg -> 拼接飞书主文档；（达标时）ChatGPT Bridge 芒格洞察章节拼入主文档 |
 | `article-decode` | **X 光解码**。只读原文与 Evidence，产出独立解码原稿 |
 
 调用关系：
 
 - `link-card` 调 `content-scoring`，按脚本返回的 `route` 走卡片或 `long-read`
 - `long-read` 调 `article-decode`（X 光），再调度外部 `ljg-*` 文字 Skill
-- `long-read` 在 `chatgpt_munger_doc=true` 时通过 Ego Lite ChatGPT Bridge 生成芒格洞察，失败关闭且不阻塞主文档；其他分析使用本地模型
+- `long-read` 在 `chatgpt_munger_doc=true` 时通过 Ego Lite ChatGPT Bridge 生成芒格洞察并作为一级主章节拼入主文档，失败关闭且不阻塞主文档；其他分析使用本地模型
 - `content-scoring` 结果传给 `long-read`，long-read 不重评
 
 ## 与 ljg-skills 的关系
@@ -133,8 +133,9 @@ content-scoring（quality -> 条件 relevance -> decision）
 1. 根 `<title>` 只保留文章标题；正文首个主章节为一级标题 `评分`
 2. 顶部：评分表 + 核心结论高亮块
 3. 主文：核心 -> 基石/边缘/暗流 -> 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字） -> 与作者对话 -> 最值得深读之处
-4. 附录：导言 + 各文字 ljg 完整原稿
-5. 文末：必要事实（若有）
+4. 芒格洞察（`chatgpt_munger_doc=true` 且分支成功时的一级主章节，失败或未达门槛时整章省略）
+5. 附录：导言 + 各文字 ljg 完整原稿
+6. 文末：必要事实（若有）
 
 ## 运行环境
 

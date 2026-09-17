@@ -19,21 +19,16 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(runner)
 
 PROMPT_ASSETS = {
-    "common.munger-soul": {
-        "prompt_id": "common.munger-soul",
-        "prompt_source": "https://example.feishu.cn/wiki/common",
-        "prompt_revision": 2,
-        "prompt_sha256": "a" * 64,
-        "prompt_fetched_at": "2026-09-16T00:00:00.000Z",
-        "content": "你是查理·芒格，思维模型收藏家。底层：提取思考本质。以芒格式简洁智慧，引导思考实现维度跃迁。",
-    },
     "read-x.munger-analysis": {
         "prompt_id": "read-x.munger-analysis",
         "prompt_source": "https://example.feishu.cn/wiki/read-x",
-        "prompt_revision": 3,
+        "prompt_revision": 7,
         "prompt_sha256": "b" * 64,
         "prompt_fetched_at": "2026-09-16T00:00:01.000Z",
-        "content": "本任务以“芒格之魂”为核心提示词来输出。原任务即：先还原作者真正试图解决的问题，不要脱离原任务另起炉灶。",
+        "content": (
+            "你是全文阅读与认知分析助手。本任务以“芒格之魂”为核心提示词来输出。原任务即：先还原作者真正试图解决的问题，不要脱离原任务另起炉灶。\n\n"
+            "【芒格之魂】\n你是查理·芒格，思维模型收藏家。底层：提取思考本质。以芒格式简洁智慧，引导思考实现维度跃迁。"
+        ),
     },
 }
 for _asset in PROMPT_ASSETS.values():
@@ -97,6 +92,8 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
         assert "真正试图解决的问题" in captured["prompt"]
         assert "本任务以“芒格之魂”为核心提示词" in captured["prompt"]
         assert "不要脱离原任务另起炉灶" in captured["prompt"]
+        # 提示词独立成篇：芒格之魂全文内嵌在 read-x.munger-analysis 正文中，不再拼接第二个资产。
+        assert "【芒格之魂】" in captured["prompt"]
         assert "Bridge 将在本段之后追加两行唯一的输出边界" in captured["prompt"]
         assert "## Overview" not in captured["prompt"]
         assert "## 工作规则" not in captured["prompt"]

@@ -54,8 +54,8 @@ link-card 流程：
 2. **文体识别**：判断是否专项文体（访谈 Q&A、周刊等），是则走专项规则
 3. **独立解码与并行编排**：Evidence 完成后，只通过 `run_long_read_pipeline.py` 并行独立启动分析分支（内部经 `run_isolated_analyses.py` 向 MoonBridge 发出独立 `store=false` HTTP 请求运行 `article-decode`）与 ChatGPT 分支；脚本必须严格校验 Evidence 并写本轮 `pipeline-summary.json`；不输出骨架或单独 X 光四层
 4. **文字深度链路**：各 ljg 由分析分支并行发出互不可见的独立 HTTP 请求；命令、路径或交付残留必须失败关闭且不落盘；只重试网络、传输、服务端临时类错误，每次尝试的错误类型与耗时写入 `attempts_detail`；`article-decode` 失败不得阻断 ChatGPT 分支，也不得丢弃已成功的 ljg 输出；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
-5. **ChatGPT Bridge 芒格后处理**：仅当 `scoring_result.chatgpt_munger_doc=true` 时由编排入口自动启动 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`；通过 Ego Lite ChatGPT Bridge 返回规范 Markdown、`verification=live-dom+snapshot`、有效会话 URL和匹配 hash，再由 `markdown_to_feishu_xml.py` 生成独立芒格洞察 XML。不接受本地模型或旧验证标记；提交前 `local-rate-limit-cooldown` 只按 Bridge 给出的等待时间安全恢复一次，可能已提交但无法确认时禁止自动重发、标记 `needs_review`；失败关闭，主精读文档仍照常交付
-6. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；成功时创建主文档与芒格洞察文档，并合并为一张私聊交付卡（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
+5. **ChatGPT Bridge 芒格后处理**：仅当 `scoring_result.chatgpt_munger_doc=true` 时由编排入口自动启动 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`；通过 Ego Lite ChatGPT Bridge 返回规范 Markdown、`verification=live-dom+snapshot`、有效会话 URL和匹配 hash，再作为一级主章节「芒格洞察」拼进 `.wx_doc.xml`（复用 `markdown_to_feishu_xml.py` 渲染层，不创建第二篇文档）。不接受本地模型或旧验证标记；提交前 `local-rate-limit-cooldown` 只按 Bridge 给出的等待时间安全恢复一次，可能已提交但无法确认时禁止自动重发、标记 `needs_review`；失败关闭，主精读文档仍照常交付
+6. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；成功时主文档含「芒格洞察」一级主章节，交付卡加 `--munger-embedded` 只放主文档单链接并注明「含芒格洞察」（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
    - `ljg_card=true` 时，主文档交付成功后再独立运行 `ljg-card`；PNG 不插入文档，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
 
 ## 关键目录
@@ -146,8 +146,8 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] 内容质量判断已完成（字数、论点、金句、结构、亲历者）
 - [ ] 高质量：Evidence / article-decode / 隔离文字 ljg / XML 飞书文档已完成，主文与附录无重复结论
 - [ ] `ljg_card=true`：文档已先交付，ljg-card PNG 私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）
-- [ ] `chatgpt_munger_doc=true`：ChatGPT Bridge 后处理成功后创建第二篇芒格洞察文档，与主文档共用一张交付卡；失败关闭且主文档仍交付
-- [ ] ChatGPT Bridge 输出经 `live-dom+snapshot`、会话 URL 和 hash 验证为规范 Markdown，再创建第二篇文档
+- [ ] `chatgpt_munger_doc=true`：ChatGPT Bridge 后处理成功后把芒格结果拼入主文档一级主章节「芒格洞察」，交付卡为单链接并注明含芒格洞察；失败关闭且主文档仍交付
+- [ ] ChatGPT Bridge 输出经 `live-dom+snapshot`、会话 URL 和 hash 验证为规范 Markdown，再拼进主文档并通过 `validate_output.py`
 - [ ] 交付卡由渲染脚本生成，读回内容没有字面量 `\\n`
 - [ ] 评分卡凭据已生成并在交付卡渲染器中校验通过
 - [ ] 中低质量：摘要已生成

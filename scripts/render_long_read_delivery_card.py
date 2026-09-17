@@ -35,24 +35,25 @@ def _url(value: str) -> str:
     return value
 
 
-def render_card(*, title: str, main_url: str, munger_url: str | None = None, failure_reason: str | None = None, decision_score: float | None = None, munger_threshold: float = 8.3) -> dict:
+def render_card(*, title: str, main_url: str, munger_embedded: bool = False, failure_reason: str | None = None, decision_score: float | None = None, munger_threshold: float = 8.3) -> dict:
     _url(main_url)
-    if munger_url:
-        _url(munger_url)
-    success = bool(munger_url) and not failure_reason
-    subtitle = "主精读文档 + 芒格洞察" if success else "主精读文档"
-    columns = [{
-        "tag": "column", "width": "weighted", "weight": 1,
-        "background_style": "indigo-50", "padding": "12px",
-        "elements": [{"tag": "markdown", "content": f"**主精读文档**\n[打开主文档]({main_url})"}],
-    }]
-    if success:
-        columns.append({
+    success = munger_embedded and not failure_reason
+    subtitle = "主精读文档（含芒格洞察）" if success else "主精读文档"
+    elements = [{
+        "tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px",
+        "columns": [{
             "tag": "column", "width": "weighted", "weight": 1,
-            "background_style": "purple-50", "padding": "12px",
-            "elements": [{"tag": "markdown", "content": f"**ChatGPT 芒格洞察**\n[打开芒格文档]({munger_url})"}],
-        })
-    elements = [{"tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px", "columns": columns}]
+            "background_style": "indigo-50", "padding": "12px",
+            "elements": [{
+                "tag": "markdown",
+                "content": (
+                    "**主精读文档（含芒格洞察）**\n"
+                    f"[打开主文档]({main_url})" if success else
+                    f"**主精读文档**\n[打开主文档]({main_url})"
+                ),
+            }],
+        }],
+    }]
     if not success:
         if failure_reason:
             reason = failure_reason
@@ -78,7 +79,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--title", required=True)
     parser.add_argument("--main-url", required=True)
-    parser.add_argument("--munger-url")
+    parser.add_argument("--munger-embedded", action="store_true")
     parser.add_argument("--failure-reason")
     parser.add_argument("--decision-score", type=float)
     parser.add_argument("--munger-threshold", type=float, default=8.3)
@@ -87,7 +88,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     _load_score_evidence(args.score_evidence, args.scoring_result)
-    rendered = json.dumps(render_card(title=args.title, main_url=args.main_url, munger_url=args.munger_url, failure_reason=args.failure_reason, decision_score=args.decision_score, munger_threshold=args.munger_threshold), ensure_ascii=False, indent=2) + "\n"
+    rendered = json.dumps(render_card(title=args.title, main_url=args.main_url, munger_embedded=args.munger_embedded, failure_reason=args.failure_reason, decision_score=args.decision_score, munger_threshold=args.munger_threshold), ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")

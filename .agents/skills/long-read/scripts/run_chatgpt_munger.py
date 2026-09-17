@@ -21,7 +21,8 @@ MAX_PROMPT_CHARS = 120_000
 # 提交前冷却最多按 Bridge 给出的等待时间安全恢复一次；超过 15 分钟的冷却不挂起编排。
 MAX_COOLDOWN_WAIT_SECONDS = 900
 
-PROMPT_GOVERNANCE_IDS = ("common.munger-soul", "read-x.munger-analysis")
+# 提示词独立成篇：read-x.munger-analysis 正文内嵌芒格之魂全文，一次只读取这一个资产。
+PROMPT_GOVERNANCE_IDS = ("read-x.munger-analysis",)
 
 
 def _skill_candidates(name: str) -> list[Path]:

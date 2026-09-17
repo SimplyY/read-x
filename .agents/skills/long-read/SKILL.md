@@ -38,7 +38,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 编排只通过最薄的确定性入口 `scripts/run_long_read_pipeline.py` 启动；它并行独立拉起两条互不阻塞的分支：
 
 - **分析分支**：内部调用 `scripts/run_isolated_analyses.py` 运行 `article-decode` 和文字 ljg。脚本为每个任务读取对应完整 `SKILL.md`；为 `article-decode` 追加推断必须标为「我的判断」的证据覆盖，对含工具/写文件步骤的外部 ljg 追加固定的无工具 HTTP 交付覆盖。覆盖只约束证据身份与交付动作，不改分析使命与方法。脚本分别向本地 MoonBridge `/v1/responses` 固定发送独立 `deepseek-v4-flash` 请求；上游超时或传输失败时，在每个任务的同一总超时内对同一模型重试，不切换模型，固定 `store=false`，最多四请求并行。只重试网络、传输、服务端临时类错误；确定性的输出校验错误（过短、缺形式、工具残留）立即失败，不再重试。每次尝试的错误类型、耗时和结果都写入 `attempts_detail`，不得把“尝试两次”笼统写成“两次超时”。主 Agent 不读取这些 SKILL.md，不在自身上下文生成分析，也不得在脚本失败时回退角色扮演、SubAgent、fresh thread 或嵌套 `codex exec`。
-- **ChatGPT 分支**：当 `scoring_result.chatgpt_munger_doc=true` 时，编排入口并行运行 `scripts/run_chatgpt_munger.py`。**article-decode 失败不得阻断 ChatGPT，也不得丢弃已成功的 ljg 输出**；ChatGPT 分支不依赖任何分析分支的结果，只依赖原文。脚本每次运行实时读取并冻结 `prompt-governance` 资产 `common.munger-soul` 与 `read-x.munger-analysis`，不在本地保存可执行 Prompt 正文，并在 `chatgpt-munger-summary.json` 中记录来源、revision、Prompt/Input/Output 哈希。通过现有 Ego Lite ChatGPT Bridge 生成 Markdown，脚本必须返回 `format=markdown`、`verification=live-dom+snapshot`、有效 `conversationUrl` 和匹配的 `outputSha256`；不得接受本地模型或旧验证标记。提交前明确遇到 `local-rate-limit-cooldown` 时，只允许依据 Bridge 提供的等待时间安全恢复一次；可能已经提交但无法确认（observer-window-ended、submit-* 等）时禁止自动重发，必须标记 `needs_review`。ChatGPT Bridge 失败、超时、超长或输出校验失败均失败关闭，主精读文档仍照常交付。
+- **ChatGPT 分支**：当 `scoring_result.chatgpt_munger_doc=true` 时，编排入口并行运行 `scripts/run_chatgpt_munger.py`。**article-decode 失败不得阻断 ChatGPT，也不得丢弃已成功的 ljg 输出**；ChatGPT 分支不依赖任何分析分支的结果，只依赖原文。脚本每次运行实时读取并冻结 `prompt-governance` 资产 `read-x.munger-analysis`（正文内嵌芒格之魂全文，独立成篇），不在本地保存可执行 Prompt 正文，并在 `chatgpt-munger-summary.json` 中记录来源、revision、Prompt/Input/Output 哈希。通过现有 Ego Lite ChatGPT Bridge 生成 Markdown，脚本必须返回 `format=markdown`、`verification=live-dom+snapshot`、有效 `conversationUrl` 和匹配的 `outputSha256`；不得接受本地模型或旧验证标记。提交前明确遇到 `local-rate-limit-cooldown` 时，只允许依据 Bridge 提供的等待时间安全恢复一次；可能已经提交但无法确认（observer-window-ended、submit-* 等）时禁止自动重发，必须标记 `needs_review`。ChatGPT Bridge 失败、超时、超长或输出校验失败均失败关闭，主精读文档仍照常交付。
 
 阈值与触发条件只消费 `scoring_result`（`score_status=scored` 且 `route=long_read`，直接使用 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`），**不得重新评分或复制阈值**。区间内只有存在互不重复的独立问题才取上限；`scoring_result.questions` 优先作为问题来源。`ljg_card=true` 时必须等主文档创建和通知成功后才开始。
 
@@ -54,7 +54,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 - `主精读完成，ChatGPT 待复核`：`chatgpt_munger_doc=true` 但 ChatGPT 分支未成功——主文档可交付，交付卡必须注明待复核，整轮不得标成“精读完成”；
 - `主文档降级交付`：`article-decode` 或部分 ljg 失败——按 `references/routing.md` 降级，交付内容必须明确列出缺失的分析分支。
 
-Markdown 是本轮唯一临时源，使用 `markdown_to_feishu_xml.py` 生成第二篇 Docx XML。
+Markdown 是本轮唯一临时源。ChatGPT 芒格结果成功时，作为一个一级主章节拼进主文档；**不再创建第二篇 Docx XML**。
 
 为每条文字 ljg 创建只含唯一问题的独立文件，然后运行编排入口：
 
@@ -92,6 +92,8 @@ python3 .agents/skills/long-read/scripts/run_long_read_pipeline.py \
 - 补最少的连接语；
 - 转义并排版为 Docx XML。
 
+`chatgpt_munger_doc=true` 且 ChatGPT 分支成功时，把 `chatgpt-munger.md` 渲染为一级主章节「芒格洞察」拼进 `.wx_doc.xml`（可复用 `markdown_to_feishu_xml.py` 的共享渲染层，只取其正文块，不带独立文档标题、溯源段和重复 callout）；只做排版与去重，不改语义。失败或未达门槛时整章省略。
+
 文档根 `<title>` 只承载文章标题，正文不得再次输出同名标题。正文第一个主章节必须是 `<h1>评分</h1>`；评分、原文金句、文章真正的核心、基石 / 边缘 / 暗流、值得研究的相关问题、与作者对话、最值得深读之处、附录和必要事实均为一级主章节，附录内各文字 Skill 边界使用 `h2`，其内部标题使用 `h3` 或更低层级。
 
 不要把独立 Skill 的表达统一改写成平直白话。相同证据可以复用，相同结论只能出现一次。能套在无关文章上的泛化句删除。
@@ -112,8 +114,9 @@ python3 .agents/skills/long-read/scripts/run_long_read_pipeline.py \
 7. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
 8. 与作者对话；
 9. 最值得深读之处；
-10. 附录：独立深度分析；
-11. 必要事实（若有，文末）。
+10. 芒格洞察（仅 ChatGPT 分支成功时，一级主章节；失败或未达门槛时整章省略）；
+11. 附录：独立深度分析；
+12. 必要事实（若有，文末）。
 
 不输出「骨架」章节，不再输出独立的「X 光四层」。普通文章最多 5 条原文金句；确有足够密度时最多 8 条；允许更少，禁止凑数。
 原文为英文时，用户可见的金句以中文译文为主展示并遵守信达雅（忠实原意、通顺自然、文采得体），英文原句紧随其后作溯源附注，格式「译文（原文：English original）」；Evidence 层仍保留逐字英文原文供 `validate_output.py` 校验，翻译只作用于成品展示，不改变证据层。
@@ -123,8 +126,8 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 ## 6. 交付顺序
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
-1. 生成 `.wx_doc.xml` 后先运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。若 `chatgpt_munger_doc=true` 且后处理成功，再用 `markdown_to_feishu_xml.py` 创建独立的芒格洞察 Docx XML；
-2. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。成功时同时放主文档和芒格文档链接；ChatGPT Bridge 或第二篇文档失败时只放主文档链接并注明待复核；`chatgpt_munger_doc=false`（未达 `chatgpt_munger_threshold`）时，把 `--decision-score` 与 `--munger-threshold`（取运行级 Base 快照值，缺失时 8.3）一并传入，让卡片显示「综合决策分 X.X，未达 ChatGPT 芒格门槛 Y.Y」而不是裸「未生成」。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
+1. 若 `chatgpt_munger_doc=true` 且后处理成功，先把 `chatgpt-munger.md` 拼进 `.wx_doc.xml` 的一级主章节「芒格洞察」，再运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。**不创建第二篇芒格文档**；
+2. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。成功时加 `--munger-embedded`，卡片只放主文档链接并在副标题注明「含芒格洞察」；ChatGPT Bridge 失败时只放主文档链接并注明待复核；`chatgpt_munger_doc=false`（未达 `chatgpt_munger_threshold`）时，把 `--decision-score` 与 `--munger-threshold`（取运行级 Base 快照值，缺失时 8.3）一并传入，让卡片显示「综合决策分 X.X，未达 ChatGPT 芒格门槛 Y.Y」而不是裸「未生成」。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
 3. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
    ```bash
@@ -153,10 +156,10 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 ## 自检
 
 - [ ] 是否消费 content-scoring 的 `scoring_result`，而非自行评分？
-- [ ] `chatgpt_munger_doc=true` 时是否先运行 ChatGPT Bridge 后处理，再创建第二篇文档并与主文档合并为一张交付卡？
+- [ ] `chatgpt_munger_doc=true` 且 ChatGPT 分支成功时，是否把芒格结果拼进主文档一级主章节「芒格洞察」，且没有创建第二篇文档？
 - [ ] ChatGPT Bridge 后处理失败时是否失败关闭，且主精读文档仍可交付？
 - [ ] ChatGPT Bridge 是否返回 Markdown、`verification=live-dom+snapshot`、有效会话 URL 和匹配 hash？
-- [ ] `chatgpt-munger-summary.json` 是否包含 `common.munger-soul`、`read-x.munger-analysis` 的来源、revision、Prompt/Input/Output 哈希？
+- [ ] `chatgpt-munger-summary.json` 是否包含 `read-x.munger-analysis` 的来源、revision、Prompt/Input/Output 哈希？
 - [ ] 芒格 Markdown 是否只在本轮临时目录存在，且文档/卡片读回后清理？
 - [ ] 交付卡是否由渲染脚本生成，读回时没有字面量 `\\n`？
 - [ ] 交付卡是否携带本轮 `score-gate.json`，且评分凭据校验通过？

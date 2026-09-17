@@ -61,7 +61,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 ## 5. 文档拼接
 
-主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再由共享 `feishu-doc-renderer`（read-x 的 `markdown_to_feishu_xml.py` 兼容入口）生成 XML，禁止把模型纯文本直接拼进文档。编排层只传递原文、实时读取并冻结的 `common.munger-soul` 与 `read-x.munger-analysis` 资产和最小边界，不把固定八标题或其他外层模板塞进模型请求：
+主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再作为一级主章节「芒格洞察」拼进主文档，**禁止创建第二篇文档**，也禁止把模型纯文本直接拼进文档。编排层只传递原文、实时读取并冻结的 `read-x.munger-analysis` 资产（正文内嵌芒格之魂全文，独立成篇）和最小边界，不把固定八标题或其他外层模板塞进模型请求：
 
 1. 先从 `article-decode` 选择主文；
 2. 对照所有文字 ljg 删除重复结论；
@@ -97,7 +97,7 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
   --jq '.data.message_id'
 ```
 
-只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。ChatGPT Bridge 芒格文档属于主文档交付前的可选后处理；失败时保留主文档交付。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
+只有取得主文档 URL 且主交付完成后，才能进入 ljg-card。ChatGPT Bridge 芒格结果属于主文档交付前的可选后处理，成功时作为一级主章节「芒格洞察」拼入主文档，不创建第二篇文档；失败时保留主文档交付。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
 
 ### ljg-card 后置任务
 
@@ -136,6 +136,6 @@ lark-cli im +messages-send --as bot --chat-id <chatId> \
 - `.wx_doc.xml`
 - `/tmp/link_card.json`
 - `/tmp/ljg_cast_*.html`
-- `chatgpt-munger.md`、`chatgpt-munger-summary.json` 和芒格 XML
+- `chatgpt-munger.md`、`chatgpt-munger-summary.json`
 
 不要删除与本轮无关的既有文件。

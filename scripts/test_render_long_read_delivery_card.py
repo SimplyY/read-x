@@ -16,14 +16,16 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(card)
 
 
-def test_success_card_has_two_links_and_real_newline():
-    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_url="https://feishu.cn/docx/munger")
+def test_success_card_has_single_link_and_real_newline():
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_embedded=True)
     payload = json.loads(json.dumps(value, ensure_ascii=False))
     contents = [element["content"] for column in payload["body"]["elements"][0]["columns"] for element in column["elements"]]
     assert any("\n" in content for content in contents)
     assert all("\\n" not in content for content in contents)
-    assert any("munger" in content for content in contents)
-    assert any("ChatGPT 芒格洞察" in content for content in contents)
+    assert all("munger" not in content for content in contents)
+    assert any("主精读文档（含芒格洞察）" in content for content in contents)
+    links = [content for content in contents if "https://feishu.cn/docx/main" in content]
+    assert len(links) == 1
 
 
 def test_failure_card_only_has_main_link():
