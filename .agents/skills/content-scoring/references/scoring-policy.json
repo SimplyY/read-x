@@ -12,11 +12,11 @@
     },
     "insight_explanatory": {
       "label": "洞察解释力",
-      "weight": 0.40
+      "weight": 0.45
     },
     "transfer_durability": {
       "label": "长期迁移价值",
-      "weight": 0.40
+      "weight": 0.35
     }
   },
   "importance_weight": 0.30,
