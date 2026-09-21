@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run article-decode and selected text ljg skills in isolated MoonBridge requests."""
+"""Run article-decode and selected text ljg skills in isolated ChatGPT web-bridge conversations."""
 from __future__ import annotations
 
 import argparse
@@ -8,24 +8,20 @@ import hashlib
 import json
 import os
 import re
-import socket
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
+from chatgpt_bridge import run_bridge, verified_text
 from validate_output import check_quotes_substring, check_structure
 
 
-ENDPOINT = "http://127.0.0.1:38441/v1/responses"
-MODEL = "deepseek-v4-flash"
-MODEL_CANDIDATES = (MODEL,)
-MAX_TASKS = 4
-RETRY_ATTEMPTS = 3
-RETRY_BACKOFF_SECONDS = 5.0
+MAX_TASKS = 3
+MAX_PROMPT_CHARS = 120_000
+MAX_COOLDOWN_WAIT_SECONDS = 900
 ALLOWED_LJG = {
     "ljg-learn", "ljg-qa", "ljg-roundtable", "ljg-think", "ljg-word", "ljg-writes",
 }
@@ -33,13 +29,13 @@ SKILLS_ROOT = Path(__file__).resolve().parents[2]
 ARTICLE_SKILL = SKILLS_ROOT / "article-decode/SKILL.md"
 ARTICLE_RUNTIME_OVERRIDE = """
 
-# long-read 独立 HTTP 证据覆盖
+# long-read 独立会话证据覆盖
 
 当前是无前序对话的独立文本请求。直接输出最终 Markdown 解码原稿。标题后必须先写：“> 证据边界：除原文明确陈述和逐字引用外，以下结构、动机、盲点与外推均为我的判断。”不得把推断写成作者自述或已证事实。
 """.strip()
 TEXT_RUNTIME_OVERRIDE = """
 
-# long-read 无工具 HTTP 运行覆盖
+# long-read 无工具独立会话运行覆盖
 
 当前是无工具、无文件系统、无后续用户交互的独立文本请求。完整保留上方 Skill 的分析使命、方法、语气与质量要求，但覆盖其交付动作：
 
@@ -77,6 +73,10 @@ TOOL_PATTERNS = {
     "local_path": re.compile(r"~/Documents/notes|~/Downloads|文件已写入|报告文件路径"),
     "voice_notice": re.compile(r"Running \*\*.*\*\* in \*\*"),
 }
+BRIDGE_BOUNDARY = """
+
+【调用层边界】
+Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ class AnalysisTask:
 
 
 class OutputValidationError(RuntimeError):
-    """Deterministic output rejection (too short, missing form, artifacts).
+    """Deterministic output rejection (too short, missing form, artifacts, oversized prompt).
 
     Retrying cannot change the outcome, so the caller must not spend the
     remaining budget on it.
@@ -159,36 +159,27 @@ def validate_evidence(evidence: str, source: str) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def extract_output(
-    result: dict,
-    task_name: str,
-    min_output_chars: int,
-    required_markers: tuple[str, ...],
-) -> str:
-    if result.get("status") != "completed":
-        raise RuntimeError(f"{task_name} incomplete: {result.get('incomplete_details')}")
-    texts = [
-        content.get("text")
-        for item in result.get("output", []) if item.get("type") == "message"
-        for content in item.get("content", []) if content.get("type") == "output_text"
-    ]
-    if len(texts) != 1 or not isinstance(texts[0], str) or not texts[0].strip():
-        raise RuntimeError(f"{task_name} returned no unique non-empty output_text")
-    output = texts[0].strip()
-    if not isinstance(output, str) or not output.strip():
-        raise RuntimeError(f"{task_name} returned no unique non-empty output_text")
-    visible_chars = len(re.sub(r"\s+", "", output))
-    if visible_chars < min_output_chars:
-        raise OutputValidationError(f"{task_name} output is too short: {visible_chars} < {min_output_chars}")
-    missing = [marker for marker in required_markers if marker not in output]
+def build_task_prompt(task: AnalysisTask, source: str, evidence: str) -> str:
+    task_input = build_input(source, evidence, task.question)
+    prompt = f"{task.skill_text}\n\n{task_input}{BRIDGE_BOUNDARY}\n"
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise OutputValidationError(f"{task.name} prompt too large: {len(prompt)} > {MAX_PROMPT_CHARS}")
+    return prompt
+
+
+def validate_task_text(task: AnalysisTask, text: str) -> str:
+    visible_chars = len(re.sub(r"\s+", "", text))
+    if visible_chars < task.min_output_chars:
+        raise OutputValidationError(f"{task.name} output is too short: {visible_chars} < {task.min_output_chars}")
+    missing = [marker for marker in task.required_markers if marker not in text]
     if missing:
-        raise OutputValidationError(f"{task_name} output misses required form markers: {missing}")
-    if task_name == "ljg-word" and re.search(r"(?m)^\s*>", output):
+        raise OutputValidationError(f"{task.name} output misses required form markers: {missing}")
+    if task.name == "ljg-word" and re.search(r"(?m)^\s*>", text):
         raise OutputValidationError("ljg-word output contains a forbidden quote block")
-    artifacts = [label for label, pattern in TOOL_PATTERNS.items() if pattern.search(output)]
+    artifacts = [label for label, pattern in TOOL_PATTERNS.items() if pattern.search(text)]
     if artifacts:
-        raise OutputValidationError(f"{task_name} output contains forbidden tool artifacts: {artifacts}")
-    return output + "\n"
+        raise OutputValidationError(f"{task.name} output contains forbidden tool artifacts: {artifacts}")
+    return text + "\n"
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -208,122 +199,79 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
-def _call_once(
-    task: AnalysisTask,
-    source: str,
-    evidence: str,
-    endpoint: str,
-    timeout: float,
-    max_output_tokens: int,
-    model: str = MODEL,
-) -> dict:
-    """Single MoonBridge attempt; raises on any failure so the caller can retry."""
-    task_input = build_input(source, evidence, task.question)
-    payload = {
-        "model": model,
-        "instructions": task.skill_text,
-        "input": task_input,
-        "max_output_tokens": max_output_tokens,
-        "store": False,
-    }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode(),
-        headers={"Content-Type": "application/json"},
-    )
+def cooldown_wait_seconds(result: dict) -> int | None:
+    """Only a pre-submit cooldown may be recovered, and only as the Bridge prescribes."""
+    if result.get("status") != "needs_review" or result.get("reason") != "local-rate-limit-cooldown":
+        return None
+    wait = result.get("retryAfterSeconds")
+    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait <= 0 or wait > MAX_COOLDOWN_WAIT_SECONDS:
+        return None
+    return int(wait)
+
+
+def record_attempt(result: dict) -> dict:
+    return {key: result.get(key) for key in ("status", "reason", "retryAfterSeconds")}
+
+
+def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: float) -> dict:
+    """One bridge conversation per task; uncertain submissions are never auto-resent."""
     started = time.perf_counter()
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=timeout) as response:
-        result = json.load(response)
-    output = extract_output(result, task.name, task.min_output_chars, task.required_markers)
-    atomic_write(task.output_path, output)
+    digests = {
+        "skill_sha256": task.skill_sha256,
+        "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
+    }
+    attempts: list[dict] = []
+    try:
+        prompt = build_task_prompt(task, source, evidence)
+        digests["input_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+        result = run_bridge(prompt, max_wait_seconds=max_wait_seconds)
+        attempts.append(record_attempt(result))
+        cooldown = cooldown_wait_seconds(result)
+        if cooldown is not None:
+            # 提交前冷却：还没有任何内容被提交，按 Bridge 给出的等待时间安全恢复一次。
+            time.sleep(cooldown)
+            result = run_bridge(prompt, max_wait_seconds=max_wait_seconds)
+            attempts.append(record_attempt(result))
+        output = validate_task_text(task, verified_text(result))
+        atomic_write(task.output_path, output)
+    except OutputValidationError as exc:
+        return {
+            "task": task.name,
+            "status": "failed",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "attempts": len(attempts),
+            "attempts_detail": attempts,
+            "error_type": "output_validation",
+            **digests,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "task": task.name,
+            "status": "failed",
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "attempts": len(attempts),
+            "attempts_detail": attempts,
+            "error_type": attempts[-1].get("reason") or type(exc).__name__ if attempts else type(exc).__name__,
+            **digests,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     return {
         "task": task.name,
         "status": "completed",
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "output": str(task.output_path),
         "output_chars": len(output.rstrip("\n")),
-        "skill_sha256": task.skill_sha256,
-        "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
-        "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
-        "usage": result.get("usage", {}),
-    }
-
-
-def call_task(
-    task: AnalysisTask,
-    source: str,
-    evidence: str,
-    endpoint: str,
-    timeout: float,
-    max_output_tokens: int,
-    model: str = MODEL,
-) -> dict:
-    """Run one task with a bounded retry budget; a later task may continue after failure.
-
-    只重试网络、传输、服务端临时类错误；确定性的输出校验错误（OutputValidationError）
-    立即失败，不再消耗预算。每次尝试的错误类型、耗时与结果都记录进 attempts_detail，
-    不得把"尝试了两次"笼统写成"两次超时"。
-    """
-    task_input = build_input(source, evidence, task.question)
-    digests = {
-        "skill_sha256": task.skill_sha256,
-        "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
-        "input_sha256": hashlib.sha256(task_input.encode()).hexdigest(),
-    }
-    last_error = None
-    last_error_type = None
-    attempts_detail: list[dict] = []
-    started = time.perf_counter()
-    deadline = time.monotonic() + max(float(timeout), 0.01)
-    attempts = 0
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        attempts = attempt
-        attempt_started = time.perf_counter()
-        try:
-            result = _call_once(task, source, evidence, endpoint, remaining, max_output_tokens, model=model)
-            result["attempts"] = attempt
-            result["model"] = model
-            if attempts_detail:
-                # 成功前的失败尝试也必须留痕：attempts=2 不能掩盖第一次为什么失败。
-                result["attempts_detail"] = attempts_detail
-            return result
-        except OutputValidationError as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            last_error_type = "output_validation"
-            attempts_detail.append({
-                "attempt": attempt,
-                "error_type": last_error_type,
-                "error": str(exc)[:200],
-                "elapsed_seconds": round(time.perf_counter() - attempt_started, 3),
-            })
-            break
-        except (urllib.error.URLError, socket.timeout, json.JSONDecodeError, RuntimeError, OSError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            last_error_type = type(exc).__name__
-            attempts_detail.append({
-                "attempt": attempt,
-                "error_type": last_error_type,
-                "error": str(exc)[:200],
-                "elapsed_seconds": round(time.perf_counter() - attempt_started, 3),
-            })
-            if attempt < RETRY_ATTEMPTS:
-                wait = min(RETRY_BACKOFF_SECONDS, max(0.0, deadline - time.monotonic()))
-                if wait:
-                    time.sleep(wait)
-    return {
-        "task": task.name,
-        "status": "failed",
-        "elapsed_seconds": round(time.perf_counter() - started, 3),
-        "attempts": attempts,
-        "attempts_detail": attempts_detail,
-        "error_type": last_error_type or "budget_exhausted",
         **digests,
-        "error": last_error or "task budget exhausted before any attempt",
-        "model": model if attempts else MODEL,
+        "runId": result.get("runId"),
+        "run_id": result.get("runId"),
+        "conversationUrl": result.get("conversationUrl"),
+        "conversation_url": result.get("conversationUrl"),
+        "verification": result.get("verification"),
+        "outputSha256": result.get("outputSha256"),
+        "output_sha256": result.get("outputSha256"),
+        "attempts": len(attempts),
+        **({"attempts_detail": attempts} if len(attempts) > 1 else {}),
     }
 
 
@@ -372,16 +320,14 @@ def run(
     output_dir: Path,
     task_specs: list[tuple[str, Path]],
     max_workers: int = MAX_TASKS,
-    timeout: float = 240,
-    max_output_tokens: int = 8000,
-    endpoint: str = ENDPOINT,
+    timeout: float = 360,
     article_skill_path: Path = ARTICLE_SKILL,
     skill_roots: list[Path] | None = None,
 ) -> dict:
     if not 1 <= max_workers <= MAX_TASKS:
         raise ValueError(f"max_workers must be between 1 and {MAX_TASKS}")
-    if timeout <= 0 or max_output_tokens <= 0:
-        raise ValueError("timeout and max_output_tokens must be positive")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
     source = read_input(source_path, "source")
     evidence = validate_evidence(read_input(evidence_path, "evidence"), source)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -390,7 +336,7 @@ def run(
     by_name = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
         futures = {
-            pool.submit(call_task, task, source, evidence, endpoint, timeout, max_output_tokens): task.name
+            pool.submit(run_task, task, source, evidence, timeout): task.name
             for task in tasks
         }
         for future in as_completed(futures):
@@ -399,11 +345,8 @@ def run(
     completed = sum(item["status"] == "completed" for item in results)
     return {
         "status": "completed" if completed == len(results) else "partial" if completed else "failed",
-        "model": MODEL,
-        "store": False,
-        "endpoint": endpoint,
-        "timeout_seconds": timeout,
-        "max_output_tokens": max_output_tokens,
+        "transport": "chatgpt-web-bridge",
+        "max_wait_seconds": timeout,
         "max_workers": min(max_workers, len(tasks)),
         "wall_seconds": round(time.perf_counter() - started, 3),
         "tasks": results,
@@ -417,8 +360,7 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--task", action="append", nargs=2, metavar=("SKILL", "QUESTION_FILE"), default=[])
     parser.add_argument("--max-workers", type=int, default=MAX_TASKS)
-    parser.add_argument("--timeout", type=float, default=240)
-    parser.add_argument("--max-output-tokens", type=int, default=8000)
+    parser.add_argument("--timeout", type=float, default=360)
     parser.add_argument("--summary-file", type=Path)
     args = parser.parse_args()
     try:
@@ -429,7 +371,6 @@ def main() -> int:
             [(name, Path(question)) for name, question in args.task],
             args.max_workers,
             args.timeout,
-            args.max_output_tokens,
         )
     except Exception as exc:
         print(json.dumps({"status": "failed", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))

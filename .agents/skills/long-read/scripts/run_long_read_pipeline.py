@@ -3,8 +3,8 @@
 
 并行独立启动三条分支；任何前置失败都不得阻断或丢弃其他分支：
 
-- article-decode + 文字 ljg（run_isolated_analyses，独立 MoonBridge HTTP 请求）；
-- ChatGPT Bridge 芒格精读（run_chatgpt_munger，仅当 scoring_result.chatgpt_munger_doc=true）。
+- article-decode + 文字 ljg（run_isolated_analyses，独立 ChatGPT web-bridge 会话）；
+- ChatGPT Bridge 芒格精读（run_chatgpt_munger，route=long_read 即启动，分数不再设门内门槛）。
 
 阈值与触发条件只来自 content_scoring 的 scoring_result；本脚本不复制阈值、不重算路由。
 article-decode 失败不阻断 ChatGPT，也不丢弃已成功的 ljg 输出；汇总逐分支记录状态与错误，
@@ -62,7 +62,6 @@ def _run_analyses(args, results: dict) -> None:
             [(name, Path(question)) for name, question in args.task],
             args.max_workers,
             args.timeout,
-            args.max_output_tokens,
         )
     except Exception as exc:
         # 输入校验等前置失败：记录计划中的任务后仍不阻断 ChatGPT 分支。
@@ -113,7 +112,8 @@ def delivery_state(analyses: dict, chatgpt: dict) -> dict:
 def run(args: argparse.Namespace) -> dict:
     started = time.monotonic()
     scoring = load_scoring_result(args.scoring_result)
-    chatgpt_required = bool(scoring.get("chatgpt_munger_doc"))
+    # route=long_read 即启动芒格分支；chatgpt_munger_doc 只作为评分信息随 summary 留档。
+    chatgpt_required = True
     results: dict = {"analyses": None, "chatgpt_munger": {"status": "not_required"}}
     threads = [threading.Thread(target=_run_analyses, args=(args, results), daemon=True)]
     if chatgpt_required:
@@ -131,7 +131,7 @@ def run(args: argparse.Namespace) -> dict:
             "score_status": scoring.get("score_status"),
             "route": scoring.get("route"),
             "decision_score": scoring.get("decision_score"),
-            "chatgpt_munger_doc": chatgpt_required,
+            "chatgpt_munger_doc": bool(scoring.get("chatgpt_munger_doc")),
         },
         "branches": {
             "analyses": results["analyses"],
@@ -160,8 +160,7 @@ def main() -> int:
     parser.add_argument("--scoring-result", required=True, type=Path)
     parser.add_argument("--task", action="append", nargs=2, metavar=("SKILL", "QUESTION_FILE"), default=[])
     parser.add_argument("--max-workers", type=int, default=isolated.MAX_TASKS)
-    parser.add_argument("--timeout", type=float, default=240)
-    parser.add_argument("--max-output-tokens", type=int, default=8000)
+    parser.add_argument("--timeout", type=float, default=360)
     parser.add_argument("--munger-output", type=Path)
     parser.add_argument("--munger-summary", type=Path)
     parser.add_argument("--summary-file", type=Path)

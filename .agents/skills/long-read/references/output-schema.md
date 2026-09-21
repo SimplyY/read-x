@@ -135,7 +135,7 @@ ChatGPT Bridge 后处理的 `text` 必须是规范 Markdown，且返回 `verific
 - 「骨架」章节；
 - 独立「X 光四层」章节；
 - 第二个金色高亮块；
-- ljg-card 图片或占位章节。
+- 任何图片块或占位章节（核心内容图由文档创建后经 `lark-cli docs +media-insert` 插入顶部，不属于 Docx XML）。
 
 ### 顶部评分
 
@@ -187,4 +187,4 @@ ChatGPT Bridge 后处理的 `text` 必须是规范 Markdown，且返回 `verific
 
 ## 5. 评分与深度契约
 
-评分由 content-scoring 在 link-card 阶段完成。long-read 只接受 `score_status=scored`、`route=long_read` 的结果并直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`；不复制分档，不用 `decision_score` 改变深度。文字 Skill 只在有独立问题时取区间上限，`ljg-card` 不计入文字数量。
+评分由 content-scoring 在 link-card 阶段完成。long-read 只接受 `score_status=scored`、`route=long_read` 的结果并直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`；不复制分档，不用 `decision_score` 改变深度。文字 Skill 只在有独立问题时取区间上限；核心内容图与芒格分支不设分数门槛，不计入文字数量。

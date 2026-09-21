@@ -27,9 +27,8 @@ def _args(root: Path, *, chatgpt: bool) -> argparse.Namespace:
         run_dir=run_dir,
         scoring_result=root / "scoring-result.json",
         task=[],
-        max_workers=4,
+        max_workers=3,
         timeout=1,
-        max_output_tokens=8000,
         munger_output=run_dir / "chatgpt-munger.md",
         munger_summary=run_dir / "chatgpt-munger-summary.json",
         summary_file=run_dir / "pipeline-summary.json",
@@ -67,22 +66,32 @@ def _restore(original):
     pipeline.isolated.run, pipeline.munger.run = original
 
 
-def test_all_branches_succeed_without_chatgpt_is_complete():
+def test_munger_runs_even_when_score_is_below_gate():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         args = _args(root, chatgpt=False)
         _scoring(root, chatgpt=False)
+        calls = {"isolated": 0, "munger": 0}
+
+        def fake_munger(source, output, **kwargs):
+            calls["munger"] += 1
+            return {"status": "succeeded", "output": str(output)}
+
         original = _patch({
-            "isolated": lambda *a, **k: _analyses("completed", "completed"),
+            "isolated": lambda *a, **k: (calls.__setitem__("isolated", calls["isolated"] + 1), _analyses("completed", "completed"))[1],
+            "munger": fake_munger,
         })
         try:
             summary = pipeline.run(args)
         finally:
             _restore(original)
+        # route=long_read 即启动芒格分支：评分里的 chatgpt_munger_doc=false 不再阻止启动
+        assert calls == {"isolated": 1, "munger": 1}
+        assert summary["scoring"]["chatgpt_munger_doc"] is False
+        assert summary["branches"]["chatgpt_munger"]["status"] == "succeeded"
         assert summary["delivery"]["state"] == "complete"
         assert summary["delivery"]["label"] == "精读完成"
         assert summary["delivery"]["missing_branches"] == []
-        assert summary["branches"]["chatgpt_munger"]["status"] == "not_required"
 
 
 def test_article_decode_failure_does_not_block_chatgpt_or_discard_ljg():
@@ -187,7 +196,7 @@ def test_analyses_crash_records_planned_tasks_as_missing():
         def crash(*a, **k):
             raise ValueError("invalid evidence: quotes[0] not a substring of source")
 
-        original = _patch({"isolated": crash})
+        original = _patch({"isolated": crash, "munger": lambda *a, **k: {"status": "succeeded"}})
         try:
             summary = pipeline.run(args)
         finally:

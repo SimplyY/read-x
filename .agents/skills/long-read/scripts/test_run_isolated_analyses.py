@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
-"""Focused checks for run_isolated_analyses.py using a fake MoonBridge."""
+"""Focused checks for run_isolated_analyses.py using a fake ChatGPT web-bridge."""
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import socket
 import sys
 import tempfile
 import threading
 import time
-import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -27,54 +23,48 @@ def skill(name: str) -> str:
     return f"---\nname: {name}\ndescription: test\n---\n\n# {name}\n只使用本次输入。\n"
 
 
-class Recorder:
-    def __init__(self, failing: str | None = None, short: str | None = None):
-        self.failing = failing
-        self.short = short
-        self.payloads = []
+class FakeBridge:
+    """Records prompts and returns canned runBridge results keyed by task name."""
+
+    def __init__(self, outputs: dict[str, list[dict]] | None = None):
+        self.outputs = {name: list(queue) for name, queue in (outputs or {}).items()}
+        self.prompts: list[str] = []
+        self.calls: list[dict] = []
         self.active = 0
         self.max_active = 0
         self.lock = threading.Lock()
 
+    def task_name(self, prompt: str) -> str:
+        return runner.skill_name(prompt.split("\n\n", 1)[0] + "\n")
 
-def serve(recorder: Recorder):
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            name = runner.skill_name(payload["instructions"])
-            with recorder.lock:
-                recorder.payloads.append(payload)
-                recorder.active += 1
-                recorder.max_active = max(recorder.max_active, recorder.active)
-            time.sleep(0.08)
-            with recorder.lock:
-                recorder.active -= 1
-            if name == recorder.failing:
-                self.send_response(500)
-                self.end_headers()
-                return
-            markers = "证据边界 我的判断 " if name == "article-decode" else " ".join(runner.OUTPUT_MARKERS.get(name, ()))
-            if name == "ljg-think":
-                markers = "## 第一层\n## 第二层\n## 第三层\n## 第四层"
-            output = "short" if name == recorder.short else f"# {name}\n{markers}\n" + ("有效分析。" * 140)
-            body = json.dumps({
-                "status": "completed",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": output}]}],
-                "usage": {"input_tokens": 10, "output_tokens": 2},
-            }).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    def __call__(self, prompt, *, max_wait_seconds=360, image=False, busy_retry_max_wait_seconds=600):
+        with self.lock:
+            self.prompts.append(prompt)
+            self.calls.append({"max_wait_seconds": max_wait_seconds, "image": image})
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.05)
+        with self.lock:
+            self.active -= 1
+        name = self.task_name(prompt)
+        queue = self.outputs.get(name) or []
+        if not queue:
+            raise AssertionError(f"unexpected extra bridge call for {name}")
+        return queue.pop(0)
 
-        def log_message(self, *args):
-            return
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, f"http://127.0.0.1:{server.server_port}/v1/responses"
+def succeeded(name: str, text: str | None = None) -> dict:
+    markers = "证据边界 我的判断" if name == "article-decode" else " ".join(runner.OUTPUT_MARKERS.get(name, ()))
+    body = text if text is not None else f"# {name}\n{markers}\n" + ("有效分析。" * 140)
+    return {
+        "status": "succeeded",
+        "runId": f"run-{name}",
+        "conversationUrl": "https://chatgpt.com/c/fake",
+        "verification": "live-dom+snapshot",
+        "format": "markdown",
+        "text": body,
+        "outputSha256": __import__("hashlib").sha256(body.encode("utf-8")).hexdigest(),
+    }
 
 
 def fixture(root: Path):
@@ -101,83 +91,84 @@ def fixture(root: Path):
     return source, evidence, article, skills, specs
 
 
-def test_parallel_payload_boundary_and_atomic_outputs():
-    recorder = Recorder()
-    server, endpoint = serve(recorder)
-    old_proxy = os.environ.get("http_proxy")
-    old_no_proxy = os.environ.get("no_proxy")
-    os.environ["http_proxy"] = "http://127.0.0.1:1"
-    os.environ["no_proxy"] = ""
+def patch_bridge(fake: FakeBridge):
+    original = runner.run_bridge
+    runner.run_bridge = fake
+    return lambda: setattr(runner, "run_bridge", original)
+
+
+def task_input(prompt: str) -> dict:
+    start = prompt.index("以下 JSON 是本次任务的全部输入")
+    end = prompt.index("【调用层边界】")
+    return json.loads(prompt[start:end].split("\n", 1)[1])
+
+
+def test_parallel_prompt_boundary_and_atomic_outputs():
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think")], "ljg-qa": [succeeded("ljg-qa")]})
+    restore = patch_bridge(fake)
     try:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, evidence, article, skills, specs = fixture(root)
             summary = runner.run(
-                source, evidence, root / "out", specs, endpoint=endpoint,
+                source, evidence, root / "out", specs,
                 article_skill_path=article, skill_roots=[skills],
             )
             assert summary["status"] == "completed"
-            assert summary["endpoint"] == endpoint
-            assert summary["timeout_seconds"] == 240
-            assert summary["max_output_tokens"] == 8000
-            assert recorder.max_active >= 2
+            assert summary["transport"] == "chatgpt-web-bridge"
+            assert summary["max_wait_seconds"] == 360
+            assert fake.max_active >= 2
             assert [item["task"] for item in summary["tasks"]] == ["article-decode", "ljg-think", "ljg-qa"]
             assert all(item["status"] == "completed" for item in summary["tasks"])
             assert all(item["instructions_sha256"] and item["input_sha256"] for item in summary["tasks"])
+            assert all(item["conversationUrl"] == "https://chatgpt.com/c/fake" and item["outputSha256"] for item in summary["tasks"])
             assert [path.name for path in sorted((root / "out").glob("*.md"))] == [
                 "01-ljg-think.md", "02-ljg-qa.md", "article-decode.md",
             ]
             assert not list((root / "out").glob(".*.md.*"))
-            assert len(recorder.payloads) == 3
-            for payload in recorder.payloads:
-                assert payload["model"] == "deepseek-v4-flash" and payload["store"] is False
-                assert set(payload) == {"model", "instructions", "input", "max_output_tokens", "store"}
-                assert "FORBIDDEN_PROFILE_SENTINEL" not in json.dumps(payload, ensure_ascii=False)
-                parsed = json.loads(payload["input"].split("\n", 1)[1])
-                name = runner.skill_name(payload["instructions"])
+            assert len(fake.prompts) == 3
+            for prompt in fake.prompts:
+                assert prompt.endswith(runner.BRIDGE_BOUNDARY + "\n")
+                assert "【调用层边界】" in prompt
+            for prompt in fake.prompts:
+                parsed = task_input(prompt)
+                name = runner.skill_name(prompt.split("\n\n", 1)[0] + "\n")
                 if name == "article-decode":
-                    assert runner.TEXT_RUNTIME_OVERRIDE not in payload["instructions"]
-                    assert runner.ARTICLE_RUNTIME_OVERRIDE in payload["instructions"]
+                    assert runner.TEXT_RUNTIME_OVERRIDE not in prompt
+                    assert runner.ARTICLE_RUNTIME_OVERRIDE in prompt
                 else:
-                    assert payload["instructions"].startswith(skill(name))
-                    assert runner.TEXT_RUNTIME_OVERRIDE in payload["instructions"]
-                    assert runner.TEXT_TASK_REQUIREMENTS[name] in payload["instructions"]
+                    assert prompt.startswith(skill(name))
+                    assert runner.TEXT_RUNTIME_OVERRIDE in prompt
+                    assert runner.TEXT_TASK_REQUIREMENTS[name] in prompt
                 assert parsed["source"] == source.read_text(encoding="utf-8")
                 assert json.loads(parsed["evidence"]) == json.loads(evidence.read_text(encoding="utf-8"))
                 assert ("question" in parsed) == (name != "article-decode")
     finally:
-        if old_proxy is None:
-            os.environ.pop("http_proxy", None)
-        else:
-            os.environ["http_proxy"] = old_proxy
-        if old_no_proxy is None:
-            os.environ.pop("no_proxy", None)
-        else:
-            os.environ["no_proxy"] = old_no_proxy
-        server.shutdown()
-        server.server_close()
+        restore()
 
 
 def test_one_failure_keeps_other_outputs_and_stale_outputs_are_rejected():
-    recorder = Recorder(failing="ljg-qa")
-    server, endpoint = serve(recorder)
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think")], "ljg-qa": [{"status": "needs_review", "reason": "observer-timeout"}]})
+    restore = patch_bridge(fake)
     try:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, evidence, article, skills, specs = fixture(root)
             output = root / "out"
             summary = runner.run(
-                source, evidence, output, specs, endpoint=endpoint,
+                source, evidence, output, specs,
                 article_skill_path=article, skill_roots=[skills],
             )
             assert summary["status"] == "partial"
             assert (output / "article-decode.md").is_file()
             assert (output / "01-ljg-think.md").is_file()
             assert not (output / "02-ljg-qa.md").exists()
-            assert next(item for item in summary["tasks"] if item["task"] == "ljg-qa")["status"] == "failed"
+            failed = next(item for item in summary["tasks"] if item["task"] == "ljg-qa")
+            assert failed["status"] == "failed"
+            assert failed["error_type"] == "observer-timeout"
             try:
                 runner.run(
-                    source, evidence, output, [], endpoint=endpoint,
+                    source, evidence, output, [],
                     article_skill_path=article, skill_roots=[skills],
                 )
             except ValueError as exc:
@@ -185,220 +176,91 @@ def test_one_failure_keeps_other_outputs_and_stale_outputs_are_rejected():
             else:
                 raise AssertionError("stale output must be rejected")
     finally:
-        server.shutdown()
-        server.server_close()
+        restore()
 
 
 def test_short_model_output_fails_closed():
-    recorder = Recorder(short="ljg-think")
-    server, endpoint = serve(recorder)
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think", text="短")]})
+    restore = patch_bridge(fake)
     try:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, evidence, article, skills, specs = fixture(root)
             summary = runner.run(
-                source, evidence, root / "out", specs[:1], endpoint=endpoint,
+                source, evidence, root / "out", specs[:1],
                 article_skill_path=article, skill_roots=[skills],
             )
             failed = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
             assert summary["status"] == "partial" and failed["status"] == "failed"
             assert "output is too short" in failed["error"]
+            assert failed["error_type"] == "output_validation"
             assert not (root / "out/01-ljg-think.md").exists()
     finally:
-        server.shutdown()
-        server.server_close()
+        restore()
 
 
-def test_retry_budget_is_total_per_task():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        calls = []
-
-        def slow_call(*args, **kwargs):
-            calls.append(args[4])
-            time.sleep(0.02)
-            raise RuntimeError("simulated timeout")
-
-        runner._call_once = slow_call
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 0.01, 1)
-        finally:
-            runner._call_once = original
-        assert result["status"] == "failed" and result["attempts"] == 1
-        assert len(calls) == 1 and calls[0] <= 0.01
-
-
-def test_deterministic_output_validation_error_is_not_retried():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        calls = []
-
-        def too_short(*args, **kwargs):
-            calls.append(1)
-            raise runner.OutputValidationError("article-decode output is too short: 10 < 300")
-
-        runner._call_once = too_short
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
-        finally:
-            runner._call_once = original
-        assert result["status"] == "failed"
-        assert result["attempts"] == 1 and len(calls) == 1
-        assert result["error_type"] == "output_validation"
-        assert result["attempts_detail"] == [{
-            "attempt": 1, "error_type": "output_validation",
-            "error": "article-decode output is too short: 10 < 300", "elapsed_seconds": result["attempts_detail"][0]["elapsed_seconds"],
-        }]
-        assert not (Path(directory) / "article-decode.md").exists()
-
-
-def test_mixed_failure_attempts_are_recorded_individually():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        original_backoff = runner.RETRY_BACKOFF_SECONDS
-        calls = []
-
-        def fail_transport_then_validation(*args, **kwargs):
-            calls.append(1)
-            if len(calls) == 1:
-                raise socket.timeout("first attempt hit the 240s ceiling")
-            raise runner.OutputValidationError("article-decode output misses required form markers: ['证据边界']")
-
-        runner._call_once = fail_transport_then_validation
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
-        finally:
-            runner._call_once = original
-            runner.RETRY_BACKOFF_SECONDS = original_backoff
-        assert result["status"] == "failed" and result["attempts"] == 2
-        assert [item["error_type"] for item in result["attempts_detail"]] == ["timeout", "output_validation"]
-        assert "ceiling" in result["attempts_detail"][0]["error"]
-        assert "form markers" in result["attempts_detail"][1]["error"]
-        assert result["error_type"] == "output_validation"
-
-
-def test_transport_failures_record_each_attempt_then_exhaust_budget():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        original_backoff = runner.RETRY_BACKOFF_SECONDS
-        calls = []
-
-        def always_transport(*args, **kwargs):
-            calls.append(1)
-            raise urllib.error.URLError("connection refused")
-
-        runner._call_once = always_transport
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
-        finally:
-            runner._call_once = original
-            runner.RETRY_BACKOFF_SECONDS = original_backoff
-        assert result["status"] == "failed" and result["attempts"] == 3
-        assert len(result["attempts_detail"]) == 3
-        assert all(item["error_type"] == "URLError" for item in result["attempts_detail"])
-        assert [item["attempt"] for item in result["attempts_detail"]] == [1, 2, 3]
-
-
-def test_first_attempt_keeps_full_budget_for_slow_generation():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        original_backoff = runner.RETRY_BACKOFF_SECONDS
-        timeouts = []
-
-        def fail_once_then_succeed(*args, **kwargs):
-            timeouts.append(args[4])
-            if len(timeouts) == 1:
-                raise RuntimeError("transient upstream failure")
-            return {"task": task.name, "status": "completed"}
-
-        runner._call_once = fail_once_then_succeed
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 0.3, 1)
-        finally:
-            runner._call_once = original
-            runner.RETRY_BACKOFF_SECONDS = original_backoff
-        assert result["status"] == "completed"
-        assert len(timeouts) == 2
-        assert timeouts[0] > 0.25
-        assert timeouts[1] > 0.25
-
-
-def test_model_retries_keep_one_fixed_model_after_failure():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        original_backoff = runner.RETRY_BACKOFF_SECONDS
-        seen = []
-
-        def fail_once_then_succeed(*args, **kwargs):
-            seen.append(kwargs["model"])
-            if len(seen) == 1:
-                raise RuntimeError("primary unavailable")
-            return {"task": task.name, "status": "completed"}
-
-        runner._call_once = fail_once_then_succeed
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 0.2, 1)
-        finally:
-            runner._call_once = original
-            runner.RETRY_BACKOFF_SECONDS = original_backoff
-        assert result["status"] == "completed"
-        assert seen == ["deepseek-v4-flash", "deepseek-v4-flash"]
-
-
-def test_article_failure_is_fatal_but_keeps_independent_ljg_output():
-    recorder = Recorder(failing="article-decode")
-    server, endpoint = serve(recorder)
+def test_pre_submit_cooldown_recovers_exactly_once():
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [{"status": "needs_review", "reason": "local-rate-limit-cooldown", "retryAfterSeconds": 1}, succeeded("ljg-think")]})
+    restore = patch_bridge(fake)
     try:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, evidence, article, skills, specs = fixture(root)
-            output = root / "out"
             summary = runner.run(
-                source, evidence, output, specs[:1], endpoint=endpoint,
+                source, evidence, root / "out", specs[:1],
                 article_skill_path=article, skill_roots=[skills],
             )
-            assert summary["status"] == "partial"
-            assert not (output / "article-decode.md").exists()
-            assert (output / "01-ljg-think.md").is_file()
-            article_result = next(item for item in summary["tasks"] if item["task"] == "article-decode")
-            assert article_result["status"] == "failed"
+            think = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert think["status"] == "completed" and think["attempts"] == 2
+            assert [item["reason"] for item in think["attempts_detail"]] == ["local-rate-limit-cooldown", None]
+            assert len(fake.calls) == 3
     finally:
-        server.shutdown()
-        server.server_close()
+        restore()
 
 
-def test_invalid_evidence_and_agentic_outputs_fail_closed():
-    recorder = Recorder()
-    server, endpoint = serve(recorder)
+def test_uncertain_submission_is_never_resent():
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [{"status": "needs_review", "reason": "observer-timeout"}]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            summary = runner.run(
+                source, evidence, root / "out", specs[:1],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            think = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert think["status"] == "failed" and think["attempts"] == 1
+            assert len(fake.calls) == 2
+    finally:
+        restore()
+
+
+def test_oversized_prompt_fails_closed_without_bridge_call():
+    fake = FakeBridge([])
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            huge = root / "huge.md"
+            huge.write_text("可信原文。" + "长" * runner.MAX_PROMPT_CHARS, encoding="utf-8")
+            summary = runner.run(
+                huge, evidence, root / "out", [],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            article_result = summary["tasks"][0]
+            assert article_result["status"] == "failed"
+            assert article_result["error_type"] == "output_validation"
+            assert "prompt too large" in article_result["error"]
+            assert fake.calls == []
+    finally:
+        restore()
+
+
+def test_invalid_evidence_fails_before_any_bridge_call():
+    fake = FakeBridge([])
+    restore = patch_bridge(fake)
     try:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -408,63 +270,79 @@ def test_invalid_evidence_and_agentic_outputs_fail_closed():
             evidence.write_text(json.dumps(value), encoding="utf-8")
             try:
                 runner.run(
-                    source, evidence, root / "out", specs[:1], endpoint=endpoint,
+                    source, evidence, root / "out", specs[:1],
                     article_skill_path=article, skill_roots=[skills],
                 )
             except ValueError as exc:
                 assert "unexpected top-level key: user_profile" in str(exc)
             else:
                 raise AssertionError("schema-external evidence must be rejected")
-            assert recorder.payloads == []
-
-        fake = {"status": "completed", "output": [{"type": "message", "content": [{
-            "type": "output_text", "text": "## 一\n## 二\n## 三\n## 四\n```bash\ndate +%Y%m%d\n```\n" + "执行计划" * 200,
-        }]}]}
-        try:
-            runner.extract_output(fake, "ljg-think", runner.MIN_OUTPUT_CHARS["ljg-think"], ())
-        except RuntimeError as exc:
-            assert "forbidden tool artifacts" in str(exc)
-        else:
-            raise AssertionError("agentic command output must be rejected")
-
-        fake["output"][0]["content"][0]["text"] = "原始画面 核心意象 本次提炼\n> 伪造引语\n" + "解释" * 150
-        try:
-            runner.extract_output(fake, "ljg-word", runner.MIN_OUTPUT_CHARS["ljg-word"], runner.OUTPUT_MARKERS["ljg-word"])
-        except RuntimeError as exc:
-            assert "forbidden quote block" in str(exc)
-        else:
-            raise AssertionError("unsupported quote block must be rejected")
+            assert fake.calls == []
     finally:
-        server.shutdown()
-        server.server_close()
+        restore()
 
 
-def test_success_after_transient_failure_keeps_failed_attempt_record():
-    with tempfile.TemporaryDirectory() as directory:
-        task = runner.AnalysisTask(
-            "article-decode", skill("article-decode"), "digest", None,
-            Path(directory) / "article-decode.md", 1, (),
-        )
-        original = runner._call_once
-        original_backoff = runner.RETRY_BACKOFF_SECONDS
-        calls = []
+def test_agentic_outputs_fail_closed():
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think", text=(
+        "## 第一层\n## 第二层\n## 第三层\n## 第四层\n```bash\ndate +%Y%m%d\n```\n" + "执行计划" * 200
+    ))]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            summary = runner.run(
+                source, evidence, root / "out", specs[:1],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            think = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert think["status"] == "failed"
+            assert "forbidden tool artifacts" in think["error"]
+            assert not (root / "out/01-ljg-think.md").exists()
+    finally:
+        restore()
 
-        def fail_once_then_succeed(*args, **kwargs):
-            calls.append(1)
-            if len(calls) == 1:
-                raise socket.timeout("first attempt hit the ceiling")
-            return {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "证据边界。我的判断。" * 30}]}]}
 
-        runner._call_once = fail_once_then_succeed
-        runner.RETRY_BACKOFF_SECONDS = 0
-        try:
-            result = runner.call_task(task, "source", "evidence", "endpoint", 30, 1)
-        finally:
-            runner._call_once = original
-            runner.RETRY_BACKOFF_SECONDS = original_backoff
-        assert result["status"] == "completed" and result["attempts"] == 2
-        # 成功不掩盖历史：第一次失败的类型与耗时必须可见
-        assert [item["error_type"] for item in result["attempts_detail"]] == ["timeout"]
+def test_article_failure_is_fatal_but_keeps_independent_ljg_output():
+    fake = FakeBridge({"article-decode": [{"status": "needs_review", "reason": "observer-timeout"}], "ljg-think": [succeeded("ljg-think")]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            output = root / "out"
+            summary = runner.run(
+                source, evidence, output, specs[:1],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            assert summary["status"] == "partial"
+            assert not (output / "article-decode.md").exists()
+            assert (output / "01-ljg-think.md").is_file()
+            article_result = next(item for item in summary["tasks"] if item["task"] == "article-decode")
+            assert article_result["status"] == "failed"
+    finally:
+        restore()
+
+
+def test_text_output_hash_mismatch_fails_closed():
+    bogus = succeeded("ljg-think")
+    bogus["outputSha256"] = "0" * 64
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [bogus]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            summary = runner.run(
+                source, evidence, root / "out", specs[:1],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            think = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert think["status"] == "failed"
+            assert "hash mismatch" in think["error"]
+            assert not (root / "out/01-ljg-think.md").exists()
+    finally:
+        restore()
 
 
 def main():

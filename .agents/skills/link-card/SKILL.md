@@ -271,13 +271,13 @@ fi
 
 **长摘要 / 含 ljg**：生成飞书文档 → 私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`）。
 
-`scoring_result.chatgpt_munger_doc=true` 时，long-read 在主文档交付卡之前额外完成 ChatGPT Bridge 芒格洞察文档；成功时两篇文档共用一张交付卡，失败时只交付主文档并注明待复核。
+long-read 的 ChatGPT Bridge 芒格洞察分支每篇必跑（`chatgpt_munger_doc` 只作评分留档）：成功时作为「芒格洞察」一级主章节拼入主文档，交付卡注明含芒格洞察；失败时只交付主文档并注明待复核。
 
 长文交付卡统一使用 `/Users/yuwei/code/read-x/scripts/render_long_read_delivery_card.py` 生成 CardKit 2.0 JSON，再用 `json.loads` 校验后发送。禁止手工拼接 JSON；卡片正文必须使用真实换行，发送后读回消息确认不存在字面量 `\\n`。
 
-> ⚠️ `ljg-card` 不属于文档链路。`scoring_result.ljg_card=true` 时，先创建并发送主文档卡片，再独立生成 PNG，以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）；禁止插入文档。
+> ⚠️ 核心内容图由 long-read 自动生成（`run_chatgpt_core_image.py`，Bridge image 模式）：插入文档顶部（标题后、原文链接前），PNG 以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）只发一次；失败不阻塞主文档交付。
 
-> ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接；`chatgpt_munger_doc=true` 时同一张卡追加芒格洞察文档链接。
+> ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接；芒格分支成功时卡片副标题注明「含芒格洞察」。
 >
 > ⚠️ **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完（`relevance_score`/`interest_score` 为 `null`/「待计算」/「不可用」）时，禁止发精读完成卡或文档交付卡。先补算两轴，三档全部算完才一起发卡；禁止只带质量分单发交付卡。
 
@@ -383,7 +383,7 @@ fi
 
 ## 发送卡片命令
 
-群聊场景：所有卡片（评分卡、中低质量结果卡、精读完成卡、ljg-card PNG）私聊发给触发者本人（`--user-id <bridge_context.senderId>`），不污染群聊。p2p 场景：`chatId` 即私聊会话，用 `--chat-id` 只发一次，不要再用 `--user-id` 重复发送。
+群聊场景：所有卡片（评分卡、中低质量结果卡、精读完成卡、核心内容图 PNG）私聊发给触发者本人（`--user-id <bridge_context.senderId>`），不污染群聊。p2p 场景：`chatId` 即私聊会话，用 `--chat-id` 只发一次，不要再用 `--user-id` 重复发送。
 
 发送目标裁决：
 - `chatType=group` 且 `senderType=user`：`--user-id <bridge_context.senderId>` 私聊发给触发者
@@ -408,14 +408,14 @@ lark-cli im +messages-send \
   --jq '.data.message_id'
 ```
 
-> ⚠️ 群聊场景禁止把长文阅读卡片（评分卡、精读完成卡、ljg-card PNG）发回原群；统一私聊发给 `bridge_context.senderId`。p2p 场景用 `chatId`，不要再用 `--user-id` 重复发送。
+> ⚠️ 群聊场景禁止把长文阅读卡片（评分卡、精读完成卡、核心内容图 PNG）发回原群；统一私聊发给 `bridge_context.senderId`。p2p 场景用 `chatId`，不要再用 `--user-id` 重复发送。
 
 **关键约束：**
 - `--as bot`：必须，卡片以 bot 身份发送
 - `--msg-type interactive`：必须，表示交互卡片
 - `--content`：JSON 字符串，直接传入或用文件
 - 卡片 JSON 写到临时文件 `/tmp/link_card.json`，发送后清理
-- 所有卡片（含 ljg-card PNG）群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次
+- 所有卡片（含核心内容图 PNG）群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次
 - **JSON 结构化生成（硬约束）**：卡片 JSON 必须用 `python3` 的 `json.dump` 结构化构建后写入 `/tmp/link_card.json`，禁止手拼字符串拼 JSON--手拼括号配对易错（如末尾多/少 `]`），坏 JSON 传给 `--content` 会让整张卡发不出
 - **发送前校验（硬约束）**：发送前必须跑 `python3 -c "import json;json.load(open('/tmp/link_card.json'))"` 校验合法性；校验失败则停止、修好 JSON 再发，绝不带病发送
 - **发送后确认（硬约束）**：每条 `messages-send` 必须用 `--jq '.data.message_id'` 取回 message_id 确认成功；禁止用 `tail`/截断输出判断是否发出--截断会丢 message_id，误判后重发会产生重复卡片
@@ -495,6 +495,6 @@ lark-cli im +messages-send \
 - [ ] 所有卡片 `--as bot`，不出现 user 身份
 - [ ] 评分卡已发（所有路由必发，非 scored 状态没有伪数字）
 - [ ] `quality_score ≥ quality_floor` 时，精读完成卡在相关性、兴趣两轴算完后才发出，未只带质量分单发
-- [ ] 群聊场景：评分卡、精读完成卡、ljg-card PNG 均私聊发给 `senderId`，未发回原群
+- [ ] 群聊场景：评分卡、精读完成卡、核心内容图 PNG 均私聊发给 `senderId`，未发回原群
 - [ ] p2p 场景：用 `chatId` 只发一次，未用 `--user-id` 重复发送
 - [ ] senderType=bot（bot-at-bot）：回退发原群

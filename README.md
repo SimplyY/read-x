@@ -20,10 +20,9 @@ cd read-x
 ```bash
 bunx skills add lijigang/ljg-skills -g -a codex \
   --skill ljg-think --skill ljg-learn --skill ljg-roundtable \
-  --skill ljg-qa --skill ljg-writes --skill ljg-word --skill ljg-card -y
+  --skill ljg-qa --skill ljg-writes --skill ljg-word -y
 ```
 
-`ljg-card` 需 Playwright：`cd ~/.agents/skills/ljg-card && bun install && bunx playwright install chromium`
 
 **3. 触发**
 
@@ -63,11 +62,11 @@ content-scoring（quality -> 条件 relevance -> decision）
 └──────────────────────┴──────────────────────┘
                                               ↓
                             Evidence -> article-decode + 文字 ljg
-                                     （本地模型独立并行）
-                                     -> Docx XML -> 飞书主文档
-                                     -> chatgpt_munger_doc=true 时 ChatGPT Bridge -> 芒格洞察章节拼入主文档
-                                     -> 私聊卡片通知
-                            （ljg_card=true 时额外私聊 PNG）
+                                 （ChatGPT web-bridge 独立会话并行，全局 ≤3 路、错开 ≥10 秒）
+                                 -> Docx XML -> 飞书主文档
+                                 -> ChatGPT Bridge 芒格（每篇必跑）-> 芒格洞察章节拼入主文档
+                                 -> 核心内容图（ChatGPT Bridge image 模式）插入文档顶部
+                                 -> 私聊卡片通知 + 核心图 PNG 私聊发送
 ```
 
 ## Skill 架构
@@ -78,21 +77,21 @@ content-scoring（quality -> 条件 relevance -> decision）
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
 | `content-scoring` | **评分引擎**。三维质量、权威性与大问题思考、独立相关性与确定性路由；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence -> 本地模型独立并行 article-decode + 文字 ljg -> 拼接飞书主文档；（达标时）ChatGPT Bridge 芒格洞察章节拼入主文档 |
+| `long-read` | **深度编排器**。Evidence -> ChatGPT web-bridge 独立会话并行 article-decode + 文字 ljg -> 拼接飞书主文档；ChatGPT Bridge 芒格洞察章节拼入主文档 + 核心内容图置顶 |
 | `article-decode` | **X 光解码**。只读原文与 Evidence，产出独立解码原稿 |
 
 调用关系：
 
 - `link-card` 调 `content-scoring`，按脚本返回的 `route` 走卡片或 `long-read`
 - `long-read` 调 `article-decode`（X 光），再调度外部 `ljg-*` 文字 Skill
-- `long-read` 在 `chatgpt_munger_doc=true` 时通过 Ego Lite ChatGPT Bridge 生成芒格洞察并作为一级主章节拼入主文档，失败关闭且不阻塞主文档；其他分析使用本地模型
+- `long-read` 通过 Ego Lite ChatGPT web-bridge 以独立会话生成全部分析内容（article-decode、文字 ljg、芒格洞察、核心内容图），芒格每篇必跑、失败关闭且不阻塞主文档；全局并发 ≤3 路、会话发起错开 ≥10 秒
 - `content-scoring` 结果传给 `long-read`，long-read 不重评
 
 ## 与 ljg-skills 的关系
 
 [`ljg-skills`](https://github.com/lijigang/ljg-skills) 是独立的外部 Skill 仓库，通过 [skills CLI](https://github.com/vercel-labs/skills) 安装到全局 `~/.agents/skills/`，**不在本仓库内**。
 
-`long-read` 通过 `references/routing.md` 调度其中 7 个 Skill；文字分析由独立 HTTP 请求运行，互不可见：
+`long-read` 通过 `references/routing.md` 调度其中 6 个 Skill；文字分析由 ChatGPT web-bridge 独立会话运行，互不可见：
 
 | 触发条件 | Skill |
 |----------|-------|
@@ -102,7 +101,6 @@ content-scoring（quality -> 条件 relevance -> decision）
 | 长因果链、逐问推进 | `ljg-qa` |
 | 值得独立成文批评 | `ljg-writes` |
 | 罕见概念或单词 | `ljg-word` |
-| `ljg_card=true` 生成卡片图 | `ljg-card`（私聊触发者，不进文档） |
 
 文字数量直接消费 `content-scoring` 的 `ljg_range`；相关性只影响边界文章是否进入 long-read，不改变深度。
 
@@ -118,8 +116,9 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
-| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 通过本地 MoonBridge 并行运行独立 article-decode 与文字 ljg |
-| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 达到运行时门槛时调用 ChatGPT Bridge 生成芒格洞察原稿 |
+| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 经 ChatGPT web-bridge 并行运行独立 article-decode 与文字 ljg 会话 |
+| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 调用 ChatGPT Bridge 生成芒格洞察原稿（每篇必跑） |
+| `.agents/skills/long-read/scripts/run_chatgpt_core_image.py` | 调用 ChatGPT Bridge image 模式对完整精读 markdown 生成核心内容图 PNG |
 | `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 长读编排入口：并行独立启动分析分支与 ChatGPT 分支并汇总交付状态 |
 | `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
 | `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |
@@ -133,7 +132,7 @@ content-scoring（quality -> 条件 relevance -> decision）
 1. 根 `<title>` 只保留文章标题；正文首个主章节为一级标题 `评分`
 2. 顶部：评分表 + 核心结论高亮块
 3. 主文：核心 -> 基石/边缘/暗流 -> 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字） -> 与作者对话 -> 最值得深读之处
-4. 芒格洞察（`chatgpt_munger_doc=true` 且分支成功时的一级主章节，失败或未达门槛时整章省略）
+4. 芒格洞察（ChatGPT Bridge 分支成功时的一级主章节，失败时整章省略并注明待复核）
 5. 附录：导言 + 各文字 ljg 完整原稿
 6. 文末：必要事实（若有）
 

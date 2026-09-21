@@ -710,19 +710,27 @@ def test_quality_generator_is_closed_book_and_schema_bound():
     assert quality_generator.select_units(dimensions, 5) == [1, 2, 3, 4, 5]
 
 
-def test_chatgpt_bridge_is_reserved_for_munger():
+def test_chatgpt_bridge_is_reserved_for_long_read_content():
     root = Path(cs.__file__).parents[1]
-    non_munger = (
+    # 评分链路（quality/authority/relevance）不得直连 ChatGPT web-bridge
+    scoring_only = (
         root / "scripts/generate_quality.py",
         root / "scripts/generate_authority.py",
         root / "scripts/generate_relevance.py",
-        root / ".agents/skills/long-read/scripts/run_isolated_analyses.py",
     )
-    for path in non_munger:
+    for path in scoring_only:
         source = path.read_text(encoding="utf-8")
         assert "chatgpt_bridge" not in source and "run_bridge(" not in source
-    munger = (root / ".agents/skills/long-read/scripts/run_chatgpt_munger.py").read_text(encoding="utf-8")
-    assert "chatgpt_bridge" in munger and "run_bridge(" in munger
+    # 长读内容生成全部走 ChatGPT web-bridge，不再使用 MoonBridge
+    long_read = (
+        root / ".agents/skills/long-read/scripts/run_isolated_analyses.py",
+        root / ".agents/skills/long-read/scripts/run_chatgpt_munger.py",
+        root / ".agents/skills/long-read/scripts/run_chatgpt_core_image.py",
+    )
+    for path in long_read:
+        source = path.read_text(encoding="utf-8")
+        assert "chatgpt_bridge" in source and "run_bridge(" in source
+        assert "38441" not in source and "deepseek-v4-flash" not in source
 
 
 def test_model_retries_share_one_total_deadline():
