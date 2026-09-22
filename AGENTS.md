@@ -78,7 +78,7 @@ python3 scripts/prepare_scoring_run.py "<mp.weixin.qq.com URL>"
 python3 scripts/fetch_base_config.py --output <run_dir>/base-config.json
 
 # 创建飞书文档（long-read 输出用）
-lark-cli docs +create --content @.wx_doc.xml --parent-position my_library
+lark-cli docs +create --as bot --content @.wx_doc.xml --parent-position my_library
 
 # 发卡片（群聊场景私聊发 senderId；p2p 场景发 chatId，只发一次）
 # 群聊：

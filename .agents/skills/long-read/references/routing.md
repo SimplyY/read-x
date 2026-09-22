@@ -78,7 +78,8 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 ```bash
 lark-cli docs +create \
   --content @.wx_doc.xml \
-  --parent-position my_library
+  --parent-position my_library \
+  --as bot
 ```
 
 创建前必须读取当前 CLI 内置的 `lark-doc` XML、style、create workflow。开发验证使用 `--dry-run`，不得创建测试文档。
@@ -113,7 +114,7 @@ python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
 脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题后、原文链接前）：
 
 ```bash
-lark-cli docs +media-insert --doc <文档URL> \
+lark-cli docs +media-insert --as bot --doc <文档URL> \
   --file <run_dir>/core-image.png \
   --selection-with-ellipsis <原文链接段落文本> \
   --before --caption 核心内容图 --align center
