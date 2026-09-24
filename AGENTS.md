@@ -38,7 +38,7 @@ link-card 流程：
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
 - **`route=long_read`** -> long-read 全流程 -> 卡片
-- **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片
+- **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片；快速阅读必须通过 `--quick-read` 提供速读内容，缺失或为空时失败关闭
 
 **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
 

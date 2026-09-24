@@ -935,6 +935,51 @@ def test_non_scored_card_explains_failure_and_next_step():
     assert "未编造数字，已停止当前评分" in payload
 
 
+def test_quick_read_card_requires_and_renders_quick_read_content():
+    result = cs.score(
+        quality({"evidence_quality": 6.0, "insight_explanatory": 6.0, "transfer_durability": 6.0}),
+        SOURCE,
+        importance_output=importance(),
+        relevance_output=relevance(0.0, 0.0),
+    )
+    assert result["quality_label"] == "快速阅读"
+    assert result["route"] == "card"
+    try:
+        card.render_card(result, title="标题", author="", date="", url="https://example.com", score_only=False)
+    except ValueError as exc:
+        assert "快速阅读 must provide" in str(exc)
+    else:
+        raise AssertionError("quick-read cards must fail closed without content")
+
+    try:
+        card.render_card(result, title="标题", author="", date="", url="https://example.com", score_only=False, quick_read="   ")
+    except ValueError as exc:
+        assert "快速阅读 must provide" in str(exc)
+    else:
+        raise AssertionError("whitespace-only quick-read content must fail closed")
+
+    payload = json.dumps(card.render_card(
+        result, title="标题", author="", date="", url="https://example.com", score_only=False, quick_read="速读正文",
+    ), ensure_ascii=False)
+    assert "速读正文" in payload
+
+    score_only_payload = json.dumps(card.render_card(
+        result, title="标题", author="", date="", url="https://example.com", score_only=True,
+    ), ensure_ascii=False)
+    assert "仅评分" in score_only_payload
+
+    long_read = cs.score(
+        quality({"evidence_quality": 9.0, "insight_explanatory": 9.0, "transfer_durability": 9.0}),
+        SOURCE,
+        importance_output=importance(),
+        relevance_output=relevance(0.0, 0.0),
+    )
+    long_read_payload = json.dumps(card.render_card(
+        long_read, title="标题", author="", date="", url="https://example.com", score_only=False,
+    ), ensure_ascii=False)
+    assert "速读正文" not in long_read_payload
+
+
 def test_seven_anchor_profiles_match_user_ranges():
     profiles = {
         "A1": ((8.0, 9.0, 9.0), (8.5, 9.0)),

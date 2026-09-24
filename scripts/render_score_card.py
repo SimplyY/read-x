@@ -176,7 +176,7 @@ def _failure_notes(result: dict) -> str:
     return f"**处理说明**\n- 原因：{reason}\n- 已处理：未编造数字，已停止当前评分\n- 下一步：{action}"
 
 
-def render_card(result: dict, *, title: str, author: str, date: str, url: str, score_only: bool) -> dict:
+def render_card(result: dict, *, title: str, author: str, date: str, url: str, score_only: bool, quick_read: str | None = None) -> dict:
     if urlparse(url).scheme not in {"http", "https"}:
         raise ValueError("url must use http or https")
     status = result.get("score_status")
@@ -229,6 +229,11 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
         },
         _highlight(f"{result['quality_label']} · {result['quality_score']:.1f}/10", result.get("conclusion") or "无结论"),
     ]
+    if result.get("route") == "card" and result.get("quality_label") == "快速阅读" and not score_only:
+        quick_read_text = (quick_read or "").strip()
+        if not quick_read_text:
+            raise ValueError("快速阅读 must provide --quick-read content file")
+        elements.append({"tag": "markdown", "content": quick_read_text})
     notes = _status_notes(result)
     if notes:
         elements.insert(-1, {"tag": "markdown", "content": notes})

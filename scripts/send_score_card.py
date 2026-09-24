@@ -69,6 +69,7 @@ def main() -> int:
     parser.add_argument("--date", default="")
     parser.add_argument("--url", required=True)
     parser.add_argument("--score-only", action="store_true")
+    parser.add_argument("--quick-read", type=Path)
     parser.add_argument("--idempotency-key", required=True)
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--chat-id")
@@ -77,6 +78,7 @@ def main() -> int:
     args = parser.parse_args()
 
     result = json.loads(args.scoring_result.read_text(encoding="utf-8"))
+    quick_read = args.quick_read.read_text(encoding="utf-8") if args.quick_read else None
     card = render_card(
         result,
         title=args.title,
@@ -84,6 +86,7 @@ def main() -> int:
         date=args.date,
         url=args.url,
         score_only=args.score_only,
+        quick_read=quick_read,
     )
     evidence = _send(args, card)
     args.evidence_output.write_text(

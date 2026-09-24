@@ -200,6 +200,7 @@ fi
 - `score_status=needs_full_text|needs_review`：状态卡即最终卡；说明需要完整正文或人工复核，不显示任何数字。
 - `score_status=needs_relevance`：内部状态，禁止发卡。
 - `route=card`：评分卡即最终卡。评分块作为卡片头部，下方接对应摘要/金句/链接，不再单独发结果卡。
+- `route=card` 且 `quality_label=快速阅读`：发评分卡前先按「速读卡结构」提炼 200-400 字速读内容写入 `<run_dir>/quick-read.md`，发送命令加 `--quick-read <run_dir>/quick-read.md`；缺失或为空时脚本失败关闭。
 - `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
 - `score_only=true`：不论脚本 `route`，评分卡都是最终卡，显示“本次仅评分，不进入精读”后结束。
 
