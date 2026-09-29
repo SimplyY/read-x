@@ -55,8 +55,8 @@ link-card 流程：
 3. **独立解码与并行编排**：Evidence 完成后，只通过 `run_long_read_pipeline.py` 并行独立启动分析分支（内部经 `run_isolated_analyses.py` 向 ChatGPT web-bridge 发出独立会话请求运行 `article-decode` 与文字 ljg）与 ChatGPT 芒格分支；脚本必须严格校验 Evidence 并写本轮 `pipeline-summary.json`；不输出骨架或单独 X 光四层
 4. **文字深度链路**：article-decode 与各 ljg 由分析分支经 ChatGPT web-bridge 发出互不可见的独立会话请求；全局并发 ≤3 路、会话发起错开 ≥10 秒（Bridge 槽位与错峰器保证），Bridge 忙时有界排队。命令、路径或交付残留必须失败关闭且不落盘；确定性输出校验错误立即失败，只允许提交前 `local-rate-limit-cooldown` 按 Bridge 给定等待安全恢复一次，可能已提交但无法确认时禁止自动重发，每次尝试写入 `attempts_detail`；`article-decode` 失败不得阻断 ChatGPT 分支，也不得丢弃已成功的 ljg 输出；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
 5. **ChatGPT Bridge 芒格后处理**：`route=long_read` 每篇必跑，由编排入口自动启动 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`（`chatgpt_munger_doc` 只作评分留档，不再设门内门槛）；通过 Ego Lite ChatGPT Bridge 返回规范 Markdown、`verification=live-dom+snapshot`、有效会话 URL和匹配 hash，再作为一级主章节「芒格洞察」拼进 `.wx_doc.xml`（复用 `markdown_to_feishu_xml.py` 渲染层，不创建第二篇文档）。不接受本地模型或旧验证标记；提交前 `local-rate-limit-cooldown` 只按 Bridge 给出的等待时间安全恢复一次，可能已提交但无法确认时禁止自动重发、标记 `needs_review`；失败关闭，主精读文档仍照常交付
-6. **输出**：主 Agent 只摘取、去重和排版为 Docx XML；成功时主文档含「芒格洞察」一级主章节，交付卡加 `--munger-embedded` 只放主文档单链接并注明「含芒格洞察」（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
-   - 主文档拼接完成后把完整精读 markdown 落盘 `<run_dir>/main-doc.md`，运行 `.agents/skills/long-read/scripts/run_chatgpt_core_image.py`（ChatGPT Bridge image 模式）对全文生成一张核心内容图，文档创建成功后用 `lark-cli docs +media-insert` 插入文档顶部（标题后、原文链接前），PNG 再以 bot 身份私聊发给触发者一次（群聊发 `senderId`，p2p 发 `chatId`）；图片分支失败不阻塞主文档交付，卡片如实注明
+6. **输出**：主 Agent 原样完整拼接（article-decode + 每条 ljg + 芒格洞察）与排版为 Docx XML，不选择、不去重、不摘要、不压缩，也不设总字数上限；成功时主文档含「芒格洞察」一级主章节，交付卡加 `--munger-embedded` 只放主文档单链接并注明「含芒格洞察」（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
+   - 主文档拼接完成后把完整精读 markdown 落盘 `<run_dir>/main-doc.md`，运行 `.agents/skills/long-read/scripts/run_chatgpt_core_image.py`（ChatGPT Bridge image 模式）对全文生成一张核心内容图（提示词从 prompt-governance 注册表 `read-x.core-image` 拉取并校验 revision/sha256，拉取失败即止不提交），文档创建成功后用 `lark-cli docs +media-insert` 插入文档顶部（标题后、原文链接前），PNG 再以 bot 身份私聊发给触发者一次（群聊发 `senderId`，p2p 发 `chatId`）；图片分支失败不阻塞主文档交付，卡片如实注明
 
 ## 关键目录
 

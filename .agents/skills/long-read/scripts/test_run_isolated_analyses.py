@@ -140,6 +140,8 @@ def test_parallel_prompt_boundary_and_atomic_outputs():
                     assert prompt.startswith(skill(name))
                     assert runner.TEXT_RUNTIME_OVERRIDE in prompt
                     assert runner.TEXT_TASK_REQUIREMENTS[name] in prompt
+                    assert "输出完整原稿，不设上限" in prompt
+                    assert "600~1000" not in prompt
                 assert parsed["source"] == source.read_text(encoding="utf-8")
                 assert json.loads(parsed["evidence"]) == json.loads(evidence.read_text(encoding="utf-8"))
                 assert ("question" in parsed) == (name != "article-decode")

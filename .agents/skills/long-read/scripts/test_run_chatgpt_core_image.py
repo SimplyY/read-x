@@ -58,7 +58,19 @@ def patch(fake: FakeBridge):
     return lambda: (setattr(image_runner, "run_bridge", original_bridge), setattr(image_runner, "time.sleep", original_sleep))
 
 
-def test_success_writes_png_and_summary_metadata():
+def prompt_asset():
+    content = "# 任务\n\n生成核心信息图。\n\n# 内容\n\n图中所有可见文字必须与上下文内容一致。\n\n# 视觉\n\n干净可读。"
+    return {
+        "prompt_id": image_runner.PROMPT_GOVERNANCE_ID,
+        "prompt_source": "https://example.invalid/wiki/prompt",
+        "prompt_revision": 1,
+        "prompt_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "prompt_fetched_at": "2026-01-01T00:00:00.000Z",
+        "content": content,
+    }
+
+
+def test_success_fetches_governance_prompt_writes_png_and_summary():
     fake = FakeBridge([image_result()])
     restore = patch(fake)
     try:
@@ -68,17 +80,27 @@ def test_success_writes_png_and_summary_metadata():
             source.write_text(doc_text(), encoding="utf-8")
             output = root / "core-image.png"
             summary_path = root / "core-image-summary.json"
-            result = image_runner.run(source, output, summary_path=summary_path)
+            fetched_assets = []
+
+            def fetcher(prompt_id):
+                fetched_assets.append(prompt_id)
+                return prompt_asset()
+
+            result = image_runner.run(source, output, summary_path=summary_path, prompt_fetcher=fetcher)
             assert result["status"] == "succeeded"
             assert output.is_file() and output.read_bytes() == b"\x89PNG-fake-image"
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             assert summary["status"] == "succeeded" and summary["image_bytes"] == len(b"\x89PNG-fake-image")
             assert summary["conversationUrl"] == "https://chatgpt.com/c/img"
-            assert summary["instruction_sha256"] == hashlib.sha256(image_runner.CORE_IMAGE_INSTRUCTION.encode()).hexdigest()
+            assert fetched_assets == [image_runner.PROMPT_GOVERNANCE_ID]
+            assert summary["prompt_id"] == image_runner.PROMPT_GOVERNANCE_ID
+            assert summary["prompt_revision"] == 1
+            assert summary["prompt_sha256"] == prompt_asset()["prompt_sha256"]
             assert summary["source_sha256"] == hashlib.sha256(doc_text().encode()).hexdigest()
             assert fake.calls == [{"max_wait_seconds": 600, "image": True, "conversation_url": None}]
             prompt = fake.prompts[0]
-            assert image_runner.CORE_IMAGE_INSTRUCTION in prompt
+            assert "# 任务" in prompt
+            assert "图中所有可见文字必须与上下文内容一致" in prompt
             assert doc_text() in prompt
             assert prompt.endswith(image_runner.BRIDGE_BOUNDARY + "\n")
     finally:
@@ -95,7 +117,7 @@ def test_failure_is_recorded_and_never_resent():
             source.write_text(doc_text(), encoding="utf-8")
             output = root / "core-image.png"
             summary_path = root / "core-image-summary.json"
-            result = image_runner.run(source, output, summary_path=summary_path)
+            result = image_runner.run(source, output, summary_path=summary_path, prompt_fetcher=lambda _: prompt_asset())
             assert result["status"] == "needs_review" and result["reason"] == "observer-timeout"
             assert len(result["attempts"]) == 1
             assert not output.exists()
@@ -116,7 +138,7 @@ def test_pre_submit_cooldown_recovers_exactly_once():
             root = Path(directory)
             source = root / "main-doc.md"
             source.write_text(doc_text(), encoding="utf-8")
-            result = image_runner.run(source, root / "core-image.png")
+            result = image_runner.run(source, root / "core-image.png", prompt_fetcher=lambda _: prompt_asset())
             assert result["status"] == "succeeded"
             assert fake.sleeps == [2]
             assert len(fake.calls) == 2
@@ -136,7 +158,7 @@ def test_conversation_url_passthrough_and_cooldown_reuse():
             root = Path(directory)
             source = root / "main-doc.md"
             source.write_text(doc_text(), encoding="utf-8")
-            result = image_runner.run(source, root / "core-image.png", conversation_url=url)
+            result = image_runner.run(source, root / "core-image.png", conversation_url=url, prompt_fetcher=lambda _: prompt_asset())
             assert result["status"] == "succeeded"
             assert all(call["conversation_url"] == url for call in fake.calls)
             assert len(fake.calls) == 2
@@ -144,13 +166,24 @@ def test_conversation_url_passthrough_and_cooldown_reuse():
         restore()
 
 
-def test_prompt_requires_information_dense_core_image():
-    prompt = image_runner.build_prompt(doc_text())
-    assert "90-140" in prompt
-    assert "5 个相互连接的核心节点" in prompt
-    assert "无信息量标签" in prompt
-    assert "因果关系" in prompt
-    assert "适用边界" in prompt
+def test_governance_prompt_failure_stops_before_bridge():
+    fake = FakeBridge([image_result()])
+    restore = patch(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "main-doc.md"
+            source.write_text(doc_text(), encoding="utf-8")
+
+            def fetcher(prompt_id):
+                raise RuntimeError("prompt-fetch-failed")
+
+            result = image_runner.run(source, root / "core-image.png", prompt_fetcher=fetcher)
+            assert result["status"] == "needs_review" and "prompt-fetch-failed" in result["reason"]
+            assert not (root / "core-image.png").exists()
+            assert len(fake.calls) == 0
+    finally:
+        restore()
 
 
 def test_hash_mismatch_and_short_doc_fail_closed():
@@ -161,14 +194,14 @@ def test_hash_mismatch_and_short_doc_fail_closed():
             root = Path(directory)
             source = root / "main-doc.md"
             source.write_text(doc_text(), encoding="utf-8")
-            result = image_runner.run(source, root / "core-image.png")
+            result = image_runner.run(source, root / "core-image.png", prompt_fetcher=lambda _: prompt_asset())
             assert result["status"] == "needs_review" and "hash mismatch" in result["reason"]
             assert not (root / "core-image.png").exists()
 
             short = root / "short.md"
             short.write_text("太短。", encoding="utf-8")
             try:
-                image_runner.run(short, root / "core-image.png")
+                image_runner.run(short, root / "core-image.png", prompt_fetcher=lambda _: prompt_asset())
             except ValueError as exc:
                 assert "document too short" in str(exc)
             else:

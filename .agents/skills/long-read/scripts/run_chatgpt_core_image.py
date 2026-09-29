@@ -13,6 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
 from chatgpt_bridge import run_bridge, verified_image
+from run_chatgpt_munger import fetch_prompt_asset
 
 
 MAX_PROMPT_CHARS = 120_000
@@ -21,17 +22,8 @@ MAX_COOLDOWN_WAIT_SECONDS = 900
 # 单图生成通常比纯文字慢；上限对齐 Bridge 的 submit/observe 预算并留出余量。
 MAX_WAIT_SECONDS = 600
 
-# 图片指令作为仓库内版本化真源；每次运行的 sha256 记入 summary，便于追溯。
-CORE_IMAGE_INSTRUCTION = """你是一名信息图设计师。请基于下方的长文精读文档全文，生成一张「核心内容图」：
-
-- 一张图，16:9 横版，信息图风格；
-- 只表达文档真正核心的判断与结构（核心结论、关键机制或关系），不做全文摘要；
-- 图内文字使用简体中文，短语化，总量控制在 90-140 个词：足够表达核心结论、关键分支、因果关系和适用边界，不得出现长段落；
-- 至少呈现 5 个相互连接的核心节点；每个节点必须携带一个能区分本篇文章的短语，禁止用“AI”“学校”“时间”这类无信息量标签凑数；
-- 因果、取舍或边界必须用箭头、分层或标注表达；若原文包含数字、档位或对比，优先保留最有判断力的一个；
-- 构图自上而下：顶部一行点题的大标题短语，中部是核心结构或机制的可视化，底部一行出处小字（原文标题）；
-- 平面矢量插画风格，干净背景，最多三种主色，不用照片素材，不加水印、边框和装饰性图标堆砌；
-- 不得出现文档中不存在的事实；推断与原文判断在视觉上不得混淆。"""
+# 图片指令来自 prompt-governance；每次运行实时读取并校验，不在本地缓存可执行 Prompt。
+PROMPT_GOVERNANCE_ID = "read-x.core-image"
 
 BRIDGE_BOUNDARY = """
 
@@ -52,8 +44,8 @@ def visible_chars(text: str) -> int:
     return len("".join(text.split()))
 
 
-def build_prompt(doc: str) -> str:
-    prompt = f"{CORE_IMAGE_INSTRUCTION}\n\n【精读文档全文】\n{doc}{BRIDGE_BOUNDARY}\n"
+def build_prompt(doc: str, instruction: str) -> str:
+    prompt = f"{instruction.strip()}\n\n【精读文档全文】\n{doc}{BRIDGE_BOUNDARY}\n"
     if len(prompt) > MAX_PROMPT_CHARS:
         raise ValueError(f"prompt-too-large: {len(prompt)} > {MAX_PROMPT_CHARS}")
     return prompt
@@ -98,13 +90,17 @@ def _record_attempt(attempts: list[dict], result: dict) -> None:
     })
 
 
-def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None) -> dict:
+def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None, prompt_fetcher=None) -> dict:
     if output_path.exists():
         raise FileExistsError(f"output already exists: {output_path}")
     doc = _read_regular(source_path, "source")
     if visible_chars(doc) < MIN_DOC_VISIBLE_CHARS:
         raise ValueError(f"document too short for an image: {visible_chars(doc)} < {MIN_DOC_VISIBLE_CHARS}")
-    prompt = build_prompt(doc)
+    try:
+        prompt_assets = [(prompt_fetcher or fetch_prompt_asset)(PROMPT_GOVERNANCE_ID)]
+    except Exception as exc:
+        return {"status": "needs_review", "reason": str(exc)}
+    prompt = build_prompt(doc, prompt_assets[0]["content"])
     started = time.monotonic()
     attempts: list[dict] = []
     result = run_bridge(prompt, bridge=bridge_path, max_wait_seconds=MAX_WAIT_SECONDS, image=True, conversation_url=conversation_url)
@@ -144,7 +140,11 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
         "image_bytes": len(payload),
         "source_sha256": hashlib.sha256(doc.encode("utf-8")).hexdigest(),
         "conversation_url_requested": conversation_url,
-        "instruction_sha256": hashlib.sha256(CORE_IMAGE_INSTRUCTION.encode("utf-8")).hexdigest(),
+        "prompt_id": PROMPT_GOVERNANCE_ID,
+        "prompt_source": prompt_assets[0]["prompt_source"],
+        "prompt_revision": prompt_assets[0]["prompt_revision"],
+        "prompt_sha256": prompt_assets[0]["prompt_sha256"],
+        "prompt_fetched_at": prompt_assets[0]["prompt_fetched_at"],
         "input_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "attempts": attempts,
