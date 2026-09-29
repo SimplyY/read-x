@@ -144,6 +144,15 @@ def test_conversation_url_passthrough_and_cooldown_reuse():
         restore()
 
 
+def test_prompt_requires_information_dense_core_image():
+    prompt = image_runner.build_prompt(doc_text())
+    assert "90-140" in prompt
+    assert "5 个相互连接的核心节点" in prompt
+    assert "无信息量标签" in prompt
+    assert "因果关系" in prompt
+    assert "适用边界" in prompt
+
+
 def test_hash_mismatch_and_short_doc_fail_closed():
     fake = FakeBridge([image_result(outputSha256="0" * 64)])
     restore = patch(fake)
