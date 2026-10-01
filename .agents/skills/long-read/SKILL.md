@@ -16,6 +16,7 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
         与 ChatGPT Bridge 芒格（route=long_read 每篇必跑）并行独立启动；全局并发 ≤3 路、会话发起错开 ≥10 秒
      -> Markdown 渲染为 Docx XML 与 Card 2.0
      -> 核心内容图（run_chatgpt_core_image.py，输入完整精读 markdown）与文档创建并行
+     -> 芒格洞察图（同一脚本，输入芒格洞察 Markdown；芒格分支成功时必生成）
      -> lark-cli docs +media-insert 把核心图插入文档顶部（标题后、原文链接前）
      -> 发送交付卡并登记精读记录（群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次）
      -> 核心图 PNG 私聊发给触发者（只发一次）
@@ -134,16 +135,17 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
 1. 若 `chatgpt_munger_doc=true` 且后处理成功，先把 `chatgpt-munger.md` 拼进 `.wx_doc.xml` 的一级主章节「芒格洞察」，再运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。**不创建第二篇芒格文档**；
 2. 校验通过后并行执行两件事：创建主文档（`lark-cli docs +create --as bot --content @.wx_doc.xml --parent-position my_library`），以及运行核心内容图脚本 `python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/main-doc.md --output <run_dir>/core-image.png --summary <run_dir>/core-image-summary.json --conversation-url "$(jq -r '.conversationUrl // empty' <run_dir>/chatgpt-munger-summary.json)"`（ChatGPT Bridge image 模式，输入是完整精读 markdown；必须复用芒格分支的 `conversationUrl`，缺失时失败关闭并标记 `needs_review`，不得回退新窗口；失败关闭并标记 `needs_review`，禁止自动重发）；
-3. 文档与图片都就绪后，把核心图插入文档顶部（标题后、原文链接前）：`lark-cli docs +media-insert --as bot --doc <文档URL> --file <run_dir>/core-image.png --selection-with-ellipsis <原文链接段落文本> --before --caption 核心内容图 --align center`。插入失败不自动重试（防止重复插入），主文档照常交付并在交付卡注明「核心图待插入」；图片生成本身失败时跳过插入并在交付卡注明「核心图待复核」；
-4. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。芒格成功时加 `--munger-embedded`，卡片只放主文档链接并在副标题注明「含芒格洞察」；芒格失败时用 `--failure-reason` 注明待复核。图片分支失败时按第 3 步结果传入 `--image-note`。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
-5. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
+3. 芒格分支成功时，再用同一脚本对 `chatgpt-munger.md` 单独生成一张芒格洞察图：`python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/chatgpt-munger.md --output <run_dir>/munger-image.png --summary <run_dir>/munger-image-summary.json`（不插入主文档；只作为独立图片交付）；
+4. 文档与图片都就绪后，把核心图插入文档顶部（标题后、原文链接前）：`lark-cli docs +media-insert --as bot --doc <文档URL> --file <run_dir>/core-image.png --selection-with-ellipsis <原文链接段落文本> --before --caption 核心内容图 --align center`。插入失败不自动重试（防止重复插入），主文档照常交付并在交付卡注明「核心图待插入」；图片生成本身失败时跳过插入并在交付卡注明「核心图待复核」；
+5. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。芒格成功时加 `--munger-embedded`，卡片只放主文档链接并在副标题注明「含芒格洞察」；芒格失败时用 `--failure-reason` 注明待复核。图片分支失败时按第 4 步结果传入 `--image-note`。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
+6. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
    ```bash
    lark-cli base +record-upsert --base-token ASdsbB3Gka9OKNsD7YhcJ9rZnjd --table-id tbltqJwdmOmcbFlI --as user --json '{"日期":"<当天 00:00:00>","标题":"<原文标题>","来源链接":"[<原文 URL>](<原文 URL>)","云文档链接":"[<飞书文档 URL>](<飞书文档 URL>)","评分":"<quality_score>/10","是否已读":true}'
    ```
 
    要点：`日期` 取当天 `00:00:00`；`标题` 用原文标题；`来源链接`/`云文档链接` 用 markdown 链接格式 `[url](url)`（与历史记录一致）；`评分` 取 content-scoring 的 `quality_score` 去尾零（如 `9/10`、`7.5/10`）；`是否已读` 固定 `true`。标题或 URL 含 `"`、`\` 等字符时，用 `python3 -c "import json,sys;print(json.dumps(sys.stdin.read()))"` 或等价方式构造 `--json` 值，禁手工拼接破坏 JSON。回写是登记步骤，失败不阻塞主流程，仅告警不回滚、不重试阻塞文档交付；
-6. 核心图 PNG 私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：p2p 场景 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image <run_dir>/core-image.png`，群聊场景 `--user-id <bridge_context.senderId>`；`senderType=bot` 时回退发原群。图片生成本身失败时不发送 PNG；插入文档与私聊发送共用同一份 PNG，发送只执行一次。
+7. 核心图 PNG 私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：p2p 场景 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image <run_dir>/core-image.png`，群聊场景 `--user-id <bridge_context.senderId>`；`senderType=bot` 时回退发原群。图片生成本身失败时不发送 PNG；插入文档与私聊发送共用同一份 PNG，发送只执行一次。芒格洞察图 PNG 用同样的身份和目标发送一次，发送顺序放在核心图之后；生成失败时不发送。
 
 具体命令、降级和临时文件清理见 `references/routing.md`。
 
@@ -183,5 +185,6 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 - [ ] 核心内容图是否经 `run_chatgpt_core_image.py`（Bridge image 模式）生成，失败时标记 `needs_review` 且未自动重发？
 - [ ] 核心图是否插入文档顶部（标题后、原文链接前）；插入失败时交付卡注明且未重复插入？
 - [ ] 核心图 PNG 是否只发送一次（按 chatType 二选一，未同时执行 `--chat-id` 与 `--user-id`）；图片生成失败时未发送？
+- [ ] 芒格分支成功时是否用同一脚本额外生成一张芒格洞察图并私聊发送一次，生成失败时不发送？
 - [ ] 附录每条 ljg 是否各用一个注明 Skill 名的独立 h2 包裹，原稿内部小标题是否降为 h3 未占用 h2？
 - [ ] 附录每条 ljg 原稿是否做过排版加工（拆段≤100字、加粗、列表/表格、换行），且内容未删改？

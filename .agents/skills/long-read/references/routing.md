@@ -125,6 +125,19 @@ lark-cli docs +media-insert --as bot --doc <文档URL> \
 - 插入失败后自动重试插入（防止重复插入）；
 - 对同一轮文章生成第二张核心内容图。
 
+### 芒格洞察图
+
+`chatgpt-munger.md` 成功落盘后，用同一脚本单独生成：
+
+```bash
+python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
+  --source <run_dir>/chatgpt-munger.md \
+  --output <run_dir>/munger-image.png \
+  --summary <run_dir>/munger-image-summary.json
+```
+
+这张图不是第二张核心内容图，也不插入主文档；它只是芒格洞察的独立交付图。生成后按触发者身份单独发送一次，失败时不发送。
+
 ### PNG 私聊发送
 
 核心图 PNG 以 bot 身份私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：
