@@ -134,7 +134,7 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
 1. 若 `chatgpt_munger_doc=true` 且后处理成功，先把 `chatgpt-munger.md` 拼进 `.wx_doc.xml` 的一级主章节「芒格洞察」，再运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。**不创建第二篇芒格文档**；
-2. 校验通过后并行执行两件事：创建主文档（`lark-cli docs +create --as bot --content @.wx_doc.xml --parent-position my_library`），以及运行核心内容图脚本 `python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/main-doc.md --output <run_dir>/core-image.png --summary <run_dir>/core-image-summary.json --conversation-url "$(jq -r '.conversationUrl // empty' <run_dir>/chatgpt-munger-summary.json)"`（ChatGPT Bridge image 模式，输入是完整精读 markdown；必须复用芒格分支的 `conversationUrl`，缺失时失败关闭并标记 `needs_review`，不得回退新窗口；失败关闭并标记 `needs_review`，禁止自动重发）；
+2. 校验通过后并行执行两件事：创建主文档（正文写入统一走 Document Compiler 质量链，见下「主文档 dc 发布链」；M5 入口切换，禁止再直接 `lark-cli docs +create` 写正文），以及运行核心内容图脚本 `python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/main-doc.md --output <run_dir>/core-image.png --summary <run_dir>/core-image-summary.json --conversation-url "$(jq -r '.conversationUrl // empty' <run_dir>/chatgpt-munger-summary.json)"`（ChatGPT Bridge image 模式，输入是完整精读 markdown；必须复用芒格分支的 `conversationUrl`，缺失时失败关闭并标记 `needs_review`，不得回退新窗口；失败关闭并标记 `needs_review`，禁止自动重发）；
 3. 芒格分支成功时，再用同一脚本对 `chatgpt-munger.md` 单独生成一张芒格洞察图：`python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/chatgpt-munger.md --output <run_dir>/munger-image.png --summary <run_dir>/munger-image-summary.json`（不插入主文档；只作为独立图片交付）；
 4. 文档与图片都就绪后，把核心图插入文档顶部（标题后、原文链接前）：`lark-cli docs +media-insert --as bot --doc <文档URL> --file <run_dir>/core-image.png --selection-with-ellipsis <原文链接段落文本> --before --caption 核心内容图 --align center`。插入失败不自动重试（防止重复插入），主文档照常交付并在交付卡注明「核心图待插入」；图片生成本身失败时跳过插入并在交付卡注明「核心图待复核」；
 5. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。芒格成功时加 `--munger-embedded`，卡片只放主文档链接并在副标题注明「含芒格洞察」；芒格失败时用 `--failure-reason` 注明待复核。图片分支失败时按第 4 步结果传入 `--image-note`。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
@@ -146,6 +146,23 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
    要点：`日期` 取当天 `00:00:00`；`标题` 用原文标题；`来源链接`/`云文档链接` 用 markdown 链接格式 `[url](url)`（与历史记录一致）；`评分` 取 content-scoring 的 `quality_score` 去尾零（如 `9/10`、`7.5/10`）；`是否已读` 固定 `true`。标题或 URL 含 `"`、`\` 等字符时，用 `python3 -c "import json,sys;print(json.dumps(sys.stdin.read()))"` 或等价方式构造 `--json` 值，禁手工拼接破坏 JSON。回写是登记步骤，失败不阻塞主流程，仅告警不回滚、不重试阻塞文档交付；
 7. 核心图 PNG 私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：p2p 场景 `lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image <run_dir>/core-image.png`，群聊场景 `--user-id <bridge_context.senderId>`；`senderType=bot` 时回退发原群。图片生成本身失败时不发送 PNG；插入文档与私聊发送共用同一份 PNG，发送只执行一次。芒格洞察图 PNG 用同样的身份和目标发送一次，发送顺序放在核心图之后；生成失败时不发送。
+
+### 主文档 dc 发布链（M5 入口切换，2026-10-02）
+
+主精读文档的正式正文写入统一走 Document Compiler（XML 桥）；`validate_output.py` 业务 validator、三档齐全门与交付卡链路原样保留。候选 XML 就是已过 validator 的 `.wx_doc.xml`（含 `<title>`）：
+
+```bash
+cd /Users/yuwei/code/document-compiler
+python3 -m compiler.cli tableplan --xml <run_dir>/candidate.xml --out <run_dir>/candidate.xml   # 复制 .wx_doc.xml 为 candidate.xml 后执行；缺 colgroup 的表补确定性列宽
+python3 -m compiler.cli fingerprint --packet <run_dir>/packet.json --xml <run_dir>/candidate.xml   # → fingerprint / xml_sha256 / release_id
+python3 -m compiler.cli publish --packet <run_dir>/packet.json --xml <run_dir>/candidate.xml --review <run_dir>/review.json --state-dir /Users/yuwei/code/document-compiler/state --json
+```
+
+- `<run_dir>/packet.json`：`{"schema":"ContentPacket/v1","job_id":"read-x-longread-<run_dir 名>","caller":"read-x/long-read","business_key":"read-x-longread-<run_dir 名>","operation":"create","target":{},"identity":"bot"}`。同键异稿会被幂等门禁阻断；修正稿递增 `.r2`/`.r3`（run_dir 名天然唯一时可不加）。
+- `<run_dir>/review.json`：`{"status":"PASS","author":"read-x long-read（经 validate_output 业务门禁=PASS）","release_id":"<fingerprint 返回>","fingerprint":"<同>","xml_sha256":"<同>","confirmation":{"source":"validate_output","confirmed_by":"long-read 编排（validate_output.py --document 校验通过）","sha256":"<.wx_doc.xml 的 sha256>","run_id":"<run_dir 名>"}}`。
+- 退出码：`0`=published（envelope.doc 为新文档 id，URL 即 `https://ywhome.feishu.cn/docx/<doc>`，后续 `+media-insert` 与交付卡用它）；`1`=blocked（先修候选过门禁，禁止绕过）；`3`=unknown（写结果未知，只做只读核查 `python3 -m compiler.cli recover`，禁止自动重试或重建文档）。
+- 旧的 `docs +create --parent-position my_library` 定位能力 dc 暂不支持，文档落在 lark-cli 默认位置；首次真实发布时核对落点，不可接受时保留旧路由作例外登记。
+- `docs +media-insert`、图片生成与发送、交付卡、精读记录回写是资源/消息/Base 操作，不走 dc。
 
 具体命令、降级和临时文件清理见 `references/routing.md`。
 
