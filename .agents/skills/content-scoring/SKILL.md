@@ -32,9 +32,9 @@ link-card 抓取正文
 
 ## 质量阶段
 
-调用方先生成 `blind-source.md`，再调用 `scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。该脚本把匿名正文与 `quality-runtime.md` 的三维数值语义一次发送到既有本地 MoonBridge `/v1/responses`，固定使用 `deepseek-v4-flash`；上游超时或传输失败时，在同一个总超时内对同一模型重试，不切换模型。模型没有可调推理等级，脚本不传推理覆盖。模型在一个 JSON 中直接返回证据、洞察、迁移三维等级及其原文单元、全局元数据和一次主张预算；脚本校验等级与逐字引用并组装质量 JSON。请求使用 JSON Schema，`store=false`；三次传输尝试共享同一个总超时，契约偏差失败关闭。输入不含 URL、标题、作者、日期、用户意见、锚点、目标区间、主代理预判或前序对话。
+调用方先生成 `blind-source.md`，再调用 `scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。该脚本把匿名正文与 `quality-runtime.md` 的三维数值语义一次发送到当前 Codex 模型；上游超时或传输失败时，在同一个总超时内对同一模型重试，不切换模型。脚本不传推理覆盖。模型在一个 JSON 中直接返回证据、洞察、迁移三维等级及其原文单元、全局元数据和一次主张预算；脚本校验等级与逐字引用并组装质量 JSON。请求使用 JSON Schema；三次传输尝试共享同一个总超时，契约偏差失败关闭。输入不含 URL、标题、作者、日期、用户意见、锚点、目标区间、主代理预判或前序对话。
 
-质量命令执行路径已经确定，不再现场设计：直接运行上述一次性质量命令；主 Agent 禁止读取匿名正文或质量运行契约。本地运行时不可用、请求超时或未生成合法文件时直接失败关闭，不得退回主上下文评分或嵌套 `codex exec`。命令完成后的下一次响应只运行 `content_scoring.py`；若结果不是 `needs_relevance`，同一命令立即渲染并发送卡片，只有边界结果才返回主代理继续相关性。禁止能力探测、搜索实现、创建 plan/任务文件、重读 Skill/schema/policy/脚本、用 shell 逐条检查引用或现场修 JSON。
+质量命令执行路径已经确定，不再现场设计：直接运行上述一次性质量命令；主 Agent 禁止读取匿名正文或质量运行契约。模型运行时不可用、请求超时或未生成合法文件时直接失败关闭，不得退回主上下文评分或启动子 Agent。命令完成后的下一次响应只运行 `content_scoring.py`；若结果不是 `needs_relevance`，同一命令立即渲染并发送卡片，只有边界结果才返回主代理继续相关性。禁止能力探测、搜索实现、创建 plan/任务文件、重读 Skill/schema/policy/脚本、用 shell 逐条检查引用或现场修 JSON。
 
 ## 第五步：按需相关性隔离评分
 

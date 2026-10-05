@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import content_scoring as cs
+import codex_model
 import fetch_base_config
 import generate_quality as quality_generator
 import generate_authority as authority_generator
@@ -635,7 +636,7 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "wrapper 退出码为 0 且写出 `score-gate.json` 才视为发送成功" in skill
     assert "/Users/yuwei/code/read-x/scripts/content_scoring.py" in skill
     assert "quality-runtime.md" in skill and "禁止把完整 content-scoring Skill" in skill
-    assert "blind-source.md" in skill and "禁止回退主上下文、启动子 Agent 或嵌套 `codex exec`" in skill
+    assert "blind-source.md" in skill and "禁止回退主上下文或启动子 Agent" in skill
     assert "blind_source_parts" in skill and "scripts/generate_quality.py" in skill
     assert "主 Agent 禁止读取匿名正文和质量契约" in skill
     assert "任何锚点视图" in skill and "只用于评分后的外部闭卷回归" in skill
@@ -649,7 +650,7 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "禁止手写卡片 JSON" in skill
     assert "--evidence-output <run_dir>/score-gate.json" in skill
     assert "三维数值语义一次发送" in scoring_skill and "直接返回证据、洞察、迁移三维等级" in scoring_skill
-    assert "既有本地 MoonBridge" in scoring_skill and "脚本不传推理覆盖" in scoring_skill
+    assert "当前 Codex 模型" in scoring_skill and "MoonBridge" not in scoring_skill
     assert "不得退回主上下文评分" in scoring_skill
     assert "runtime/core-context/full.md" in scoring_skill
     assert "_validate_full_context" in relevance_generator_source
@@ -686,9 +687,8 @@ def test_quality_generator_is_closed_book_and_schema_bound():
     assert set(dimensions["required"]) == set(cs.QUALITY_DIMENSIONS)
     assert "problem_significance" in schema["required"]
     assert all(item["required"] == ["level", "unit_ids", "disqualifiers"] for item in dimensions["properties"].values())
-    assert quality_generator.MODEL == "deepseek-v4-flash"
-    assert quality_generator.MODEL_CANDIDATES == ("deepseek-v4-flash",)
-    assert quality_generator.ENDPOINT.startswith("http://127.0.0.1:")
+    assert quality_generator.MODEL == "codex-current"
+    assert quality_generator.MODEL_CANDIDATES == ("codex-current",)
     generator_source = Path(quality_generator.__file__).read_text(encoding="utf-8")
     assert "reasoning" not in generator_source
     assert "DIMENSION_KEYWORDS" not in generator_source and "transfer_examples" not in generator_source
@@ -712,8 +712,9 @@ def test_quality_generator_is_closed_book_and_schema_bound():
 
 def test_chatgpt_bridge_is_reserved_for_long_read_content():
     root = Path(cs.__file__).parents[1]
-    # 评分链路（quality/authority/relevance）不得直连 ChatGPT web-bridge
+    # 评分链路只走当前 Codex 模型，不接 ChatGPT web-bridge，也不接 MoonBridge。
     scoring_only = (
+        root / "scripts/codex_model.py",
         root / "scripts/generate_quality.py",
         root / "scripts/generate_authority.py",
         root / "scripts/generate_relevance.py",
@@ -721,6 +722,7 @@ def test_chatgpt_bridge_is_reserved_for_long_read_content():
     for path in scoring_only:
         source = path.read_text(encoding="utf-8")
         assert "chatgpt_bridge" not in source and "run_bridge(" not in source
+        assert "38441" not in source and "deepseek-v4-flash" not in source
     # 长读内容生成全部走 ChatGPT web-bridge，不再使用 MoonBridge
     long_read = (
         root / ".agents/skills/long-read/scripts/run_isolated_analyses.py",
@@ -797,7 +799,17 @@ def test_model_retries_keep_one_fixed_model_and_use_remaining_budget():
         finally:
             module._call_once = original_call
             module.RETRY_BACKOFF_SECONDS = original_backoff
-        assert seen == ["deepseek-v4-flash", "deepseek-v4-flash"]
+        assert seen == ["codex-current", "codex-current"]
+
+
+def test_codex_model_runs_schema_bound_current_model():
+    source = (Path(cs.__file__).parent / "codex_model.py").read_text(encoding="utf-8")
+    assert '"codex", "exec"' in source
+    assert "--output-schema" in source and "--output-last-message" in source
+    assert "--sandbox" in source and "read-only" in source
+    assert "deepseek" not in source and "MoonBridge" not in source
+    fenced = '```json\n{"ok":true}\n```'
+    assert codex_model.parse_json_output(fenced, "probe") == {"ok": True}
 
 
 def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
@@ -1843,8 +1855,8 @@ def test_authority_search_generator_runs_real_tvly_and_grounds_assessment():
     finally:
         authority_generator.run_tvly = original_tvly
         authority_generator._call_once = original_call
-    assert authority_generator.MODEL == "deepseek-v4-flash"
-    assert authority_generator.ENDPOINT.startswith("http://127.0.0.1:")
+    assert authority_generator.MODEL == "codex-current"
+    assert "http://127.0.0.1:" not in Path(authority_generator.__file__).read_text(encoding="utf-8")
     assert observation["tool_status"] == "ok" and observation["mode"] == "web_search"
     assert [item["kind"] for item in observation["queries"]] == ["title", "entity_topic", "entity_event"]
     assert all(item["hash"].startswith("sha256:") for item in observation["queries"])
