@@ -64,7 +64,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再作为一级主章节「芒格洞察」拼进主文档，**禁止创建第二篇文档**，也禁止把模型纯文本直接拼进文档。编排层只传递原文、实时读取并冻结的 `read-x.munger-analysis` 资产（正文内嵌芒格之魂全文，独立成篇）和最小边界，不把固定八标题或其他外层模板塞进模型请求：
 
 1. `article-decode` 完整原稿作为主文；
-2. 每条 ljg 完整原稿放入附录，不设字数上限；
+2. 每条 ljg 的 500～1500 字 ChatGPT 原稿放入附录，主 Agent 只排版，不压缩；
 3. 拆分超过 100 字的段落；
 4. 按 `output-schema.md` 转成 XML。
 
@@ -110,7 +110,7 @@ python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
   --summary <run_dir>/core-image-summary.json
 ```
 
-脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题后、原文链接前）：
+脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）：
 
 ```bash
 lark-cli docs +media-insert --as bot --doc <文档URL> \

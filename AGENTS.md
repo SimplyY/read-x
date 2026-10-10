@@ -56,7 +56,7 @@ link-card 流程：
 4. **文字深度链路**：article-decode 与各 ljg 由分析分支经 ChatGPT web-bridge 发出互不可见的独立会话请求；全局并发 ≤3 路、会话发起错开 ≥10 秒（Bridge 槽位与错峰器保证），Bridge 忙时有界排队。命令、路径或交付残留必须失败关闭且不落盘；确定性输出校验错误立即失败，只允许提交前 `local-rate-limit-cooldown` 按 Bridge 给定等待安全恢复一次，可能已提交但无法确认时禁止自动重发，每次尝试写入 `attempts_detail`；`article-decode` 失败不得阻断 ChatGPT 分支，也不得丢弃已成功的 ljg 输出；直接消费 content-scoring 的 `ljg_range` 与 `ljg_card`（已按 `decision_score` 含相关+兴趣计算深度档），不得自行用相关性二次抬高深度，不得回退主上下文角色扮演
 5. **ChatGPT Bridge 芒格后处理**：`route=long_read` 每篇必跑，由编排入口自动启动 `.agents/skills/long-read/scripts/run_chatgpt_munger.py`（`chatgpt_munger_doc` 只作评分留档，不再设门内门槛）；通过 Ego Lite ChatGPT Bridge 返回规范 Markdown、`verification=live-dom+snapshot`、有效会话 URL和匹配 hash，再作为一级主章节「芒格洞察」拼进 `.wx_doc.xml`（复用 `markdown_to_feishu_xml.py` 渲染层，不创建第二篇文档）。不接受本地模型或旧验证标记；提交前 `local-rate-limit-cooldown` 只按 Bridge 给出的等待时间安全恢复一次，可能已提交但无法确认时禁止自动重发、标记 `needs_review`；失败关闭，主精读文档仍照常交付
 6. **输出**：主 Agent 原样完整拼接（article-decode + 每条 ljg + 芒格洞察）与排版为 Docx XML，不选择、不去重、不摘要、不压缩，也不设总字数上限；成功时主文档含「芒格洞察」一级主章节，交付卡加 `--munger-embedded` 只放主文档单链接并注明「含芒格洞察」（群聊发 `senderId`，p2p 发 `chatId`，只发一次）；后处理失败时只交付主文档并注明待复核
-   - 主文档拼接完成后把完整精读 markdown 落盘 `<run_dir>/main-doc.md`，运行 `.agents/skills/long-read/scripts/run_chatgpt_core_image.py`（ChatGPT Bridge image 模式）对全文生成一张核心内容图（提示词从 prompt-governance 注册表 `read-x.core-image` 拉取并校验 revision/sha256，拉取失败即止不提交），文档创建成功后用 `lark-cli docs +media-insert` 插入文档顶部（标题后、原文链接前），PNG 再以 bot 身份私聊发给触发者一次（群聊发 `senderId`，p2p 发 `chatId`）；芒格分支成功时，再用同一脚本对 `chatgpt-munger.md` 单独生成一张芒格洞察图并私聊发送；图片分支失败不阻塞主文档交付，卡片如实注明
+   - 主文档拼接完成后把完整精读 markdown 落盘 `<run_dir>/main-doc.md`，运行 `.agents/skills/long-read/scripts/run_chatgpt_core_image.py`（ChatGPT Bridge image 模式）对全文生成一张核心内容图（提示词从 prompt-governance 注册表 `read-x.core-image` 拉取并校验 revision/sha256，拉取失败即止不提交），文档创建成功后用 `lark-cli docs +media-insert` 插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前），PNG 再以 bot 身份私聊发给触发者一次（群聊发 `senderId`，p2p 发 `chatId`）；芒格分支成功时，再用同一脚本对 `chatgpt-munger.md` 单独生成一张芒格洞察图并私聊发送；图片分支失败不阻塞主文档交付，卡片如实注明
 
 ## 关键目录
 
@@ -101,13 +101,13 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 精读文档结论先行，使用 Docx XML 原生排版，评分不得埋在文末。
 
-- 顶部（紧跟 `<title>`）：原文链接（独立段落，作为溯源入口）
+- 顶部（紧跟 `<title>`）：ChatGPT 溯源链接、原文链接（各自独立段落）
 - 评分表（`quality_score + quality_label`、`importance_score`、权威性状态/分数、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
 - 原文金句（紧跟评分表，作为溯源入口）
 - 全文唯一 `light-yellow` 核心结论高亮块
 - 正文根 `<title>` 只保留文章标题；第一个主章节必须是一级标题 `评分`，其余主章节也使用一级标题，附录内文字 Skill 边界使用二级标题
 - 主文：真正的核心 → 基石/边缘/暗流 → 值得研究的相关问题（独立问题列表 + 共同上下文列表，总计 ≤300 字）→ 与作者对话 → 最值得深读之处
-- 附录：先 ≤100 字导言（只做最精华的一句话概要，从第一性原理平实描述，不堆复杂概念），再各文字 ljg 完整原稿（不限字数）
+- 附录：先 ≤100 字导言（只做最精华的一句话概要，从第一性原理平实描述，不堆复杂概念），再各文字 ljg 的 500～1500 字 ChatGPT 原稿；主 Agent 只排版，不压缩
 - 文末：必要事实（若有）
 - 单段可见文本不超过 100 字；并列信息用列表，真实对比或数据才用不超过 4 列的表格
 - 创建主文档前必须通过 `.agents/skills/long-read/scripts/validate_output.py --document`，失败不得写入飞书
@@ -145,7 +145,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 - [ ] 正文已成功抓取
 - [ ] 内容质量判断已完成（字数、论点、金句、结构、亲历者）
 - [ ] 高质量：Evidence / article-decode / 隔离文字 ljg / XML 飞书文档已完成，主文与附录无重复结论
-- [ ] 主文档拼接完成、`main-doc.md` 落盘：核心内容图经 `run_chatgpt_core_image.py`（Bridge image 模式）生成并插入文档顶部（标题后、原文链接前）；失败时卡片注明且不阻塞主文档交付
+- [ ] 主文档拼接完成、`main-doc.md` 落盘：核心内容图经 `run_chatgpt_core_image.py`（Bridge image 模式）生成并插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）；失败时卡片注明且不阻塞主文档交付
 - [ ] 核心内容图 PNG 私聊发给触发者且只发一次（群聊发 `senderId`，p2p 发 `chatId`）；图片生成失败时不发送
 - [ ] ChatGPT Bridge 分支（芒格每篇必跑）输出经 `live-dom+snapshot`、会话 URL 和 hash 验证为规范 Markdown，再拼进主文档并通过 `validate_output.py`
 - [ ] 交付卡由渲染脚本生成，读回内容没有字面量 `\\n`

@@ -17,7 +17,7 @@ description: "长文精读编排器：收到微信公众号、飞书文档、网
      -> Markdown 渲染为 Docx XML 与 Card 2.0
      -> 核心内容图（run_chatgpt_core_image.py，输入完整精读 markdown）与文档创建并行
      -> 芒格洞察图（同一脚本，输入芒格洞察 Markdown；芒格分支成功时必生成）
-     -> lark-cli docs +media-insert 把核心图插入文档顶部（标题后、原文链接前）
+     -> lark-cli docs +media-insert 把核心图插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）
      -> 发送交付卡并登记精读记录（群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次）
      -> 核心图 PNG 私聊发给触发者（只发一次）
 ```
@@ -103,30 +103,31 @@ python3 .agents/skills/long-read/scripts/run_long_read_pipeline.py \
 
 拼接完成的全文先落盘 `<run_dir>/main-doc.md`；它是核心内容图的输入，也是渲染 `.wx_doc.xml` 的同源底稿。
 
-- 文档不设总字数上限。
-- 附录放每条文字 ljg 完整原稿；每条原稿内部仍受可读性约束：单段≤100字、关键概念加粗、并列用列表、对比用表格、独立段落间换行。只做排版加工，不改语义、不磨平原 Skill 语气；附录标题后不放导言概要。完整规则见 `references/output-schema.md` 第 3、4 节。
+- 文档不设总字数上限；附录每条文字 ljg 由 ChatGPT 按 500～1500 字输出，本地不因超长拒绝。
+- 附录放每条文字 ljg 通过源头上限校验的原稿；主 Agent 只做排版加工，不压缩、不改语义、不磨平原 Skill 语气；附录标题后不放导言概要。每条原稿内部仍受可读性约束：单段≤100字、关键概念加粗、并列用列表、对比用表格、独立段落间换行。完整规则见 `references/output-schema.md` 第 3、4 节。
 
 ## 5. 成品结构
 
 顺序固定：
 
-1. 原文链接（紧跟 `<title>`，独立段落，作为溯源入口）；
-2. 评分表：`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
-3. 原文金句（紧跟评分表，作为溯源入口）；
-4. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
-5. 文章真正的核心；
-6. 基石 / 边缘 / 暗流；
-7. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
-8. 与作者对话；
-9. 最值得深读之处；
-10. 芒格洞察（仅 ChatGPT 分支成功时，一级主章节；失败或未达门槛时整章省略）；
-11. 附录：独立深度分析；
-12. 必要事实（若有，文末）。
+1. ChatGPT 溯源链接（紧跟 `<title>`，独立段落；来自芒格分支 `conversationUrl`）；
+2. 原文链接（独立段落，作为来源溯源入口）；
+3. 评分表：`quality_score + quality_label`、`importance_score`、`relevance_score + priority_label`、`interest_score + interest_label`（不可用则如实写不可用）及简短依据；路由分不冒充质量分；
+4. 原文金句（紧跟评分表，作为溯源入口）；
+5. 全文唯一 `light-yellow` 高亮块：一句最核心结论；
+6. 文章真正的核心；
+7. 基石 / 边缘 / 暗流；
+8. 值得研究的相关问题（独立的问题列表 + 多个问题共同的上下文列表，总计 ≤300 字）；
+9. 与作者对话；
+10. 最值得深读之处；
+11. 芒格洞察（仅 ChatGPT 分支成功时，一级主章节；失败或未达门槛时整章省略）；
+12. 附录：独立深度分析；
+13. 必要事实（若有，文末）。
 
 不输出「骨架」章节，不再输出独立的「X 光四层」。普通文章最多 5 条原文金句；确有足够密度时最多 8 条；允许更少，禁止凑数。
 原文为英文时，用户可见的金句以中文译文为主展示并遵守信达雅（忠实原意、通顺自然、文采得体），英文原句紧随其后作溯源附注，格式「译文（原文：English original）」；Evidence 层仍保留逐字英文原文供 `validate_output.py` 校验，翻译只作用于成品展示，不改变证据层。
 
-核心内容图不属于 Docx XML：文档创建成功后经 `lark-cli docs +media-insert` 插入顶部（标题后、原文链接前），不参与 `validate_output.py` 校验，也不替换任何章节。
+核心内容图不属于 Docx XML：文档创建成功后经 `lark-cli docs +media-insert` 插入顶部（标题和 ChatGPT 溯源链接后、原文链接前），不参与 `validate_output.py` 校验，也不替换任何章节。
 
 Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.md`。创建文档前按 `lark-doc` Skill 读取当前 CLI 内置 XML、style 与 create workflow。
 
@@ -134,9 +135,9 @@ Docx XML、段落、颜色、引用和表格规范见 `references/output-schema.
 
 0. **三档齐全门（硬性）**：发交付卡前核对 `scoring_result` 三档齐全。`quality_score ≥ quality_floor`（6.0）的文章，`relevance_score` 与 `interest_score` 必须都是实数；任一缺省（`null`/「待计算」/「不可用」）时禁止创建文档、禁止发交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡。禁止只带质量分单发交付卡；
 1. 若 `chatgpt_munger_doc=true` 且后处理成功，先把 `chatgpt-munger.md` 拼进 `.wx_doc.xml` 的一级主章节「芒格洞察」，再运行 `.agents/skills/long-read/scripts/validate_output.py --document .wx_doc.xml`；校验失败禁止创建主精读文档。**不创建第二篇芒格文档**；
-2. 校验通过后并行执行两件事：创建主文档（正文写入统一走 Document Compiler 质量链，见下「主文档 dc 发布链」；M5 入口切换，禁止再直接 `lark-cli docs +create` 写正文），以及运行核心内容图脚本 `python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/main-doc.md --output <run_dir>/core-image.png --summary <run_dir>/core-image-summary.json --conversation-url "$(jq -r '.conversationUrl // empty' <run_dir>/chatgpt-munger-summary.json)"`（ChatGPT Bridge image 模式，输入是完整精读 markdown；必须复用芒格分支的 `conversationUrl`，缺失时失败关闭并标记 `needs_review`，不得回退新窗口；失败关闭并标记 `needs_review`，禁止自动重发）；
+2. 校验通过后并行执行两件事：创建主文档（正文写入统一走 Document Compiler 质量链，见下「主文档 dc 发布链」；M5 入口切换，禁止再直接 `lark-cli docs +create` 写正文；顶部先写 ChatGPT 溯源链接，再写原文链接），以及运行核心内容图脚本 `python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/main-doc.md --output <run_dir>/core-image.png --summary <run_dir>/core-image-summary.json --conversation-url "$(jq -r '.conversationUrl // empty' <run_dir>/chatgpt-munger-summary.json)"`（ChatGPT Bridge image 模式，输入是完整精读 markdown；必须复用芒格分支的 `conversationUrl`，缺失时失败关闭并标记 `needs_review`，不得回退新窗口；失败关闭并标记 `needs_review`，禁止自动重发）；
 3. 芒格分支成功时，再用同一脚本对 `chatgpt-munger.md` 单独生成一张芒格洞察图：`python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py --source <run_dir>/chatgpt-munger.md --output <run_dir>/munger-image.png --summary <run_dir>/munger-image-summary.json`（不插入主文档；只作为独立图片交付）；
-4. 文档与图片都就绪后，把核心图插入文档顶部（标题后、原文链接前）：`lark-cli docs +media-insert --as bot --doc <文档URL> --file <run_dir>/core-image.png --selection-with-ellipsis <原文链接段落文本> --before --caption 核心内容图 --align center`。插入失败不自动重试（防止重复插入），主文档照常交付并在交付卡注明「核心图待插入」；图片生成本身失败时跳过插入并在交付卡注明「核心图待复核」；
+4. 文档与图片都就绪后，把核心图插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）：`lark-cli docs +media-insert --as bot --doc <文档URL> --file <run_dir>/core-image.png --selection-with-ellipsis <原文链接段落文本> --before --caption 核心内容图 --align center`。插入失败不自动重试（防止重复插入），主文档照常交付并在交付卡注明「核心图待插入」；图片生成本身失败时跳过插入并在交付卡注明「核心图待复核」；
 5. 用 `scripts/render_long_read_delivery_card.py --score-evidence <run_dir>/score-gate.json --scoring-result <run_dir>/scoring-result.json` 生成并校验唯一 Card 2.0 交付卡。评分凭据缺失、非本轮发送生成、hash 不匹配或校验失败时禁止生成、禁止发送交付卡；不得从文档评分表、旧文件、手工 JSON 或主观记忆补造凭据。芒格成功时加 `--munger-embedded`，卡片只放主文档链接并在副标题注明「含芒格洞察」；芒格失败时用 `--failure-reason` 注明待复核。图片分支失败时按第 4 步结果传入 `--image-note`。卡片必须使用真实换行，禁止手工拼接 JSON。群聊场景 `--user-id <bridge_context.senderId>` 私聊发给触发者，p2p 场景 `--chat-id <bridge_context.chatId>`（即私聊会话，只发一次），全部 `--as bot`；`senderType=bot` 时回退 `--chat-id` 发原群；
 6. 确认交付卡片发送成功后，回写一行到「精读记录」索引表，登记本次精读：
 
@@ -195,12 +196,12 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 - [ ] 是否无「骨架」和独立「X 光四层」？
 - [ ] 是否在「基石 / 边缘 / 暗流」之后输出独立问题列表与共同上下文列表，且总计 ≤300 字？
 - [ ] 研究问题是否主要来自文章与本轮分析，个人上下文仅作弱排序且未写成画像标签？
-- [ ] 主文与附录中的完整原稿是否没有删改或压缩语义？
+- [ ] 主文与附录中的完整原稿是否没有删改或压缩语义？附录每条 ljg 是否保留 ChatGPT 完整原稿？
 - [ ] 原文金句总数是否不超过 8；英文金句是否给出信达雅中文译文并附英文原句？
 - [ ] 是否只有一个金色高亮块，段落均不超过 100 字？
 - [ ] `main-doc.md` 是否落盘，并被核心图脚本与 Docx XML 渲染共用为同源底稿？
 - [ ] 核心内容图是否经 `run_chatgpt_core_image.py`（Bridge image 模式）生成，失败时标记 `needs_review` 且未自动重发？
-- [ ] 核心图是否插入文档顶部（标题后、原文链接前）；插入失败时交付卡注明且未重复插入？
+- [ ] 核心图是否插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）；插入失败时交付卡注明且未重复插入？
 - [ ] 核心图 PNG 是否只发送一次（按 chatType 二选一，未同时执行 `--chat-id` 与 `--user-id`）；图片生成失败时未发送？
 - [ ] 芒格分支成功时是否用同一脚本额外生成一张芒格洞察图并私聊发送一次，生成失败时不发送？
 - [ ] 附录每条 ljg 是否各用一个注明 Skill 名的独立 h2 包裹，原稿内部小标题是否降为 h3 未占用 h2？

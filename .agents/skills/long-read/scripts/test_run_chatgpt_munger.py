@@ -92,6 +92,7 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
         assert "真正试图解决的问题" in captured["prompt"]
         assert "本任务以“芒格之魂”为核心提示词" in captured["prompt"]
         assert "不要脱离原任务另起炉灶" in captured["prompt"]
+        assert "输出 500～1500 字独立成篇的最终 Markdown" in captured["prompt"]
         # 提示词独立成篇：芒格之魂全文内嵌在 read-x.munger-analysis 正文中，不再拼接第二个资产。
         assert "【芒格之魂】" in captured["prompt"]
         assert "Bridge 将在本段之后追加两行唯一的输出边界" in captured["prompt"]
@@ -167,6 +168,19 @@ def test_prompt_limit_and_freeform_markdown_contract():
             assert "prompt-too-large" in str(exc)
         else:
             raise AssertionError("oversized prompt must fail before model execution")
+
+
+def test_overlong_analysis_is_kept():
+    with tempfile.TemporaryDirectory() as directory:
+        source, output, bridge, _ = _files(Path(directory))
+        original = runner.run_bridge
+        try:
+            runner.run_bridge = lambda *args, **kwargs: _result(text="洞察内容。" * 301)
+            completed = runner.run(source, output, bridge)
+            assert completed["status"] == "succeeded"
+            assert output.exists()
+        finally:
+            runner.run_bridge = original
 
 
 def test_pre_submit_cooldown_recovers_exactly_once_with_bridge_wait():

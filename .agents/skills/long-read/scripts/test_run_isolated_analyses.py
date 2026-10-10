@@ -140,7 +140,7 @@ def test_parallel_prompt_boundary_and_atomic_outputs():
                     assert prompt.startswith(skill(name))
                     assert runner.TEXT_RUNTIME_OVERRIDE in prompt
                     assert runner.TEXT_TASK_REQUIREMENTS[name] in prompt
-                    assert "输出完整原稿，不设上限" in prompt
+                    assert "输出 500～1500 字原稿" in prompt
                     assert "600~1000" not in prompt
                 assert parsed["source"] == source.read_text(encoding="utf-8")
                 assert json.loads(parsed["evidence"]) == json.loads(evidence.read_text(encoding="utf-8"))
@@ -197,6 +197,24 @@ def test_short_model_output_fails_closed():
             assert "output is too short" in failed["error"]
             assert failed["error_type"] == "output_validation"
             assert not (root / "out/01-ljg-think.md").exists()
+    finally:
+        restore()
+
+
+def test_overlong_model_output_is_kept():
+    fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think", text="有效分析。" * 400)]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            summary = runner.run(
+                source, evidence, root / "out", specs[:1],
+                article_skill_path=article, skill_roots=[skills],
+            )
+            completed = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert summary["status"] == "completed" and completed["status"] == "completed"
+            assert (root / "out/01-ljg-think.md").exists()
     finally:
         restore()
 

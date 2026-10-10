@@ -108,6 +108,9 @@ def build_prompt(source: str, prompt_assets: list[dict]) -> str:
 【待分析全文】
 {source}
 
+【本次交付要求】
+输出 500～1500 字独立成篇的最终 Markdown；按上限提高信息密度，禁止摘要或压缩语义。
+
 【调用层边界】
 Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
     if len(prompt) > MAX_PROMPT_CHARS:
