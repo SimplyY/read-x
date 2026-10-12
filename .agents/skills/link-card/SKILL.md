@@ -276,7 +276,7 @@ long-read 的 ChatGPT Bridge 芒格洞察分支每篇必跑（`chatgpt_munger_do
 
 长文交付卡统一使用 `/Users/yuwei/code/read-x/scripts/render_long_read_delivery_card.py` 生成 CardKit 2.0 JSON，再用 `json.loads` 校验后发送。禁止手工拼接 JSON；卡片正文必须使用真实换行，发送后读回消息确认不存在字面量 `\\n`。
 
-> ⚠️ 核心内容图由 long-read 自动生成（`run_chatgpt_core_image.py`，Bridge image 模式）：插入文档顶部（标题后、原文链接前），PNG 以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）只发一次；失败不阻塞主文档交付。
+> ⚠️ 核心内容图与芒格洞察图由 long-read 自动生成（`run_chatgpt_core_image.py`，Bridge image 模式）：按顺序插入文档顶部（标题后、溯源和原文链接前），两张 PNG 以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）各只发一次；失败不阻塞主文档交付。
 
 > ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接；芒格分支成功时卡片副标题注明「含芒格洞察」。
 >

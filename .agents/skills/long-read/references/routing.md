@@ -110,7 +110,7 @@ python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
   --summary <run_dir>/core-image-summary.json
 ```
 
-脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题和 ChatGPT 溯源链接后、原文链接前）：
+脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题后、溯源和原文链接前）。芒格洞察图生成成功后，再以同一段落为锚点把芒格洞察图插到核心内容图之后：
 
 ```bash
 lark-cli docs +media-insert --as bot --doc <文档URL> \
@@ -136,7 +136,7 @@ python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
   --summary <run_dir>/munger-image-summary.json
 ```
 
-这张图不是第二张核心内容图，也不插入主文档；它只是芒格洞察的独立交付图。生成后按触发者身份单独发送一次，失败时不发送。
+这张图不是第二张核心内容图；它先插入主文档顶部、核心内容图之后，再作为独立交付图按触发者身份单独发送一次，失败时不发送。
 
 ### PNG 私聊发送
 
@@ -167,6 +167,7 @@ python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
 - `main-doc.md`
 - `/tmp/link_card.json`
 - `core-image.png`、`core-image-summary.json`
+- `munger-image.png`、`munger-image-summary.json`
 - `chatgpt-munger.md`、`chatgpt-munger-summary.json`
 
 不要删除与本轮无关的既有文件。
