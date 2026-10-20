@@ -11,6 +11,7 @@ import chatgpt_bridge as bridge
 
 def result(text="{}", **extra):
     value = {"status": "succeeded", "runId": "r1", "conversationUrl": "https://chatgpt.test/c/1",
+             "actualConversationUrl": "https://chatgpt.test/c/1", "submissionConfirmed": True,
              "format": "markdown", "verification": "live-dom+snapshot", "text": text,
              "outputSha256": hashlib.sha256(text.encode()).hexdigest()}
     value.update(extra)
@@ -21,6 +22,7 @@ def image_result(**extra):
     payload = base64.b64encode(b"\x89PNG-fake").decode()
     data_url = f"data:image/png;base64,{payload}"
     value = {"status": "succeeded", "runId": "r2", "conversationUrl": "https://chatgpt.test/c/2",
+             "actualConversationUrl": "https://chatgpt.test/c/2", "submissionConfirmed": True,
              "verification": "live-dom+snapshot", "imageBase64": data_url,
              "outputSha256": hashlib.sha256(data_url.encode()).hexdigest()}
     value.update(extra)
@@ -41,7 +43,9 @@ def test_stdout_is_one_object():
 def test_verified_text_requires_current_contract():
     assert bridge.verified_text(result("正文")) == "正文"
     for bad in (result("正文", verification="historyVerified"), result("正文", format="text"),
-                result("正文", conversationUrl="https://chatgpt.test/share/1"), result("正文", outputSha256="bad")):
+                result("正文", conversationUrl="https://chatgpt.test/share/1"), result("正文", outputSha256="bad"),
+                result("正文", submissionConfirmed=False),
+                result("正文", actualConversationUrl="https://chatgpt.test/c/other")):
         try:
             bridge.verified_text(bad)
         except RuntimeError:
@@ -62,11 +66,14 @@ def test_json_text_accepts_only_raw_or_fenced_object():
 
 
 def test_command_streams_prompt_and_disables_only_success_cooldown():
-    command = bridge.bridge_command(Path("/tmp/bridge.mjs"), max_wait_seconds=321)[-1]
+    command = bridge.bridge_command(Path("/tmp/bridge.mjs"), max_wait_seconds=321,
+                                    caller_label="read-x:weekly", request_id="12345678-1234-5678-1234-567812345678")[-1]
     assert "for await (const chunk of process.stdin)" in command
     assert "maxWaitSeconds: 321" in command
     assert "successCooldownSeconds: 0" in command
     assert "image: false" in command
+    assert 'callerLabel: "read-x:weekly"' in command
+    assert 'preallocatedRunId: "12345678-1234-5678-1234-567812345678"' in command
     image_command = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True)[-1]
     assert "image: true" in image_command
 
@@ -75,6 +82,8 @@ def test_verified_image_requires_current_contract():
     assert bridge.verified_image(image_result()) == b"\x89PNG-fake"
     for bad in (image_result(verification="historyVerified"),
                 image_result(conversationUrl="https://chatgpt.test/share/2"),
+                image_result(actualConversationUrl="https://chatgpt.test/c/other"),
+                image_result(submissionConfirmed=False),
                 image_result(outputSha256="bad"),
                 image_result(imageBase64="data:text/plain;base64,SGk="),
                 image_result(imageBase64="data:image/png;base64,%%%not-base64%%%")):
@@ -98,7 +107,9 @@ def test_process_timeout_fails_closed():
         result = bridge.run_bridge("prompt", bridge=Path("/tmp/bridge.mjs"), max_wait_seconds=300)
     finally:
         bridge.subprocess.run = original
-    assert result == {"status": "needs_review", "reason": "bridge-process-timeout"}
+    assert result["status"] == "needs_review"
+    assert result["reason"] == "bridge-process-timeout"
+    assert result["runId"] and result["callerLabel"] == "read-x:chatgpt-bridge"
 
 
 def test_busy_rejection_waits_for_a_free_slot_once_then_succeeds():
@@ -107,7 +118,7 @@ def test_busy_rejection_waits_for_a_free_slot_once_then_succeeds():
     original_once = bridge._run_bridge_once
     original_sleep = bridge.time.sleep
 
-    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None):
+    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None, caller_label=None, request_id=None):
         attempts.append(1)
         if len(attempts) == 1:
             return {"status": "needs_review", "reason": "bridge-busy", "retryAfterSeconds": 30}
@@ -129,7 +140,7 @@ def test_busy_rejection_honors_wait_budget():
     attempts = []
     original_once = bridge._run_bridge_once
 
-    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None):
+    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None, caller_label=None, request_id=None):
         attempts.append(1)
         return {"status": "needs_review", "reason": "bridge-busy", "retryAfterSeconds": 30}
 
@@ -147,7 +158,7 @@ def test_conversation_url_is_passed_to_bridge_once():
     original_once = bridge._run_bridge_once
     seen = []
 
-    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None):
+    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None, caller_label=None, request_id=None):
         seen.append(conversation_url)
         return {"status": "succeeded"}
 

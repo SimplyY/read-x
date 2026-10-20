@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,15 +40,26 @@ def bridge_command(
     success_cooldown_seconds: int = 0,
     image: bool = False,
     conversation_url: str | None = None,
+    caller_label: str = "read-x:chatgpt-bridge",
+    request_id: str | None = None,
 ) -> list[str]:
+    if not isinstance(caller_label, str) or not caller_label.strip() or len(caller_label.strip()) > 100:
+        raise ValueError("bridge caller label must contain 1 to 100 characters")
+    request_id = request_id or str(uuid.uuid4())
+    try:
+        uuid.UUID(request_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("bridge request id must be a UUID") from exc
     bridge_uri = (bridge or resolve_bridge()).resolve().as_uri()
     conversation = json.dumps(conversation_url) if conversation_url else "undefined"
+    caller = json.dumps(caller_label.strip())
+    correlation_id = json.dumps(request_id)
     module = (
         f"import {{ runBridge }} from {json.dumps(bridge_uri)};"
         "process.stdin.setEncoding('utf8');"
         "let prompt = '';"
         "for await (const chunk of process.stdin) prompt += chunk;"
-        f"const result = await runBridge({{ prompt, maxWaitSeconds: {int(max_wait_seconds)}, successCooldownSeconds: {int(success_cooldown_seconds)}, image: {'true' if image else 'false'}, conversationUrl: {conversation} }});"
+        f"const result = await runBridge({{ prompt, maxWaitSeconds: {int(max_wait_seconds)}, successCooldownSeconds: {int(success_cooldown_seconds)}, image: {'true' if image else 'false'}, conversationUrl: {conversation}, callerLabel: {caller}, preallocatedRunId: {correlation_id} }});"
         "process.stdout.write(JSON.stringify(result) + '\\n');"
         "process.exitCode = result.status === 'succeeded' ? 0 : 2;"
     )
@@ -68,10 +80,11 @@ def _parse_stdout(stdout: str) -> dict:
     return values[0]
 
 
-def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int, image: bool, conversation_url: str | None = None) -> dict:
+def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int, image: bool, conversation_url: str | None = None, caller_label: str = "read-x:chatgpt-bridge", request_id: str | None = None) -> dict:
+    request_id = request_id or str(uuid.uuid4())
     try:
         completed = subprocess.run(
-            bridge_command(bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url),
+            bridge_command(bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url, caller_label=caller_label, request_id=request_id),
             input=prompt,
             text=True,
             capture_output=True,
@@ -79,16 +92,16 @@ def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int,
             timeout=max(int(max_wait_seconds) + BRIDGE_PROCESS_GRACE_SECONDS, BRIDGE_PROCESS_GRACE_SECONDS),
         )
     except subprocess.TimeoutExpired:
-        return {"status": "needs_review", "reason": "bridge-process-timeout"}
+        return {"status": "needs_review", "reason": "bridge-process-timeout", "runId": request_id, "callerLabel": caller_label}
     try:
         result = _parse_stdout(completed.stdout)
     except Exception as exc:
         reason = str(exc)
         if completed.returncode != 0:
             reason = f"bridge-exit-{completed.returncode}: {reason}"
-        return {"status": "needs_review", "reason": reason}
+        return {"status": "needs_review", "reason": reason, "runId": request_id, "callerLabel": caller_label}
     if completed.returncode != 0 and result.get("status") == "succeeded":
-        return {"status": "needs_review", "reason": f"bridge-exit-{completed.returncode}"}
+        return {"status": "needs_review", "reason": f"bridge-exit-{completed.returncode}", "runId": request_id, "callerLabel": caller_label}
     return result
 
 
@@ -115,13 +128,15 @@ def run_bridge(
     image: bool = False,
     conversation_url: str | None = None,
     busy_retry_max_wait_seconds: int = BUSY_RETRY_MAX_WAIT_SECONDS,
+    caller_label: str = "read-x:chatgpt-bridge",
 ) -> dict:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("bridge prompt must not be empty")
     started = time.monotonic()
     busy_retries: list[dict] = []
     while True:
-        result = _run_bridge_once(prompt, bridge=bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url)
+        request_id = str(uuid.uuid4())
+        result = _run_bridge_once(prompt, bridge=bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url, caller_label=caller_label, request_id=request_id)
         wait = _busy_retry_seconds(result, started, busy_retry_max_wait_seconds)
         if wait is None:
             if busy_retries:
@@ -138,6 +153,7 @@ def verified_text(result: dict) -> str:
         raise RuntimeError("bridge format must be markdown")
     if result.get("verification") != "live-dom+snapshot":
         raise RuntimeError("bridge output was not verified by live DOM and snapshot")
+    _verify_bound_session(result)
     parsed_url = urlparse(result.get("conversationUrl") or "")
     if parsed_url.scheme not in {"http", "https"} or "/c/" not in parsed_url.path:
         raise RuntimeError("bridge conversation URL is invalid")
@@ -154,6 +170,7 @@ def verified_image(result: dict) -> bytes:
         raise RuntimeError(result.get("reason") or f"bridge status: {result.get('status')}")
     if result.get("verification") != "live-dom+snapshot":
         raise RuntimeError("bridge output was not verified by live DOM and snapshot")
+    _verify_bound_session(result)
     parsed_url = urlparse(result.get("conversationUrl") or "")
     if parsed_url.scheme not in {"http", "https"} or "/c/" not in parsed_url.path:
         raise RuntimeError("bridge conversation URL is invalid")
@@ -169,6 +186,19 @@ def verified_image(result: dict) -> bytes:
         return base64.b64decode(payload[1], validate=True)
     except Exception as exc:
         raise RuntimeError(f"bridge image payload is not valid base64: {exc}") from exc
+
+
+def _verify_bound_session(result: dict) -> None:
+    actual = result.get("actualConversationUrl")
+    returned = result.get("conversationUrl")
+    parsed_actual = urlparse(actual or "")
+    parsed_returned = urlparse(returned or "")
+    if result.get("submissionConfirmed") is not True:
+        raise RuntimeError("bridge submission was not confirmed")
+    if (parsed_actual.scheme not in {"http", "https"} or "/c/" not in parsed_actual.path
+            or (parsed_actual.scheme, parsed_actual.netloc, parsed_actual.path)
+            != (parsed_returned.scheme, parsed_returned.netloc, parsed_returned.path)):
+        raise RuntimeError("bridge actual conversation identity was not confirmed")
 
 
 def json_text(result: dict, name: str) -> dict:
