@@ -16,8 +16,21 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(card)
 
 
+def successful_receipt():
+    required = card.REQUIRED_SUCCESS_ARTIFACTS
+    return {
+        "schema": card.DELIVERY_RECEIPT_SCHEMA,
+        "status": "succeeded",
+        "main_url": "https://feishu.cn/docx/main",
+        "munger_embedded": True,
+        "unresolved_actions": [],
+        "artifacts": {key: {"required": True, "status": "confirmed"} for key in required},
+    }
+
+
 def test_success_card_has_single_link_and_real_newline():
-    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_embedded=True)
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main",
+                             munger_embedded=True, delivery_receipt=successful_receipt())
     payload = json.loads(json.dumps(value, ensure_ascii=False))
     contents = [element["content"] for column in payload["body"]["elements"][0]["columns"] for element in column["elements"]]
     assert any("\n" in content for content in contents)
@@ -28,23 +41,50 @@ def test_success_card_has_single_link_and_real_newline():
     assert len(links) == 1
 
 
-def test_failure_card_only_has_main_link():
-    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", failure_reason="bridge-output-unverified")
+def test_failure_card_never_uses_success_title():
+    receipt = successful_receipt()
+    receipt["status"] = "failed"
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main",
+                             failure_reason="image-send-failed", delivery_receipt=receipt)
     content = json.dumps(value, ensure_ascii=False)
-    assert "main" in content and "munger" not in content and "ChatGPT 芒格洞察待复核" in content
+    assert "main" in content and "长文精读完成" not in content and "自动交付已结束" in content
 
 
-def test_failure_without_reason_defaults_to_ungenerated():
+def test_missing_receipt_is_processing_not_success():
     value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main")
     content = json.dumps(value, ensure_ascii=False)
-    assert "ChatGPT 芒格洞察待复核：未生成" in content
+    assert "部分交付｜恢复中" in content
+    assert "长文精读完成" not in content
 
 
 def test_image_note_is_appended_without_affecting_munger_state():
-    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_embedded=True, image_note="待插入")
+    value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_embedded=True,
+                             image_note="待插入", delivery_receipt=successful_receipt())
     content = json.dumps(value, ensure_ascii=False)
     assert "核心内容图：待插入" in content
     assert "主精读文档（含芒格洞察）" in content
+
+
+def test_success_requires_all_required_artifacts_and_no_unknown_actions():
+    receipt = successful_receipt()
+    del receipt["artifacts"]["core-image-insert"]
+    try:
+        card.render_card(title="标题", main_url="https://feishu.cn/docx/main",
+                         munger_embedded=True, delivery_receipt=receipt)
+    except ValueError as exc:
+        assert "missing required" in str(exc)
+    else:
+        raise AssertionError("incomplete required artifacts must not render success")
+
+    receipt = successful_receipt()
+    receipt["unresolved_actions"] = ["core-image-send"]
+    try:
+        card.render_card(title="标题", main_url="https://feishu.cn/docx/main",
+                         munger_embedded=True, delivery_receipt=receipt)
+    except ValueError as exc:
+        assert "unresolved" in str(exc)
+    else:
+        raise AssertionError("unknown remote actions must not render success")
 
 
 def test_cli_requires_verified_score_evidence():

@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 BRIDGE_PROCESS_GRACE_SECONDS = 30
 BUSY_RETRY_MAX_WAIT_SECONDS = 600
+WORKFLOW_NEW_CHAT_URL = "https://chatgpt.com/"
 
 
 def _bridge_candidates() -> list[Path]:
@@ -66,6 +67,37 @@ def bridge_command(
     return ["node", "--input-type=module", "-e", module]
 
 
+def observe_bridge_command(
+    bridge: Path | None = None,
+    *,
+    original_run_id: str,
+    conversation_url: str,
+    caller_label: str,
+    max_wait_seconds: int = 720,
+) -> list[str]:
+    try:
+        uuid.UUID(original_run_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("original bridge run id must be a UUID") from exc
+    if not isinstance(caller_label, str) or not caller_label.strip() or len(caller_label.strip()) > 100:
+        raise ValueError("bridge caller label must contain 1 to 100 characters")
+    parsed = urlparse(conversation_url)
+    is_session = parsed.path.startswith("/c/") and parsed.hostname in {"chatgpt.com", "chat.openai.com"}
+    is_new_chat_entry = parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and parsed.path in {"", "/"}
+    if parsed.scheme not in {"http", "https"} or not (is_session or is_new_chat_entry):
+        raise ValueError("conversation URL must be a ChatGPT session or the exact new-chat entrypoint")
+    if isinstance(max_wait_seconds, bool) or not isinstance(max_wait_seconds, int) or not 1 <= max_wait_seconds <= 3600:
+        raise ValueError("observe wait must be between 1 and 3600 seconds")
+    bridge_uri = (bridge or resolve_bridge()).resolve().as_uri()
+    module = (
+        f"import {{ observeBridge }} from {json.dumps(bridge_uri)};"
+        f"const result = await observeBridge({{ originalRunId: {json.dumps(original_run_id)}, conversationUrl: {json.dumps(conversation_url)}, callerLabel: {json.dumps(caller_label.strip())}, maxWaitSeconds: {max_wait_seconds} }});"
+        "process.stdout.write(JSON.stringify(result) + '\\n');"
+        "process.exitCode = result.status === 'succeeded' ? 0 : 2;"
+    )
+    return ["node", "--input-type=module", "-e", module]
+
+
 def _parse_stdout(stdout: str) -> dict:
     values = []
     for line in stdout.splitlines():
@@ -105,6 +137,43 @@ def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int,
     return result
 
 
+def observe_bridge(
+    *,
+    original_run_id: str,
+    conversation_url: str,
+    caller_label: str,
+    bridge: Path | None = None,
+    max_wait_seconds: int = 720,
+) -> dict:
+    """Read the original Bridge result by identity; this never submits a new prompt."""
+    command = observe_bridge_command(
+        bridge,
+        original_run_id=original_run_id,
+        conversation_url=conversation_url,
+        caller_label=caller_label,
+        max_wait_seconds=max_wait_seconds,
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=max_wait_seconds + BRIDGE_PROCESS_GRACE_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "needs_review", "reason": "bridge-observe-process-timeout", "runId": original_run_id}
+    try:
+        result = _parse_stdout(completed.stdout)
+    except Exception as exc:
+        return {"status": "needs_review", "reason": f"bridge-observe-result-invalid: {exc}", "runId": original_run_id}
+    if result.get("runId") != original_run_id:
+        return {"status": "needs_review", "reason": "bridge-observe-run-id-mismatch", "runId": original_run_id}
+    if completed.returncode != 0 and result.get("status") == "succeeded":
+        return {"status": "needs_review", "reason": "bridge-observe-exit-status-mismatch", "runId": original_run_id}
+    return result
+
+
 def _busy_retry_seconds(result: dict, started: float, budget: float) -> float | None:
     """All callers share the bridge slots; a busy rejection waits for a free slot."""
     if budget <= 0:
@@ -129,9 +198,23 @@ def run_bridge(
     conversation_url: str | None = None,
     busy_retry_max_wait_seconds: int = BUSY_RETRY_MAX_WAIT_SECONDS,
     caller_label: str = "read-x:chatgpt-bridge",
+    request_id: str | None = None,
 ) -> dict:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("bridge prompt must not be empty")
+    if request_id is not None:
+        # A durable caller has already journaled this exact ID before submission.
+        # Do not hide a second submission inside the adapter; the workflow owns
+        # admission retries and must allocate/journal a new ID for each one.
+        return _run_bridge_once(
+            prompt,
+            bridge=bridge,
+            max_wait_seconds=max_wait_seconds,
+            image=image,
+            conversation_url=conversation_url,
+            caller_label=caller_label,
+            request_id=request_id,
+        )
     started = time.monotonic()
     busy_retries: list[dict] = []
     while True:

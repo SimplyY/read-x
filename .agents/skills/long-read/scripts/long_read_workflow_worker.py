@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""Durable long-read content worker. Delivery stages remain separate and gated."""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import threading
+import time
+from urllib.parse import urlparse
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_text
+from long_read_workflow_store import Lease, WorkflowStore
+from long_read_document_compiler import (
+    DocumentCompilerAdapter, DocumentCompilerError, DocumentCompilerUnknown,
+)
+import run_chatgpt_munger as munger
+import run_isolated_analyses as isolated
+import long_read_document_supplement as document_supplement
+import long_read_document_assembler as document_assembler
+
+
+CALLER = "read-x:long-read-text"
+MAX_BRANCHES = 3
+SAFE_PRE_SUBMIT_FAILURES = {
+    "bridge-busy", "local-rate-limit-cooldown", "recovery-capability-unavailable",
+    "invalid-bridge-transport", "invalid-mode", "invalid-request-id",
+}
+
+
+def _safe(path: Path) -> None:
+    path = Path(path).absolute()
+    for part in (path, *path.parents):
+        if part.is_symlink() and part not in {Path("/tmp"), Path("/var")}:
+            raise ValueError(f"workflow artifact path must not traverse symlinks: {path}")
+
+
+def _read_bytes(path: Path) -> bytes:
+    _safe(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path.read_bytes()
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    _safe(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _artifact_root(state_dir: Path, job_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f-]{36}", job_id):
+        raise ValueError("invalid workflow job id")
+    root = state_dir / "jobs" / job_id
+    _safe(root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _load_job_inputs(job: dict) -> tuple[dict, Path, str, str]:
+    payload = job["payload"]
+    snapshot = Path(payload["inputs"]["source.md"]["path"]).parent
+    _safe(snapshot)
+    manifest_raw = _read_bytes(snapshot / "manifest.json")
+    snapshot_digest = hashlib.sha256(manifest_raw).hexdigest()
+    if payload.get("snapshot_sha256") != snapshot_digest or snapshot.name != snapshot_digest:
+        raise ValueError("private input snapshot manifest identity mismatch")
+    manifest = json.loads(manifest_raw.decode("utf-8"))
+    if {path.name for path in snapshot.iterdir()} != {*payload["inputs"], "manifest.json"}:
+        raise ValueError("private input snapshot file set changed")
+    expected_manifest = {}
+    for name, reference in payload["inputs"].items():
+        expected_path = (snapshot / name).absolute()
+        if Path(reference["path"]).absolute() != expected_path:
+            raise ValueError(f"private input path was rebound: {name}")
+        raw = _read_bytes(expected_path)
+        expected_manifest[name] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    if manifest != expected_manifest:
+        raise ValueError("private input snapshot manifest content mismatch")
+    source_raw = _read_bytes(snapshot / "source.md")
+    source_digest = hashlib.sha256(source_raw).hexdigest()
+    for name, reference in payload["inputs"].items():
+        raw = _read_bytes(Path(reference["path"]))
+        if hashlib.sha256(raw).hexdigest() != reference["sha256"]:
+            raise ValueError(f"private input snapshot changed: {name}")
+    source = source_raw.decode("utf-8")
+    evidence = _read_bytes(snapshot / "evidence.json").decode("utf-8")
+    isolated.validate_evidence(evidence, source)
+    return payload, snapshot, source, source_digest
+
+
+def _receipt_paths(output: Path) -> tuple[Path, Path]:
+    return output, output.with_suffix(output.suffix + ".receipt.json")
+
+
+def _request_metadata_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".request.json")
+
+
+def _read_local_receipt(output: Path, receipt_path: Path, request_id: str, prompt_sha: str, source_sha: str) -> tuple[str, dict] | None:
+    try:
+        body = _read_bytes(output).decode("utf-8")
+        record = json.loads(_read_bytes(receipt_path).decode("utf-8"))
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if (record.get("status") != "succeeded" or record.get("request_id") != request_id
+            or record.get("caller_label") != CALLER
+            or record.get("conversation_url_requested") != WORKFLOW_NEW_CHAT_URL
+            or _conversation_id(record.get("conversation_url")) is None
+            or record.get("prompt_sha256") != prompt_sha or record.get("source_sha256") != source_sha
+            or record.get("output_sha256") != digest or record.get("submissionConfirmed") is not True
+            or record.get("verification") != "live-dom+snapshot"):
+        return None
+    return body, record
+
+
+def _conversation_id(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"chatgpt.com", "chat.openai.com"}:
+        return None
+    parts = parsed.path.rstrip("/").split("/")
+    if len(parts) < 3 or parts[-2] != "c":
+        return None
+    value = parts[-1] if parts else ""
+    return value if re.fullmatch(r"[A-Za-z0-9_-]{1,200}", value) else None
+
+
+def _load_or_store_request_metadata(output: Path, *, request_id: str, prompt_sha: str,
+                                    source_sha: str, prompt_assets: list[dict],
+                                    existing_effect: bool) -> list[dict] | None:
+    path = _request_metadata_path(output)
+    try:
+        record = json.loads(_read_bytes(path).decode("utf-8"))
+    except FileNotFoundError:
+        if existing_effect:
+            return None
+        record = {
+            "request_id": request_id, "caller_label": CALLER,
+            "conversation_url_requested": WORKFLOW_NEW_CHAT_URL,
+            "prompt_sha256": prompt_sha, "source_sha256": source_sha,
+            "prompt_assets": prompt_assets,
+        }
+        _atomic_bytes(path, (json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (record.get("request_id") != request_id or record.get("caller_label") != CALLER
+            or record.get("conversation_url_requested") != WORKFLOW_NEW_CHAT_URL
+            or record.get("prompt_sha256") != prompt_sha or record.get("source_sha256") != source_sha
+            or not isinstance(record.get("prompt_assets"), list)):
+        return None
+    return record["prompt_assets"]
+
+
+def _store_receipt(output: Path, receipt_path: Path, body: str, *, request_id: str,
+                   prompt_sha: str, source_sha: str, bridge_result: dict,
+                   prompt_assets: list[dict] | None = None) -> dict:
+    record = {
+        "status": "succeeded", "request_id": request_id,
+        "caller_label": CALLER, "conversation_url_requested": WORKFLOW_NEW_CHAT_URL,
+        "conversation_url": bridge_result.get("conversationUrl"),
+        "submissionConfirmed": bridge_result.get("submissionConfirmed"),
+        "verification": bridge_result.get("verification"),
+        "bridge_output_sha256": bridge_result.get("outputSha256"),
+        "source_sha256": source_sha, "prompt_sha256": prompt_sha,
+        "output_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "prompt_assets": prompt_assets or [],
+        "recovery_receipt_status": bridge_result.get("recoveryReceiptStatus"),
+        "recovered_from_receipt": bool(bridge_result.get("recoveredFromReceipt")),
+    }
+    _atomic_bytes(output, body.encode("utf-8"))
+    _atomic_bytes(receipt_path, (json.dumps(record, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    return record
+
+
+def _write_document_candidate(*, store: WorkflowStore, job_id: str, root: Path,
+                              input_sha: str, markdown: str, xml: str) -> dict:
+    directory = root / "document"
+    _safe(directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    markdown_path = directory / "main-doc.md"
+    xml_path = directory / "main-doc.wx_doc.xml"
+    receipt_path = directory / "candidate.receipt.json"
+    markdown_sha = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    xml_sha = hashlib.sha256(xml.encode("utf-8")).hexdigest()
+    try:
+        receipt = json.loads(_read_bytes(receipt_path).decode("utf-8"))
+        existing_markdown = hashlib.sha256(_read_bytes(markdown_path)).hexdigest()
+        existing_xml = hashlib.sha256(_read_bytes(xml_path)).hexdigest()
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        receipt = None
+        existing_markdown = existing_xml = None
+    reusable = (
+        isinstance(receipt, dict) and receipt.get("schema") == "long-read-document-candidate/v1"
+        and receipt.get("input_sha256") == input_sha and receipt.get("markdown_sha256") == markdown_sha
+        and receipt.get("xml_sha256") == xml_sha and existing_markdown == markdown_sha
+        and existing_xml == xml_sha and receipt.get("validation") == "pass"
+    )
+    publish_effect = store.find_effect(job_id, "main-document", "document-publish")
+    if not reusable and publish_effect is not None:
+        raise ValueError("candidate inputs changed after document publish was prepared; read-only reconciliation required")
+    if not reusable:
+        _atomic_bytes(markdown_path, markdown.encode("utf-8"))
+        _atomic_bytes(xml_path, xml.encode("utf-8"))
+        receipt = {
+            "schema": "long-read-document-candidate/v1", "input_sha256": input_sha,
+            "markdown_sha256": markdown_sha, "xml_sha256": xml_sha,
+            "validation": "pass", "created_at": time.time(),
+        }
+        _atomic_bytes(receipt_path, (json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    return {"status": "candidate_ready", "reused": reusable,
+            "markdown_path": str(markdown_path), "xml_path": str(xml_path),
+            "input_sha256": input_sha, "markdown_sha256": markdown_sha, "xml_sha256": xml_sha}
+
+
+def _prepare_text_tasks(payload: dict, snapshot: Path, root: Path) -> dict:
+    result = {}
+    questions = [(item["skill"], snapshot / item["file"]) for item in payload.get("questions", [])]
+    stage = root / "staging"
+    stage.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name in ["article-decode"] + [skill for skill, _ in questions]:
+        task_stage = stage / name
+        task_stage.mkdir(mode=0o700, parents=True, exist_ok=True)
+        specs = [] if name == "article-decode" else [(name, next(path for skill, path in questions if skill == name))]
+        tasks = isolated.prepare_tasks(specs, task_stage)
+        task = next(item for item in tasks if item.name == name)
+        result[name] = task
+    return result
+
+
+def _mark_artifact(store: WorkflowStore, lease: Lease, artifact_key: str, status: str,
+                   reason: str | None = None, *, failure_stage: str = "bridge") -> None:
+    code = re.sub(r"[^A-Za-z0-9_.:/+-]", "-", reason or "")[:120]
+    metadata = {"failure_stage": failure_stage, "reason_code": code} if status == "failed" and code else {}
+    store.set_artifact(lease, artifact_key, status, metadata=metadata)
+
+
+def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
+                     artifact_key: str, output: Path, source_sha: str, prompt: str,
+                     validate, prompt_assets: list[dict] | None = None, prompt_sha: str | None = None,
+                     bridge_fn=run_bridge, observe_fn=observe_bridge) -> dict:
+    with lock:
+        effect = store.find_effect(lease.job_id, artifact_key, "bridge-submit")
+    prompt_sha = prompt_sha or (effect["request_sha256"] if effect else None)
+    if effect is None and prompt is None:
+        raise ValueError(f"new Bridge request requires a Prompt: {artifact_key}")
+    if prompt_sha is None and prompt is not None:
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if prompt_sha is None:
+        raise ValueError(f"persisted Bridge request is missing its Prompt hash: {artifact_key}")
+    if prompt is not None and hashlib.sha256(prompt.encode("utf-8")).hexdigest() != prompt_sha and effect:
+        raise ValueError(f"persisted Prompt hash changed for {artifact_key}")
+    initial_effect_status = effect["status"] if effect else None
+    body = None
+    bridge_result = None
+    recovered = False
+    execution_started = None
+    if effect and effect["status"] == "confirmed":
+        local = _read_local_receipt(*_receipt_paths(output), effect["request_id"], prompt_sha, source_sha)
+        if local:
+            body, receipt = local
+            validate(body)
+            with lock:
+                _mark_artifact(store, lease, artifact_key, "confirmed")
+            return {"artifact": artifact_key, "status": "confirmed", "reused": True,
+                    "request_id": effect["request_id"], "output_sha256": receipt["output_sha256"]}
+        bridge_result = observe_fn(
+            original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+            caller_label=CALLER, max_wait_seconds=720,
+        )
+        recovered = True
+    elif effect and effect["status"] in {"attempting", "uncertain"}:
+        bridge_result = observe_fn(
+            original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+            caller_label=CALLER, max_wait_seconds=720,
+        )
+        recovered = True
+    elif effect and effect["status"] == "failed":
+        return {"artifact": artifact_key, "status": "failed", "reason": "previous-known-failure",
+                "request_id": effect["request_id"]}
+    else:
+        if effect is None:
+            with lock:
+                effect = store.prepare_effect(lease, artifact_key, "bridge-submit", prompt_sha)
+        elif effect["request_sha256"] != prompt_sha:
+            raise ValueError(f"persisted Prompt hash changed for {artifact_key}")
+        prompt_assets = _load_or_store_request_metadata(
+            output, request_id=effect["request_id"], prompt_sha=prompt_sha,
+            source_sha=source_sha, prompt_assets=prompt_assets or [],
+            existing_effect=initial_effect_status not in {None, "prepared"},
+        )
+        if prompt_assets is None:
+            return {"artifact": artifact_key, "status": "needs_review", "reason": "request-metadata-unavailable",
+                    "request_id": effect["request_id"]}
+        with lock:
+            attempt = store.begin_effect(lease, effect["op_key"])
+        if not attempt["execute"]:
+            raise RuntimeError("prepared Bridge effect unexpectedly was not executable")
+        execution_started = time.monotonic()
+        try:
+            bridge_result = bridge_fn(
+                prompt, max_wait_seconds=360, caller_label=CALLER,
+                request_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}".lower()
+            with lock:
+                store.finish_effect(lease, effect["op_key"], "uncertain",
+                                    metadata={"reason_code": reason[:120], "failure_stage": "bridge",
+                                              "duration_ms": round((time.monotonic() - execution_started) * 1000)})
+                _mark_artifact(store, lease, artifact_key, "uncertain")
+            return {"artifact": artifact_key, "status": "needs_review", "reason": reason,
+                    "request_id": effect["request_id"]}
+
+    if not isinstance(bridge_result, dict) or bridge_result.get("runId") != effect["request_id"]:
+        if not recovered:
+            with lock:
+                store.finish_effect(lease, effect["op_key"], "uncertain", metadata={"reason_code": "bridge-run-id-mismatch", "failure_stage": "bridge"})
+                _mark_artifact(store, lease, artifact_key, "uncertain")
+        return {"artifact": artifact_key, "status": "needs_review", "reason": "bridge-run-id-mismatch",
+                "request_id": effect["request_id"]}
+    if bridge_result.get("status") != "succeeded":
+        reason = re.sub(r"[^A-Za-z0-9_.:/+-]", "-", str(bridge_result.get("reason") or bridge_result.get("status") or "bridge-unknown"))[:120]
+        if recovered:
+            return {"artifact": artifact_key, "status": "needs_review", "reason": reason,
+                    "request_id": effect["request_id"]}
+        outcome = "failed" if reason in SAFE_PRE_SUBMIT_FAILURES or bridge_result.get("status") == "failed" else "uncertain"
+        failure_metadata = {"reason_code": reason, "failure_stage": "bridge"}
+        if execution_started is not None:
+            failure_metadata["duration_ms"] = round((time.monotonic() - execution_started) * 1000)
+        with lock:
+            store.finish_effect(lease, effect["op_key"], outcome, metadata=failure_metadata)
+            _mark_artifact(store, lease, artifact_key, "failed" if outcome == "failed" else "uncertain", reason)
+        return {"artifact": artifact_key, "status": "failed" if outcome == "failed" else "needs_review",
+                "reason": reason, "request_id": effect["request_id"]}
+    try:
+        body = validate(verified_text(bridge_result))
+    except Exception as exc:
+        reason = re.sub(r"[^A-Za-z0-9_.:/+-]", "-", f"{type(exc).__name__}")[:120]
+        failure_metadata = {"verification": "live-dom+snapshot", "content_sha256": bridge_result.get("outputSha256"),
+                            "failure_stage": "output-validation", "reason_code": "output-validation"}
+        if execution_started is not None:
+            failure_metadata["duration_ms"] = round((time.monotonic() - execution_started) * 1000)
+        if recovered and initial_effect_status != "confirmed":
+            with lock:
+                store.reconcile_effect(lease, effect["op_key"], "confirmed", remote_id=_conversation_id(bridge_result.get("conversationUrl")),
+                                       metadata=failure_metadata)
+                _mark_artifact(store, lease, artifact_key, "failed", "output-validation", failure_stage="output-validation")
+        elif not recovered:
+            with lock:
+                store.finish_effect(lease, effect["op_key"], "confirmed", remote_id=_conversation_id(bridge_result.get("conversationUrl")),
+                                    metadata=failure_metadata)
+                _mark_artifact(store, lease, artifact_key, "failed", "output-validation", failure_stage="output-validation")
+        else:
+            with lock:
+                _mark_artifact(store, lease, artifact_key, "failed", "output-validation", failure_stage="output-validation")
+        return {"artifact": artifact_key, "status": "failed", "reason": reason,
+                "request_id": effect["request_id"]}
+    if recovered:
+        recovered_assets = _load_or_store_request_metadata(
+            output, request_id=effect["request_id"], prompt_sha=prompt_sha,
+            source_sha=source_sha, prompt_assets=prompt_assets or [], existing_effect=True,
+        )
+        if recovered_assets is None:
+            return {"artifact": artifact_key, "status": "needs_review", "reason": "request-metadata-unavailable",
+                    "request_id": effect["request_id"]}
+        prompt_assets = recovered_assets
+    record = _store_receipt(output, _receipt_paths(output)[1], body, request_id=effect["request_id"],
+                            prompt_sha=prompt_sha, source_sha=source_sha, bridge_result=bridge_result,
+                            prompt_assets=prompt_assets)
+    remote_id = _conversation_id(bridge_result.get("conversationUrl"))
+    success_metadata = {"verification": "live-dom+snapshot", "content_sha256": record["output_sha256"]}
+    if execution_started is not None:
+        success_metadata["duration_ms"] = round((time.monotonic() - execution_started) * 1000)
+    with lock:
+        if recovered and initial_effect_status != "confirmed":
+            store.reconcile_effect(lease, effect["op_key"], "confirmed", remote_id=remote_id,
+                                   metadata=success_metadata)
+        elif initial_effect_status == "confirmed":
+            pass
+        else:
+            store.finish_effect(lease, effect["op_key"], "confirmed", remote_id=remote_id,
+                                metadata=success_metadata)
+        _mark_artifact(store, lease, artifact_key, "confirmed")
+    return {"artifact": artifact_key, "status": "confirmed", "request_id": effect["request_id"],
+            "output_sha256": record["output_sha256"], "recovered": recovered}
+
+
+def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
+                           root: Path, candidate: dict, state_dir: Path,
+                           adapter: DocumentCompilerAdapter) -> dict:
+    job_id = lease.job_id
+    trigger = payload.get("trigger") or {}
+    profile = trigger.get("feishuProfile")
+    identity = trigger.get("identity")
+    try:
+        plan, env = adapter.prepare_plan(
+            job_id=job_id, document_dir=root / "document",
+            candidate_xml=Path(candidate["xml_path"]), profile=profile, identity=identity,
+        )
+    except (DocumentCompilerError, KeyError, TypeError, ValueError) as exc:
+        return {"status": "needs_review", "reason": f"{type(exc).__name__}: {exc}"}
+
+    effect = store.find_effect(job_id, "main-document", "document-publish")
+    try:
+        if effect is None:
+            effect = store.prepare_effect(
+                lease, "main-document", "document-publish", plan["request_sha256"],
+            )
+        elif effect["request_sha256"] != plan["request_sha256"]:
+            return {"status": "needs_review", "reason": "persisted_document_publish_plan_changed"}
+    except Exception as exc:
+        return {"status": "needs_review", "reason": f"{type(exc).__name__}: {exc}"}
+
+    if effect["status"] == "confirmed":
+        return {"status": "confirmed", "document_id": effect.get("remote_id"), "reused": True}
+    if effect["status"] == "failed":
+        return {"status": "failed", "reason": "previous_known_document_publish_failure"}
+
+    def reconcile_readback() -> dict:
+        recovery = adapter.recover(plan=plan, state_dir=state_dir / "document-compiler-state", env=env)
+        if recovery.get("status") == "confirmed":
+            store.reconcile_effect(
+                lease, effect["op_key"], "confirmed",
+                remote_id=recovery.get("remote_id"), metadata=recovery.get("metadata"),
+            )
+            store.set_artifact(
+                lease, "main-document", "confirmed",
+                metadata={"verification": "document-compiler-readonly-recovery-matched",
+                          "content_sha256": plan["receipt"]["xml_sha256"]},
+            )
+            return {"status": "confirmed", "document_id": recovery.get("remote_id"),
+                    "recovered": True}
+        return {"status": "uncertain", "reason": recovery.get("reason_code", "document_publish_unconfirmed")}
+
+    if effect["status"] == "attempting":
+        store.finish_effect(
+            lease, effect["op_key"], "uncertain",
+            metadata={"failure_stage": "document-publish", "reason_code": "worker-interrupted"},
+        )
+        effect = store.get_effect(effect["op_key"])
+        return reconcile_readback()
+    if effect["status"] == "uncertain":
+        return reconcile_readback()
+    if effect["status"] != "prepared":
+        return {"status": "needs_review", "reason": "unsupported_document_publish_effect_state"}
+
+    effect = store.begin_effect(lease, effect["op_key"])
+    try:
+        outcome = adapter.publish(
+            plan=plan, state_dir=state_dir / "document-compiler-state", env=env,
+        )
+    except DocumentCompilerUnknown:
+        store.finish_effect(
+            lease, effect["op_key"], "uncertain",
+            metadata={"failure_stage": "document-publish", "reason_code": "publish-response-unknown"},
+        )
+        effect = store.get_effect(effect["op_key"])
+        return reconcile_readback()
+    except DocumentCompilerError:
+        store.finish_effect(
+            lease, effect["op_key"], "failed",
+            metadata={"failure_stage": "document-publish", "reason_code": "compiler-process-unavailable"},
+        )
+        return {"status": "failed", "reason": "document_compiler_process_unavailable"}
+
+    if outcome.get("status") == "confirmed":
+        store.finish_effect(
+            lease, effect["op_key"], "confirmed", remote_id=outcome.get("remote_id"),
+            metadata=outcome.get("metadata"),
+        )
+        store.set_artifact(
+            lease, "main-document", "confirmed",
+            metadata={"verification": "document-compiler-readback-matched",
+                      "content_sha256": plan["receipt"]["xml_sha256"]},
+        )
+        return {"status": "confirmed", "document_id": outcome.get("remote_id")}
+    if outcome.get("status") == "failed":
+        store.finish_effect(
+            lease, effect["op_key"], "failed",
+            metadata={"failure_stage": "document-publish",
+                      "reason_code": outcome.get("reason_code", "document-compiler-blocked")},
+        )
+        return {"status": "failed", "reason": outcome.get("reason_code", "document-compiler-blocked")}
+    if outcome.get("status") == "uncertain":
+        store.finish_effect(
+            lease, effect["op_key"], "uncertain",
+            metadata={"failure_stage": "document-publish",
+                      "reason_code": outcome.get("reason_code", "document-compiler-publish-unknown")},
+        )
+        effect = store.get_effect(effect["op_key"])
+        return reconcile_readback()
+    store.finish_effect(
+        lease, effect["op_key"], "uncertain",
+        metadata={"failure_stage": "document-publish", "reason_code": "invalid-publish-outcome"},
+    )
+    effect = store.get_effect(effect["op_key"])
+    return reconcile_readback()
+
+
+def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *, bridge_fn, observe_fn,
+                         prompt_fetcher, document_compiler=None) -> dict:
+    job_id = lease.job_id
+    root = _artifact_root(state_dir, job_id)
+    lock = threading.RLock()
+    job = store.get_job(job_id)
+    payload, snapshot, source, source_sha = _load_job_inputs(job)
+    evidence = _read_bytes(snapshot / "evidence.json").decode("utf-8")
+    store.set_status(lease, "running")
+    task_map = _prepare_text_tasks(payload, snapshot, root)
+    branches = []
+    for name, task in task_map.items():
+        output = root / "analysis" / f"{name}.md"
+        effect = store.find_effect(job_id, f"analysis:{name}", "bridge-submit")
+        prompt = isolated.build_task_prompt(task, source, evidence) if effect is None or effect["status"] == "prepared" else None
+        branches.append({"name": name, "artifact_key": f"analysis:{name}", "output": output,
+                         "prompt": prompt, "validate": lambda text, task=task: isolated.validate_task_text(task, text),
+                         "prompt_sha": effect["request_sha256"] if effect and prompt is None else None,
+                         "prompt_assets": []})
+    munger_output = root / "analysis" / "munger-analysis.md"
+    munger_effect = store.find_effect(job_id, "analysis:munger-analysis", "bridge-submit")
+    munger_prompt_error = None
+    if munger_effect and munger_effect["status"] != "prepared":
+        # Recovery observes the exact prior request without fetching or resending live Prompt assets.
+        munger_prompt = None
+        assets = []
+    else:
+        try:
+            asset = (prompt_fetcher or munger.fetch_prompt_asset)("read-x.munger-analysis")
+            munger_prompt = munger.build_prompt(source, [asset])
+            assets = [{key: asset.get(key) for key in ("prompt_id", "prompt_source", "prompt_revision", "prompt_sha256", "prompt_fetched_at")}]
+        except Exception as exc:
+            # A governance read failure is local to this required branch. Other
+            # independent analysis branches still run and remain recoverable.
+            munger_prompt = None
+            assets = []
+            munger_prompt_error = re.sub(r"[^A-Za-z0-9_.:/+-]", "-", type(exc).__name__)[:120]
+            with lock:
+                _mark_artifact(store, lease, "analysis:munger-analysis", "failed",
+                               "prompt-governance-unavailable", failure_stage="prompt-governance")
+    if munger_prompt_error:
+        # A prepared request has not crossed the external-call boundary. Keep
+        # it reusable: a later run can fetch the governed prompt and submit
+        # this exact preallocated request identity safely.
+        branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
+                         "terminal": True, "status": "failed", "reason": "prompt-governance-unavailable",
+                         "error_type": munger_prompt_error})
+    elif munger_effect:
+        prompt_sha = munger_effect["request_sha256"]
+        local = _read_local_receipt(*_receipt_paths(munger_output), munger_effect["request_id"], prompt_sha, source_sha)
+        if local:
+            body, receipt = local
+            bridge_text = body.rstrip("\n")
+            munger._validate_text({"status": "succeeded", "format": "markdown", "verification": "live-dom+snapshot",
+                                  "submissionConfirmed": True, "actualConversationUrl": receipt.get("conversation_url"),
+                                  "conversationUrl": receipt.get("conversation_url"), "text": bridge_text,
+                                  "outputSha256": hashlib.sha256(bridge_text.encode("utf-8")).hexdigest()})
+            _mark_artifact(store, lease, "analysis:munger-analysis", "confirmed")
+            branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
+                             "reuse": True, "output": munger_output, "status": "confirmed"})
+        else:
+            branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
+                             "output": munger_output,
+                             "prompt": munger_prompt if munger_effect["status"] == "prepared" else None,
+                             "prompt_sha": prompt_sha,
+                             "validate": lambda text: text + "\n", "prompt_assets": assets})
+    else:
+        branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
+                         "output": munger_output, "prompt": munger_prompt,
+                         "prompt_sha": None, "validate": lambda text: text + "\n",
+                         "prompt_assets": assets})
+
+    started = time.monotonic()
+    outcomes = []
+
+    def invoke(branch):
+        if branch.get("terminal"):
+            return branch
+        if branch.get("reuse"):
+            return branch
+        result = _run_text_branch(
+            store=store, lease=lease, lock=lock, artifact_key=branch["artifact_key"],
+            output=branch["output"], source_sha=source_sha, prompt=branch["prompt"],
+            validate=branch["validate"], prompt_assets=branch.get("prompt_assets"),
+            prompt_sha=branch.get("prompt_sha"),
+            bridge_fn=bridge_fn, observe_fn=observe_fn,
+        )
+        return {"name": branch["name"], **result}
+
+    with ThreadPoolExecutor(max_workers=min(MAX_BRANCHES, max(1, len(branches)))) as pool:
+        future_map = {pool.submit(invoke, branch): branch["name"] for branch in branches}
+        for future in as_completed(future_map):
+            try:
+                outcomes.append(future.result())
+            except Exception as exc:
+                outcomes.append({"name": future_map[future], "status": "needs_review",
+                                 "reason": f"{type(exc).__name__}: {exc}"})
+    outcomes.sort(key=lambda item: item["name"])
+    unresolved = any(item["status"] == "needs_review" for item in outcomes)
+    unresolved |= bool(store.connection.execute(
+        "SELECT 1 FROM effects WHERE job_id=? AND artifact_key LIKE 'analysis:%' "
+        "AND status IN ('attempting','uncertain') LIMIT 1", (job_id,)
+    ).fetchone())
+
+    # This small, separately checkpointed Bridge request only fills the two
+    # document fragments that are not available as structured source data.
+    # It consumes verified article-decode and successful text-ljg artifacts;
+    # it never rewrites or replaces their originals.
+    current_artifacts = {item["artifact_key"]: item for item in store.artifacts(job_id)}
+    article_status = current_artifacts.get("analysis:article-decode", {}).get("status")
+    ljg_statuses = [current_artifacts.get(f"analysis:{name}", {}).get("status")
+                    for name in task_map if name != "article-decode"]
+    text_inputs_ready = article_status == "confirmed" and all(status in {"confirmed", "failed"} for status in ljg_statuses)
+    analysis_texts = {}
+    supplement_outcome = None
+    if text_inputs_ready:
+        for name, task in task_map.items():
+            key = f"analysis:{name}"
+            artifact_status = current_artifacts.get(key, {}).get("status")
+            if artifact_status == "failed" and name != "article-decode":
+                continue
+            effect = store.find_effect(job_id, key, "bridge-submit")
+            if effect is None or effect["status"] != "confirmed":
+                text_inputs_ready = False
+                break
+            output = root / "analysis" / f"{name}.md"
+            local = _read_local_receipt(*_receipt_paths(output), effect["request_id"],
+                                        effect["request_sha256"], source_sha)
+            if local is None:
+                text_inputs_ready = False
+                break
+            body, _ = local
+            isolated.validate_task_text(task, body.rstrip("\n"))
+            analysis_texts[name] = body
+    if text_inputs_ready:
+        supplement_prompt, supplement_input_sha = document_supplement.build_prompt(
+            source=source, evidence=json.loads(evidence), analyses=analysis_texts,
+        )
+        supplement_effect = store.find_effect(job_id, "analysis:document-supplement", "bridge-submit")
+        supplement_output = root / "analysis" / "document-supplement.md"
+        if supplement_effect and supplement_effect["status"] != "prepared":
+            supplement_prompt = None
+        supplement_outcome = _run_text_branch(
+            store=store, lease=lease, lock=lock,
+            artifact_key="analysis:document-supplement", output=supplement_output,
+            source_sha=supplement_input_sha, prompt=supplement_prompt,
+            prompt_sha=supplement_effect["request_sha256"] if supplement_effect and supplement_prompt is None else None,
+            validate=document_supplement.validate_supplement,
+            bridge_fn=bridge_fn, observe_fn=observe_fn,
+        )
+        outcomes.append({"name": "document-supplement", **supplement_outcome})
+    else:
+        pending = current_artifacts.get("analysis:document-supplement", {})
+        outcomes.append({"name": "document-supplement", "artifact": "analysis:document-supplement",
+                         "status": "needs_review", "reason": "required-text-inputs-not-confirmed"})
+        unresolved = True
+
+    artifacts = store.artifacts(job_id)
+    unresolved |= any(item["status"] == "needs_review" for item in outcomes)
+    retryable_governance_failure = any(
+        item["artifact_key"].startswith("analysis:")
+        and item["status"] == "failed"
+        and item.get("metadata", {}).get("failure_stage") == "prompt-governance"
+        for item in artifacts
+    )
+
+    candidate_result = None
+    statuses = {item["artifact_key"]: item for item in artifacts}
+    content_states_resolved = all(
+        statuses.get(f"analysis:{name}", {}).get("status") in {"confirmed", "failed"}
+        for name in task_map
+    )
+    munger_state = statuses.get("analysis:munger-analysis", {}).get("status")
+    munger_resolved = munger_state in {"confirmed", "failed"} and not retryable_governance_failure
+    supplement_state = statuses.get("analysis:document-supplement", {}).get("status")
+    unresolved_effects = store.connection.execute(
+        "SELECT 1 FROM effects WHERE job_id=? AND artifact_key LIKE 'analysis:%' "
+        "AND status IN ('attempting','uncertain') LIMIT 1", (job_id,)
+    ).fetchone()
+    if (article_status == "confirmed" and supplement_state == "confirmed" and content_states_resolved
+            and munger_resolved and not unresolved_effects):
+        article_decode = analysis_texts.get("article-decode")
+        supplement_effect = store.find_effect(job_id, "analysis:document-supplement", "bridge-submit")
+        if article_decode is None or supplement_effect is None or supplement_effect["status"] != "confirmed":
+            raise ValueError("verified article or document-supplement receipt is missing")
+        supplement_input_sha = document_supplement.input_sha256(
+            source=source, evidence=json.loads(evidence),
+            analyses={name: body for name, body in analysis_texts.items()},
+        )
+        supplement_local = _read_local_receipt(
+            *_receipt_paths(root / "analysis" / "document-supplement.md"),
+            supplement_effect["request_id"], supplement_effect["request_sha256"], supplement_input_sha,
+        )
+        if supplement_local is None:
+            raise ValueError("verified document-supplement local receipt is missing")
+        supplement_text, supplement_receipt = supplement_local
+        document_supplement.validate_supplement(supplement_text)
+        scoring_raw = _read_bytes(snapshot / "scoring-result.json")
+        scoring = json.loads(scoring_raw.decode("utf-8"))
+        evidence_value = json.loads(evidence)
+        successful_ljgs = [(name, body) for name, body in analysis_texts.items() if name != "article-decode"]
+
+        munger_text = None
+        munger_receipt = None
+        munger_effect = store.find_effect(job_id, "analysis:munger-analysis", "bridge-submit")
+        if munger_state == "confirmed":
+            if munger_effect is None or munger_effect["status"] != "confirmed":
+                raise ValueError("Munger branch confirmation has no matching Bridge effect")
+            munger_local = _read_local_receipt(
+                *_receipt_paths(root / "analysis" / "munger-analysis.md"),
+                munger_effect["request_id"], munger_effect["request_sha256"], source_sha,
+            )
+            if munger_local is None:
+                raise ValueError("confirmed Munger branch has no matching local receipt")
+            munger_text, munger_receipt = munger_local
+
+        assembled = document_assembler.assemble_markdown(
+            evidence=evidence_value, scoring=scoring, article_decode=article_decode,
+            text_analyses=successful_ljgs, supplement_markdown=supplement_text,
+            source=source, munger_markdown=munger_text,
+        )
+        original_source_url = evidence_value["metadata"]["source_url"]
+        conversation_url = munger_receipt.get("conversation_url", "") if munger_receipt else ""
+        xml = document_assembler.render_candidate(
+            assembled, title=evidence_value["metadata"]["title"],
+            source_url=original_source_url, conversation_url=conversation_url,
+        )
+        candidate_inputs = {
+            "snapshot_sha256": payload["snapshot_sha256"],
+            "article_decode_sha256": hashlib.sha256(article_decode.encode("utf-8")).hexdigest(),
+            "document_supplement_sha256": supplement_receipt["output_sha256"],
+            "successful_ljg_sha256": {name: hashlib.sha256(body.encode("utf-8")).hexdigest()
+                                       for name, body in successful_ljgs},
+            "munger_sha256": hashlib.sha256(munger_text.encode("utf-8")).hexdigest() if munger_text is not None else None,
+            "scoring_sha256": hashlib.sha256(scoring_raw).hexdigest(),
+        }
+        candidate_input_sha = hashlib.sha256(
+            json.dumps(candidate_inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        candidate_result = _write_document_candidate(
+            store=store, job_id=job_id, root=root, input_sha=candidate_input_sha,
+            markdown=assembled, xml=xml,
+        )
+
+    if not unresolved and not retryable_governance_failure:
+        required = {item["artifact_key"] for item in artifacts if item["required"]}
+        munger_artifact = next((item for item in artifacts if item["artifact_key"] == "analysis:munger-analysis"), None)
+        if munger_artifact and munger_artifact["status"] == "confirmed":
+            required.update({"munger-image", "munger-image-insert", "munger-image-send"})
+        if not store.get_job(job_id)["payload"].get("artifact_plan_finalized"):
+            store.finalize_artifact_plan(lease, required)
+
+    document_delivery = None
+    if candidate_result is not None:
+        document_delivery = _publish_main_document(
+            store=store, lease=lease, payload=payload, root=root, candidate=candidate_result,
+            state_dir=state_dir, adapter=document_compiler or DocumentCompilerAdapter(),
+        )
+        if document_delivery["status"] in {"needs_review", "uncertain"}:
+            unresolved = True
+    required_analysis_unresolved = any(
+        item["required"] and item["kind"] == "analysis" and item["status"] in {"pending", "uncertain"}
+        for item in artifacts
+    )
+    candidate_missing = candidate_result is None
+    needs_review = unresolved or retryable_governance_failure or required_analysis_unresolved or candidate_missing
+    store.set_status(lease, "needs_review" if needs_review else "waiting")
+    required_analysis_failed = any(
+        item["required"] and item["kind"] == "analysis" and item["status"] == "failed"
+        for item in artifacts
+    )
+    return {
+        "status": ("needs_review" if needs_review else
+                   "partial_content_ready_for_delivery" if required_analysis_failed else
+                   "waiting_for_delivery_stages"),
+        "job_id": job_id,
+        "delivery_complete": False,
+        "content_branches": outcomes,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "next_stage": "document_compiler_publish_and_images" if candidate_result else "resolve_content_recovery",
+        "document_candidate": candidate_result,
+        "document_delivery": document_delivery,
+        "required_artifacts": [item["artifact_key"] for item in store.artifacts(job_id) if item["required"]],
+    }
+
+
+def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", lease_seconds: float = 900,
+                bridge_fn=run_bridge, observe_fn=observe_bridge, prompt_fetcher=None,
+                document_compiler=None) -> dict:
+    state_dir = Path(state_dir).absolute()
+    lock = threading.RLock()
+    with WorkflowStore(state_dir) as store:
+        lease = store.acquire_lease(job_id, owner, lease_seconds)
+        try:
+            result = _advance_claimed_job(store, lease, state_dir, bridge_fn=bridge_fn,
+                                          observe_fn=observe_fn, prompt_fetcher=prompt_fetcher,
+                                          document_compiler=document_compiler)
+        except Exception as exc:
+            with lock:
+                try:
+                    store.set_status(lease, "needs_review")
+                except Exception:
+                    pass
+            result = {"status": "needs_review", "job_id": job_id, "delivery_complete": False,
+                      "reason": f"{type(exc).__name__}: {exc}"}
+        finally:
+            with lock:
+                try:
+                    store.release_lease(lease)
+                except Exception:
+                    pass
+        return result
+
+
+def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x-worker") -> dict:
+    state_dir = Path(state_dir).absolute()
+    if job_id:
+        return process_job(state_dir, job_id, owner=owner)
+    db = state_dir / "workflow.sqlite3"
+    if not db.is_file() or db.is_symlink():
+        return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
+    with WorkflowStore(state_dir) as store:
+        rows = store.connection.execute(
+            "SELECT DISTINCT j.job_id FROM jobs j JOIN artifacts a ON a.job_id=j.job_id "
+            "WHERE j.status NOT IN ('succeeded','failed') AND a.artifact_key LIKE 'analysis:%' "
+            "AND a.status IN ('pending','uncertain') ORDER BY j.created_at LIMIT 1"
+        ).fetchall()
+    if not rows:
+        return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
+    return process_job(state_dir, rows[0]["job_id"], owner=owner)
+

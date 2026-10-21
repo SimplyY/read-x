@@ -37,10 +37,10 @@ class FakeBridge:
     def task_name(self, prompt: str) -> str:
         return runner.skill_name(prompt.split("\n\n", 1)[0] + "\n")
 
-    def __call__(self, prompt, *, max_wait_seconds=360, image=False, busy_retry_max_wait_seconds=600):
+    def __call__(self, prompt, *, max_wait_seconds=360, image=False, conversation_url=None, caller_label=None, request_id=None, busy_retry_max_wait_seconds=600):
         with self.lock:
             self.prompts.append(prompt)
-            self.calls.append({"max_wait_seconds": max_wait_seconds, "image": image})
+            self.calls.append({"max_wait_seconds": max_wait_seconds, "image": image, "conversation_url": conversation_url, "caller_label": caller_label, "request_id": request_id})
             self.active += 1
             self.max_active = max(self.max_active, self.active)
         time.sleep(0.05)
@@ -54,12 +54,22 @@ class FakeBridge:
 
 
 def succeeded(name: str, text: str | None = None) -> dict:
-    markers = "证据边界 我的判断" if name == "article-decode" else " ".join(runner.OUTPUT_MARKERS.get(name, ()))
-    body = text if text is not None else f"# {name}\n{markers}\n" + ("有效分析。" * 140)
+    if name == "article-decode" and text is None:
+        body = (
+            "> 证据边界：除原文明确陈述外，以下均为我的判断。\n"
+            "# 这篇文章真正的核心\n有效分析。\n"
+            "# 基石 / 边缘 / 暗流\n有效分析。\n"
+            "# 作者心中的结构\n有效分析。\n"
+        )
+    else:
+        markers = "证据边界 我的判断" if name == "article-decode" else " ".join(runner.OUTPUT_MARKERS.get(name, ()))
+        body = text if text is not None else f"# {name}\n{markers}\n" + ("有效分析。" * 140)
     return {
         "status": "succeeded",
         "runId": f"run-{name}",
         "conversationUrl": "https://chatgpt.com/c/fake",
+        "actualConversationUrl": "https://chatgpt.com/c/fake",
+        "submissionConfirmed": True,
         "verification": "live-dom+snapshot",
         "format": "markdown",
         "text": body,
@@ -140,8 +150,10 @@ def test_parallel_prompt_boundary_and_atomic_outputs():
                     assert prompt.startswith(skill(name))
                     assert runner.TEXT_RUNTIME_OVERRIDE in prompt
                     assert runner.TEXT_TASK_REQUIREMENTS[name] in prompt
-                    assert "输出 500～1500 字原稿" in prompt
-                    assert "600~1000" not in prompt
+                assert "# Read-X｜单分支分析精简规范" in prompt
+                assert "不设置统一的硬性总字数要求。" in prompt
+                assert "500～1500 字" not in prompt
+                assert "600-1000 字" not in prompt
                 assert parsed["source"] == source.read_text(encoding="utf-8")
                 assert json.loads(parsed["evidence"]) == json.loads(evidence.read_text(encoding="utf-8"))
                 assert ("question" in parsed) == (name != "article-decode")
@@ -181,7 +193,7 @@ def test_one_failure_keeps_other_outputs_and_stale_outputs_are_rejected():
         restore()
 
 
-def test_short_model_output_fails_closed():
+def test_short_nonempty_output_is_kept_without_length_gate():
     fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [succeeded("ljg-think", text="短")]})
     restore = patch_bridge(fake)
     try:
@@ -192,11 +204,9 @@ def test_short_model_output_fails_closed():
                 source, evidence, root / "out", specs[:1],
                 article_skill_path=article, skill_roots=[skills],
             )
-            failed = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
-            assert summary["status"] == "partial" and failed["status"] == "failed"
-            assert "output is too short" in failed["error"]
-            assert failed["error_type"] == "output_validation"
-            assert not (root / "out/01-ljg-think.md").exists()
+            completed = next(item for item in summary["tasks"] if item["task"] == "ljg-think")
+            assert summary["status"] == "completed" and completed["status"] == "completed"
+            assert (root / "out/01-ljg-think.md").read_text(encoding="utf-8") == "短\n"
     finally:
         restore()
 
@@ -219,6 +229,42 @@ def test_overlong_model_output_is_kept():
         restore()
 
 
+def test_known_writes_length_rule_is_removed_and_unknown_conflict_fails_closed():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        question = root / "question.md"
+        question.write_text("question", encoding="utf-8")
+        skills = root / "skills"
+        writes = skills / "ljg-writes" / "SKILL.md"
+        writes.parent.mkdir(parents=True)
+        writes.write_text(
+            "---\nname: ljg-writes\ndescription: 写作引擎。600-1000 字。\n---\n总量：600-1000 字。少于 600 -> 没挖够；多于 1000 -> 没砍够。\n",
+            encoding="utf-8",
+        )
+        task = runner.prepare_tasks([("ljg-writes", question)], root / "out", skill_roots=[skills])[1]
+        prompt = runner.build_task_prompt(task, "source", "{}")
+        assert "600-1000" not in prompt
+        assert "不设置统一的硬性总字数要求。" in prompt
+
+        article = root / "article-decode.md"
+        article.write_text("---\nname: article-decode\ndescription: test\n---\n输出 500～1500 字，按信息密度完成。\n", encoding="utf-8")
+        article_task = runner.prepare_tasks([], root / "article-out", article_skill_path=article)[0]
+        article_prompt = runner.build_task_prompt(article_task, "source", "{}")
+        assert "500～1500 字" not in article_prompt
+        assert "不设置统一的硬性总字数要求。" in article_prompt
+
+        think = skills / "ljg-think" / "SKILL.md"
+        think.parent.mkdir(parents=True)
+        think.write_text("---\nname: ljg-think\ndescription: test\n---\n总量不超过 500 字。\n", encoding="utf-8")
+        task = runner.prepare_tasks([("ljg-think", question)], root / "other", skill_roots=[skills])[1]
+        try:
+            runner.build_task_prompt(task, "source", "{}")
+        except runner.OutputValidationError as exc:
+            assert "conflicting hard total-length" in str(exc)
+        else:
+            raise AssertionError("unknown conflicting skill instruction must stop before Bridge")
+
+
 def test_pre_submit_cooldown_recovers_exactly_once():
     fake = FakeBridge({"article-decode": [succeeded("article-decode")], "ljg-think": [{"status": "needs_review", "reason": "local-rate-limit-cooldown", "retryAfterSeconds": 1}, succeeded("ljg-think")]})
     restore = patch_bridge(fake)
@@ -234,6 +280,31 @@ def test_pre_submit_cooldown_recovers_exactly_once():
             assert think["status"] == "completed" and think["attempts"] == 2
             assert [item["reason"] for item in think["attempts_detail"]] == ["local-rate-limit-cooldown", None]
             assert len(fake.calls) == 3
+    finally:
+        restore()
+
+
+def test_preallocated_request_ids_are_forwarded_without_internal_cooldown_retry():
+    fake = FakeBridge({"article-decode": [{"status": "needs_review", "reason": "local-rate-limit-cooldown", "retryAfterSeconds": 1}]})
+    restore = patch_bridge(fake)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, evidence, article, skills, specs = fixture(root)
+            request_ids = {
+                "article-decode": "d3966b51-56bf-4557-8913-fad222a411ee",
+                "ljg-think": "737c0643-7d26-46ef-9d3a-1ac5bbcda47f",
+            }
+            summary = runner.run(
+                source, evidence, root / "out", specs[:1],
+                article_skill_path=article, skill_roots=[skills], request_ids=request_ids,
+            )
+            article = next(item for item in summary["tasks"] if item["task"] == "article-decode")
+            assert article["status"] == "failed" and article["request_id"] == request_ids["article-decode"]
+            assert len(fake.calls) == 2
+            calls = {item["request_id"]: item for item in fake.calls}
+            assert calls[request_ids["article-decode"]]["caller_label"] == "read-x:long-read-text"
+            assert calls[request_ids["ljg-think"]]["caller_label"] == "read-x:long-read-text"
     finally:
         restore()
 

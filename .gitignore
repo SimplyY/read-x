@@ -13,6 +13,7 @@ __pycache__/
 GROUP_INFO.md
 output/
 docs/
+state/long-read/
 
 # qoder 编辑器产物
 .qoder/

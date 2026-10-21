@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import importlib.util
 import os
 import re
@@ -41,23 +42,35 @@ for _name in (
 
 
 def render_markdown(markdown: str, *, title: str, source_url: str, conversation_url: str) -> str:
-    """Keep read-x's provenance notice while delegating layout to the shared layer."""
+    """Keep provenance in the link paragraph and leave the unique callout to content."""
     markdown = _strip_leading_document_title(markdown, title)
+    marker = re.compile(r"(?m)^:::readx-core-conclusion[ \t]*\r?\n([^\r\n]+)\r?\n:::[ \t]*(?:\r?\n|$)")
+    matches = list(marker.finditer(markdown))
+    if len(matches) > 1:
+        raise ValueError("document must contain at most one Read-X core-conclusion block")
+    sentinel = "READXCORECONCLUSIONMARKER"
+    conclusion = None
+    if matches:
+        conclusion = matches[0].group(1).strip()
+        if not conclusion or "\n" in conclusion or len(conclusion) > 100:
+            raise ValueError("Read-X core conclusion must be one non-empty line of at most 100 characters")
+        markdown = marker.sub(sentinel, markdown, count=1)
     xml = _SHARED.render_markdown(
         markdown,
         title=title,
         source_url=source_url,
         conversation_url=conversation_url,
     )
-    blocks = xml.rstrip("\n").split("\n")
-    insertion = 1
-    if len(blocks) > 1 and blocks[1].startswith("<p>溯源："):
-        insertion = 2
-    blocks.insert(
-        insertion,
-        '<callout emoji="⭐" background-color="light-yellow" border-color="yellow"><p>以下内容由 ChatGPT 基于完整原文生成，并按芒格之魂提示词组织；事实、推断与未知应分别核对。</p></callout>',
-    )
-    return "\n".join(blocks) + "\n"
+    if conclusion is not None:
+        token = f"<p>{sentinel}</p>"
+        if xml.count(token) != 1:
+            raise ValueError("Read-X core-conclusion marker was not preserved by the renderer")
+        callout = (
+            '<callout emoji="⭐" background-color="light-yellow" border-color="yellow">'
+            '<p><b>文章最重要的一刀：</b>' + html.escape(conclusion, quote=False) + "</p></callout>"
+        )
+        xml = xml.replace(token, callout, 1)
+    return xml
 
 
 def _strip_leading_document_title(markdown: str, title: str) -> str:

@@ -13,10 +13,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
-from chatgpt_bridge import bridge_command, run_bridge, verified_text
+from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, bridge_command, run_bridge, verified_text
+from long_read_prompt_contract import assert_no_hard_total_length, load_concision_prompt
 
 
-MIN_VISIBLE_CHARS = 500
 MAX_PROMPT_CHARS = 120_000
 # 提交前冷却最多按 Bridge 给出的等待时间安全恢复一次；超过 15 分钟的冷却不挂起编排。
 MAX_COOLDOWN_WAIT_SECONDS = 900
@@ -99,17 +99,21 @@ def fetch_prompt_asset(prompt_id: str) -> dict:
     return asset
 
 
-def build_prompt(source: str, prompt_assets: list[dict]) -> str:
+def build_prompt(source: str, prompt_assets: list[dict], concision_prompt: str | None = None) -> str:
     if not prompt_assets:
         raise ValueError("prompt-assets-empty")
     asset_text = "\n\n".join(str(asset["content"]).strip() for asset in prompt_assets)
+    assert_no_hard_total_length(asset_text, context="munger Prompt asset")
+    concision = concision_prompt if concision_prompt is not None else load_concision_prompt()
     prompt = f"""{asset_text}
+
+{concision}
 
 【待分析全文】
 {source}
 
 【本次交付要求】
-输出 500～1500 字独立成篇的最终 Markdown；按上限提高信息密度，禁止摘要或压缩语义。
+输出独立成篇的最终 Markdown；按信息价值保留必要论证，删除低价值冗余。
 
 【调用层边界】
 Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
@@ -123,11 +127,7 @@ def _bridge_command(bridge: Path) -> list[str]:
 
 
 def _validate_text(result: dict) -> str:
-    text = verified_text(result)
-    visible = len("".join(text.split()))
-    if visible < MIN_VISIBLE_CHARS:
-        raise RuntimeError(f"analysis too short: {visible} < {MIN_VISIBLE_CHARS}")
-    return text.strip() + "\n"
+    return verified_text(result).strip() + "\n"
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -168,7 +168,7 @@ def _record_attempt(attempts: list[dict], result: dict) -> None:
     })
 
 
-def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, prompt_fetcher=None) -> dict:
+def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, prompt_fetcher=None, request_id: str | None = None) -> dict:
     if output_path.exists():
         raise FileExistsError(f"output already exists: {output_path}")
     source = _read_regular(source_path, "source")
@@ -181,13 +181,21 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
     started = time.monotonic()
     attempts: list[dict] = []
     # The Bridge owns its submit/observe/cleanup deadlines. A shorter parent
-    result = run_bridge(prompt, bridge=bridge, max_wait_seconds=360)
+    bridge_args = {
+        "bridge": bridge,
+        "max_wait_seconds": 360,
+        "caller_label": "read-x:long-read-text",
+        "conversation_url": WORKFLOW_NEW_CHAT_URL,
+    }
+    if request_id is not None:
+        bridge_args["request_id"] = request_id
+    result = run_bridge(prompt, **bridge_args)
     _record_attempt(attempts, result)
-    cooldown_wait = _cooldown_wait_seconds(result)
+    cooldown_wait = _cooldown_wait_seconds(result) if request_id is None else None
     if cooldown_wait is not None:
         # 提交前冷却：还没有任何内容被提交，按 Bridge 给出的等待时间安全恢复一次。
         time.sleep(cooldown_wait)
-        result = run_bridge(prompt, bridge=bridge, max_wait_seconds=360)
+        result = run_bridge(prompt, **bridge_args)
         _record_attempt(attempts, result)
     try:
         text = _validate_text(result)
@@ -214,6 +222,7 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
         "verification": result.get("verification"),
         "outputSha256": result.get("outputSha256"),
         "output_sha256": result.get("outputSha256"),
+        "request_id": request_id or result.get("runId"),
         "sourceSha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "prompt_assets": [{key: asset.get(key) for key in ("prompt_id", "prompt_source", "prompt_revision", "prompt_sha256", "prompt_fetched_at")} for asset in prompt_assets],
@@ -233,9 +242,10 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--bridge", type=Path)
     parser.add_argument("--summary", type=Path)
+    parser.add_argument("--request-id", help="预先持久化的 Bridge 请求 UUID；禁用隐藏重试与内存冷却等待")
     args = parser.parse_args()
     try:
-        result = run(args.source, args.output, args.bridge, args.summary)
+        result = run(args.source, args.output, args.bridge, args.summary, request_id=args.request_id)
     except Exception as exc:
         result = {"status": "needs_review", "reason": str(exc)}
     print(json.dumps(result, ensure_ascii=False))

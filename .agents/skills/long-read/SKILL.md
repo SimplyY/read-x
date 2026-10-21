@@ -59,6 +59,10 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 Markdown 是本轮唯一临时源。ChatGPT 芒格结果成功时，作为一个一级主章节拼进主文档；**不再创建第二篇 Docx XML**。
 
+### 单分支 Prompt 精简契约
+
+`article-decode`、每条文字 ljg 与芒格分析的实际请求都必须附带 [`single-branch-concision.md`](references/single-branch-concision.md) 的完整基准正文。它是生成约束：保留当前分支的专业方法、必要证据与论证，删除低价值重复；不设统一硬性总字数门槛，不截断、不以后处理压缩，也不跨分支删重。调用层发现当前分支 Prompt 含冲突的硬性总篇幅要求时，必须在提交前停止并报告冲突，不得同时发送相互矛盾的指令。
+
 为每条文字 ljg 创建只含唯一问题的独立文件，然后运行编排入口：
 
 ```bash
@@ -103,7 +107,7 @@ python3 .agents/skills/long-read/scripts/run_long_read_pipeline.py \
 
 拼接完成的全文先落盘 `<run_dir>/main-doc.md`；它是核心内容图的输入，也是渲染 `.wx_doc.xml` 的同源底稿。
 
-- 文档不设总字数上限；附录每条文字 ljg 由 ChatGPT 按 500～1500 字输出，本地不因超长拒绝。
+- 文档与单分支分析均不设统一硬性总字数门槛；实际生成约束见 [`single-branch-concision.md`](references/single-branch-concision.md)。
 - 附录放每条文字 ljg 通过源头上限校验的原稿；主 Agent 只做排版加工，不压缩、不改语义、不磨平原 Skill 语气；附录标题后不放导言概要。每条原稿内部仍受可读性约束：单段≤100字、关键概念加粗、并列用列表、对比用表格、独立段落间换行。完整规则见 `references/output-schema.md` 第 3、4 节。
 
 ## 5. 成品结构

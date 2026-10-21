@@ -43,6 +43,8 @@ def _result(text=ANALYSIS, **overrides):
         "status": "succeeded",
         "runId": "r1",
         "conversationUrl": "https://chatgpt.test/c/1",
+        "actualConversationUrl": "https://chatgpt.test/c/1",
+        "submissionConfirmed": True,
         "format": "markdown",
         "verification": "live-dom+snapshot",
         "text": text,
@@ -92,7 +94,9 @@ def test_success_keeps_prompt_boundary_and_writes_atomically():
         assert "真正试图解决的问题" in captured["prompt"]
         assert "本任务以“芒格之魂”为核心提示词" in captured["prompt"]
         assert "不要脱离原任务另起炉灶" in captured["prompt"]
-        assert "输出 500～1500 字独立成篇的最终 Markdown" in captured["prompt"]
+        assert "# Read-X｜单分支分析精简规范" in captured["prompt"]
+        assert "不设置统一的硬性总字数要求。" in captured["prompt"]
+        assert "输出 500～1500 字" not in captured["prompt"]
         # 提示词独立成篇：芒格之魂全文内嵌在 read-x.munger-analysis 正文中，不再拼接第二个资产。
         assert "【芒格之魂】" in captured["prompt"]
         assert "Bridge 将在本段之后追加两行唯一的输出边界" in captured["prompt"]
@@ -181,6 +185,65 @@ def test_overlong_analysis_is_kept():
             assert output.exists()
         finally:
             runner.run_bridge = original
+
+
+def test_short_nonempty_analysis_is_kept_without_length_gate():
+    with tempfile.TemporaryDirectory() as directory:
+        source, output, bridge, _ = _files(Path(directory))
+        original = runner.run_bridge
+        try:
+            runner.run_bridge = lambda *args, **kwargs: _result(text="短")
+            completed = runner.run(source, output, bridge)
+            assert completed["status"] == "succeeded"
+            assert output.read_text(encoding="utf-8") == "短\n"
+        finally:
+            runner.run_bridge = original
+
+
+def test_conflicting_live_prompt_stops_before_bridge():
+    with tempfile.TemporaryDirectory() as directory:
+        source, output, bridge, _ = _files(Path(directory))
+        old_asset = PROMPT_ASSETS["read-x.munger-analysis"]
+        bad_content = old_asset["content"] + "\n全文不超过 500 字。"
+        PROMPT_ASSETS["read-x.munger-analysis"] = {
+            **old_asset,
+            "content": bad_content,
+            "prompt_sha256": hashlib.sha256(bad_content.encode("utf-8")).hexdigest(),
+        }
+        calls = []
+        original = runner.run_bridge
+        runner.run_bridge = lambda *args, **kwargs: calls.append(1)
+        try:
+            try:
+                runner.run(source, output, bridge)
+            except ValueError as exc:
+                assert "conflicting hard total-length" in str(exc)
+            else:
+                raise AssertionError("conflicting live Prompt must fail before Bridge submission")
+        finally:
+            runner.run_bridge = original
+            PROMPT_ASSETS["read-x.munger-analysis"] = old_asset
+        assert calls == [] and not output.exists()
+
+
+def test_preallocated_request_id_disables_internal_cooldown_wait_and_retry():
+    with tempfile.TemporaryDirectory() as directory:
+        source, output, bridge, _ = _files(Path(directory))
+        calls = []
+        original = runner.run_bridge
+        request_id = "ab64f154-3484-4a8c-8984-758c76bc9f3a"
+        runner.run_bridge = lambda prompt, **kwargs: (
+            calls.append(kwargs),
+            {"status": "needs_review", "reason": "local-rate-limit-cooldown", "runId": request_id},
+        )[1]
+        try:
+            result = runner.run(source, output, bridge, request_id=request_id)
+        finally:
+            runner.run_bridge = original
+        assert result["status"] == "needs_review"
+        assert len(calls) == 1
+        assert calls[0]["request_id"] == request_id
+        assert calls[0]["caller_label"] == "read-x:long-read-text"
 
 
 def test_pre_submit_cooldown_recovers_exactly_once_with_bridge_wait():
@@ -291,7 +354,7 @@ def test_cli_boundary_with_fake_node_bridge():
             "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
             "import hashlib, json\n"
             f"text = {ANALYSIS!r}\n"
-            "print(json.dumps({'status':'succeeded','runId':'cli','format':'markdown','verification':'live-dom+snapshot','conversationUrl':'https://chatgpt.test/c/1','text':text,'outputSha256':hashlib.sha256(text.encode()).hexdigest()}))\n",
+            "print(json.dumps({'status':'succeeded','runId':'cli','format':'markdown','verification':'live-dom+snapshot','conversationUrl':'https://chatgpt.test/c/1','actualConversationUrl':'https://chatgpt.test/c/1','submissionConfirmed':True,'text':text,'outputSha256':hashlib.sha256(text.encode()).hexdigest()}))\n",
             encoding="utf-8",
         )
         fake_node.chmod(0o755)

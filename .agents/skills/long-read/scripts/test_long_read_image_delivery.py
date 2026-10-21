@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Durable image delivery tests use fake Bridge and Feishu endpoints only."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import run_chatgpt_core_image as core_image
+from feishu_long_read_delivery import DeliveryError, UnknownRemoteResult
+from long_read_image_delivery import deliver_image
+from long_read_workflow_store import WorkflowStore
+
+
+PNG = b"\x89PNG\r\n\x1a\nread-x-test-image"
+
+
+class FakeImageRunner:
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, source_path, output_path, *, summary_path, conversation_url,
+            prompt_fetcher, request_id):
+        self.calls += 1
+        source = source_path.read_text(encoding="utf-8")
+        asset = prompt_fetcher(core_image.PROMPT_GOVERNANCE_ID)
+        prompt = core_image.build_prompt(source, asset["content"])
+        summary = {
+            "status": "succeeded", "runId": request_id,
+            "caller_label": core_image.CALLER_LABEL,
+            "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+            "conversation_url_requested": conversation_url,
+            "prompt_id": asset["prompt_id"], "prompt_sha256": asset["prompt_sha256"],
+            "input_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "submissionConfirmed": True, "verification": "live-dom+snapshot",
+            "image_sha256": hashlib.sha256(PNG).hexdigest(), "image_bytes": len(PNG),
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(PNG)
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        return {**summary, "output": str(output_path)}
+
+    @staticmethod
+    def _reuse_image(output, summary, source_sha, request_id, conversation_url):
+        if (output.read_bytes() != PNG or summary.get("runId") != request_id
+                or summary.get("source_sha256") != source_sha
+                or summary.get("conversation_url_requested") != conversation_url
+                or summary.get("status") != "succeeded"
+                or summary.get("submissionConfirmed") is not True
+                or summary.get("verification") != "live-dom+snapshot"):
+            raise ValueError("image receipt mismatch")
+        return summary
+
+
+class FakeFeishu:
+    def __init__(self, *, lose_create=False, lose_send=False, unreadable_create=False):
+        self.blocks = [
+            {"block_id": "title", "block_type": 3, "parent_id": "doc_1"},
+            {"block_id": "source", "block_type": 3, "parent_id": "doc_1"},
+        ]
+        self.lose_create = lose_create
+        self.lose_send = lose_send
+        self.unreadable_create = unreadable_create
+        self.created_blocks = 0
+        self.message_sends = 0
+        self.messages = {}
+        self.uploads = 0
+        self.patches = 0
+
+    def list_document_blocks(self, document_id):
+        if self.unreadable_create and self.created_blocks:
+            raise DeliveryError("incomplete block readback")
+        return list(self.blocks)
+
+    def get_document_block(self, document_id, block_id):
+        item = next((row for row in self.blocks if row["block_id"] == block_id), None)
+        if item is None:
+            raise DeliveryError("missing block")
+        return dict(item)
+
+    def create_image_block(self, *, document_id, parent_block_id, index, client_token):
+        self.created_blocks += 1
+        block_id = f"img_block_{self.created_blocks}"
+        self.blocks.insert(index, {"block_id": block_id, "block_type": 27,
+                                   "parent_id": parent_block_id, "image": {}})
+        if self.lose_create:
+            self.lose_create = False
+            raise UnknownRemoteResult("create response lost")
+        return block_id
+
+    def upload_document_image(self, *, document_id, image_block_id, png_path):
+        self.uploads += 1
+        return "media_image_1"
+
+    def patch_image_block(self, *, document_id, block_id, file_token, client_token):
+        self.patches += 1
+        item = next(row for row in self.blocks if row["block_id"] == block_id)
+        item["image"] = {"token": file_token}
+
+    def verify_document_image(self, *, document_id, block_id, parent_block_id, file_token):
+        item = self.get_document_block(document_id, block_id)
+        if item.get("parent_id") != parent_block_id or item.get("image", {}).get("token") != file_token:
+            raise UnknownRemoteResult("image block readback mismatch")
+        return item
+
+    def verify_new_image_child(self, *, before_child_ids, after_child_ids, index,
+                               blocks_by_id, parent_block_id):
+        added = [block_id for block_id in after_child_ids if block_id not in before_child_ids]
+        if len(added) != 1 or after_child_ids[index] != added[0]:
+            raise UnknownRemoteResult("image block create result ambiguous")
+        item = blocks_by_id[added[0]]
+        if item.get("parent_id") != parent_block_id or item.get("block_type") != 27:
+            raise UnknownRemoteResult("new image block readback mismatch")
+        return added[0]
+
+    def upload_message_image(self, *, png_path):
+        return "img_message_1"
+
+    def send_image_message(self, *, image_key, idempotency_key, chat_id=None, user_id=None):
+        self.message_sends += 1
+        message_id = f"om_image_{self.message_sends}"
+        actual_chat = chat_id or "oc_private"
+        self.messages[message_id] = {
+            "message_id": message_id, "msg_type": "image", "chat_id": actual_chat,
+            "sender": {"id": "app_bot", "id_type": "app_id"},
+            "body": {"content": json.dumps({"image_key": image_key})},
+        }
+        if self.lose_send:
+            self.lose_send = False
+            raise UnknownRemoteResult("send response lost")
+        return message_id
+
+    def get_message(self, message_id):
+        return self.messages[message_id]
+
+    def list_chat_messages(self, *, chat_id, start_time, end_time):
+        return [item for item in self.messages.values() if item["chat_id"] == chat_id]
+
+
+class ImageWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.state = Path(self.temporary.name) / "state"
+        self.root = self.state / "jobs" / "00000000-0000-4000-8000-000000000001"
+        self.root.mkdir(parents=True)
+        (self.root / "analysis").mkdir()
+        (self.root / "document").mkdir()
+        self.source = self.root / "document" / "main-doc.md"
+        self.source.write_text("# Article\n\nEvidence and argument.\n", encoding="utf-8")
+        self.payload = {"trigger": {
+            "feishuProfile": "read-x", "appId": "app_bot", "identity": "bot",
+            "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_user",
+            "senderType": "user",
+        }}
+        self.clock_value = [1000.0]
+        self.store = WorkflowStore(self.state, clock=lambda: self.clock_value[0])
+        specs = [
+            {"key": "core-image", "kind": "image"},
+            {"key": "core-image-insert", "kind": "image_insert"},
+            {"key": "core-image-send", "kind": "message"},
+        ]
+        job = self.store.submit(self.payload, app_id="app_bot", artifacts=specs)
+        self.job_id = job["job_id"]
+        self.lease = self.store.acquire_lease(self.job_id, "test-worker", 3600)
+        self.image_runner = FakeImageRunner()
+        self.client = FakeFeishu()
+        prompt = "Generate a concise evidence-grounded image."
+        self.prompt_asset = {
+            "prompt_id": core_image.PROMPT_GOVERNANCE_ID,
+            "content": prompt,
+            "prompt_source": "https://example.invalid/prompt",
+            "prompt_revision": 7,
+            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "prompt_fetched_at": "2026-10-21T00:00:00Z",
+        }
+
+    def tearDown(self):
+        self.store.close()
+        self.temporary.cleanup()
+
+    def deliver(self):
+        return deliver_image(
+            store=self.store, lease=self.lease, payload=self.payload, root=self.root,
+            image_key="core-image", image_name="core-image", source_path=self.source,
+            document_id="doc_1", image_index=1, image_runner=self.image_runner,
+            client=self.client, prompt_fetcher=lambda _prompt_id: self.prompt_asset,
+            clock=lambda: self.clock_value[0],
+        )
+
+    def test_normal_delivery_confirms_all_three_remote_stages_and_reuses_them(self):
+        first = self.deliver()
+        second = self.deliver()
+        self.assertEqual(first["status"], "confirmed")
+        self.assertEqual(second["status"], "confirmed")
+        self.assertEqual(self.image_runner.calls, 1)
+        self.assertEqual(self.client.created_blocks, 1)
+        self.assertEqual(self.client.uploads, 1)
+        self.assertEqual(self.client.patches, 1)
+        self.assertEqual(self.client.message_sends, 1)
+        by_key = {item["artifact_key"]: item for item in self.store.artifacts(self.job_id)}
+        self.assertTrue(all(by_key[key]["status"] == "confirmed" for key in (
+            "core-image", "core-image-insert", "core-image-send")))
+
+    def test_lost_create_response_is_resolved_by_exact_document_diff_without_duplicate(self):
+        self.client.lose_create = True
+        result = self.deliver()
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(self.client.created_blocks, 1)
+        self.assertEqual(len([item for item in self.client.blocks if item["block_type"] == 27]), 1)
+
+    def test_lost_send_response_is_resolved_from_exact_history_without_duplicate(self):
+        self.client.lose_send = True
+        result = self.deliver()
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(self.client.message_sends, 1)
+        self.assertEqual(len(self.client.messages), 1)
+
+    def test_unconfirmed_insert_stops_before_private_send(self):
+        self.client.unreadable_create = True
+        self.client.lose_create = True
+        result = self.deliver()
+        self.assertEqual(result["status"], "uncertain")
+        self.assertEqual(self.client.message_sends, 0)
+        effect = self.store.latest_effect_for_action(self.job_id, "core-image-insert", "image-block-create")
+        self.assertEqual(effect["status"], "uncertain")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

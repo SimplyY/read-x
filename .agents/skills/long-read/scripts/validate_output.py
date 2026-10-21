@@ -164,6 +164,8 @@ def check_document_xml(xml_text):
         findings.append(
             f"document must contain exactly one light-yellow callout; "
             f"found {len(gold_callouts)}")
+    elif not visible_text(gold_callouts[0]).startswith("文章最重要的一刀："):
+        findings.append("light-yellow callout must contain the article's core conclusion")
 
     quote_blocks = list(root.iter("blockquote"))
     if len(quote_blocks) > MAX_QUOTES:
@@ -333,7 +335,7 @@ def self_check():
     good_doc = (
         '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
         '<table><tbody><tr><td>x</td></tr></tbody></table>'
-        '<callout background-color="light-yellow"><p>sharp</p></callout>'
+        '<callout background-color="light-yellow"><p><b>文章最重要的一刀：</b>核心判断。</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1>'
         '<h1>值得研究的相关问题</h1><h2>问题</h2>'
         '<ol><li>因果链在哪里断裂？</li><li>这个机制何时失效？</li></ol>'
@@ -350,6 +352,12 @@ def self_check():
     f = check_document_xml(legacy_color_doc)
     cases.append(("pass: equivalent light-yellow RGB callout", f == [], f))
 
+    generic_callout_doc = good_doc.replace(
+        '<p><b>文章最重要的一刀：</b>核心判断。</p>', '<p>ChatGPT 来源提示。</p>')
+    f = check_document_xml(generic_callout_doc)
+    cases.append(("fail: provenance text cannot stand in for core conclusion",
+                  any("core conclusion" in item for item in f), f))
+
     three_item_doc = good_doc.replace(
         '</ol><h2>上下文</h2>',
         '<li>什么证据能推翻这个机制？</li></ol><h2>上下文</h2>')
@@ -357,7 +365,7 @@ def self_check():
     cases.append(("pass: three research questions", f == [], f))
 
     exact_300_doc = (
-        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1><callout background-color="light-yellow"><p>one</p></callout>'
+        '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1><callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 291) + '</li></ul>'
         '<h1>与作者对话</h1>')
@@ -367,7 +375,7 @@ def self_check():
     # document layout failures
     bad_doc = (
         '<title>t</title><h1>错误首章</h1>'
-        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<callout background-color="light-yellow"><p>two</p></callout>'
         '<h1>文章骨架</h1><h2>X 光阅读</h2><p>' + ('长' * 101) + '</p>'
         '<h1>基石 / 边缘 / 暗流</h1>'
@@ -399,7 +407,7 @@ def self_check():
 
     too_long_research = (
         '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
-        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>这个问题足够长吗？</li><li>另一个问题是什么？</li></ol><h2>上下文</h2><ul><li>' + ('长' * 280) + '</li><li>补充。</li></ul>'
         '<h1>与作者对话</h1>')
@@ -408,7 +416,7 @@ def self_check():
 
     wrong_order = (
         '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
-        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
@@ -417,7 +425,7 @@ def self_check():
 
     missing_research = (
         '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
-        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>与作者对话</h1>')
     f = check_document_xml(missing_research)
     cases.append(("fail: missing research questions", len(f) == 1, f))
@@ -436,7 +444,7 @@ def self_check():
 
     too_many_doc_quotes = (
         '<title>t</title><p>溯源：<a href="https://example.com/x">查看原文</a></p><h1>评分</h1>'
-        '<callout background-color="light-yellow"><p>one</p></callout>'
+        '<callout background-color="light-yellow"><p>文章最重要的一刀：核心判断。</p></callout>'
         '<h1>基石 / 边缘 / 暗流</h1><h1>值得研究的相关问题</h1><h2>问题</h2><ol>'
         '<li>为什么？</li><li>何时失效？</li></ol><h2>上下文</h2><ul><li>背景。</li><li>边界。</li></ul>'
         '<h1>与作者对话</h1>'

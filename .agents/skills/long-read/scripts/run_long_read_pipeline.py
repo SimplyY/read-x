@@ -8,7 +8,7 @@
 
 阈值与触发条件只来自 content_scoring 的 scoring_result；本脚本不复制阈值、不重算路由。
 article-decode 失败不阻断 ChatGPT，也不丢弃已成功的 ljg 输出；汇总逐分支记录状态与错误，
-交付状态只能是：精读完成 / 主精读完成，ChatGPT 待复核 / 主文档降级交付。
+本脚本只完成内容生成，不能确认飞书文档、图片插入或私聊发送。成功时仅返回“内容生成完成，等待交付核验”，不得报告精读最终成功。
 """
 from __future__ import annotations
 
@@ -28,13 +28,13 @@ import run_chatgpt_munger as munger
 
 SCHEMA_VERSION = "1"
 
-STATE_COMPLETE = "complete"
+STATE_CONTENT_READY = "content_ready"
 STATE_CHATGPT_NEEDS_REVIEW = "needs_review_chatgpt"
 STATE_DEGRADED = "degraded"
 LABELS = {
-    STATE_COMPLETE: "精读完成",
-    STATE_CHATGPT_NEEDS_REVIEW: "主精读完成，ChatGPT 待复核",
-    STATE_DEGRADED: "主文档降级交付",
+    STATE_CONTENT_READY: "内容生成完成，等待文档与图片交付核验",
+    STATE_CHATGPT_NEEDS_REVIEW: "内容生成待复核：芒格分支结果未确认",
+    STATE_DEGRADED: "分析内容未齐，等待交付评估",
 }
 
 
@@ -83,7 +83,7 @@ def _run_chatgpt(args, results: dict) -> None:
 
 
 def delivery_state(analyses: dict, chatgpt: dict) -> dict:
-    """Deterministic delivery state; ChatGPT 成功前整轮不得标记为“精读完成”。"""
+    """Content-stage state only; remote delivery is outside this pipeline."""
     failed_tasks = [item.get("task") for item in analyses.get("tasks", []) if item.get("status") != "completed"]
     missing_branches = list(failed_tasks)
     if analyses.get("status") == "failed" and not analyses.get("tasks"):
@@ -94,9 +94,9 @@ def delivery_state(analyses: dict, chatgpt: dict) -> dict:
         chatgpt_state = "not_required" if chatgpt.get("status") == "not_required" else "needs_review"
     if chatgpt_state == "needs_review":
         missing_branches.append("chatgpt-munger")
-    analyses_completed = analyses.get("status") == "completed"
+    analyses_completed = analyses.get("status") == "completed" and not missing_branches
     if analyses_completed and chatgpt_state in {"succeeded", "not_required"}:
-        state = STATE_COMPLETE
+        state = STATE_CONTENT_READY
     elif chatgpt_state == "needs_review":
         state = STATE_CHATGPT_NEEDS_REVIEW
     else:
@@ -104,6 +104,7 @@ def delivery_state(analyses: dict, chatgpt: dict) -> dict:
     return {
         "state": state,
         "label": LABELS[state],
+        "delivery_complete": False,
         "missing_branches": missing_branches,
         "chatgpt_state": chatgpt_state,
     }
@@ -142,8 +143,8 @@ def run(args: argparse.Namespace) -> dict:
 
 
 def exit_code(summary: dict) -> int:
-    """0 精读完成；1 降级/待复核但主文档仍可交付；2 分析分支未运行（输入失败）。"""
-    if summary["delivery"]["state"] == STATE_COMPLETE:
+    """0 content stage ready; 1 incomplete content; 2 analysis preflight failed."""
+    if summary["delivery"]["state"] == STATE_CONTENT_READY:
         return 0
     analyses = summary["branches"]["analyses"]
     if analyses.get("status") == "failed" and not analyses.get("tasks"):

@@ -35,6 +35,10 @@ print('ok')
 | A | B |
 | --- | --- |
 | 1 | 2 |
+
+:::readx-core-conclusion
+文章真正不可替代的判断。
+:::
 """
     xml = renderer.render_markdown(markdown, title="标题", source_url="https://source.test", conversation_url="https://chatgpt.com/c/1")
     ET.fromstring(f"<root>{xml}</root>")
@@ -48,6 +52,10 @@ print('ok')
 def test_research_questions_section_survives_render_and_validation():
     markdown = """## 评分
 评分表。
+
+:::readx-core-conclusion
+核心结论。
+:::
 
 ## 基石 / 边缘 / 暗流
 文章的核心结构。
@@ -109,10 +117,18 @@ def test_unsafe_html_is_escaped_and_large_tables_are_preserved():
     assert "表格超出原生表格限制" in xml and '<pre lang="markdown"><code>' in xml
 
 
-def test_chatgpt_bridge_output_gets_provenance_callout_without_session_url():
+def test_provenance_stays_in_links_and_does_not_consume_unique_core_callout():
     xml = renderer.render_markdown("正文。", title="标题", source_url="https://example.com/article", conversation_url="")
-    assert 'emoji="⭐"' in xml
-    assert "ChatGPT 基于完整原文生成" in xml
+    assert '<p>溯源：<a href="https://example.com/article">查看原文</a></p>' in xml
+    assert 'background-color="light-yellow"' not in xml
+
+
+def test_renderer_keeps_generated_core_callout_and_adds_no_duplicate():
+    markdown = ":::readx-core-conclusion\n核心判断。\n:::"
+    xml = renderer.render_markdown(markdown, title="标题", source_url="", conversation_url="https://chatgpt.com/c/1")
+    assert xml.count('background-color="light-yellow"') == 1
+    assert "文章最重要的一刀" in xml
+    assert "核心判断" in xml
 
 
 def test_metadata_rejects_unsafe_urls():

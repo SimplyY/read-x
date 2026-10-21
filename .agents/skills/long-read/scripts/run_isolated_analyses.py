@@ -15,7 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
-from chatgpt_bridge import run_bridge, verified_text
+from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, run_bridge, verified_text
+from long_read_prompt_contract import assert_no_hard_total_length, load_concision_prompt
 from validate_output import check_quotes_substring, check_structure
 
 
@@ -32,6 +33,8 @@ ARTICLE_RUNTIME_OVERRIDE = """
 # long-read 独立会话证据覆盖
 
 当前是无前序对话的独立文本请求。直接输出最终 Markdown 解码原稿。标题后必须先写：“> 证据边界：除原文明确陈述和逐字引用外，以下结构、动机、盲点与外推均为我的判断。”不得把推断写成作者自述或已证事实。
+
+为便于程序完整装配，请将 Skill 中明确要求的分析部分分别使用以下精确一级 Markdown 标题：`# 这篇文章真正的核心`、`# 基石 / 边缘 / 暗流`、`# 作者心中的结构`。如确有独立增量，再使用 `# 作者为什么要写这篇文章`、`# 与作者对话`、`# 最值得深读的论证`、`# 引导追问`；可选部分没有增量时省略。标题只提供确定性边界，正文仍按 Skill 自由分析；不得删减观点、论证或证据来适配标题。
 """.strip()
 TEXT_RUNTIME_OVERRIDE = """
 
@@ -42,31 +45,22 @@ TEXT_RUNTIME_OVERRIDE = """
 - 跳过 date、curl、读取引用文件、语音通知、等待用户指令、写入本地文件和报告文件路径；
 - 不输出待执行命令、Org 文件头、文件路径或执行过程；
 - 直接针对本次 question 完成一份自洽的最终 Markdown 分析，供 long-read 附录使用；
-- 严格保留 Skill 独有的分析形式，不得降格为普通分析；按下方本次交付要求控制篇幅；
+- 严格保留 Skill 独有的分析形式，不得降格为普通分析；按单分支精简规范减少冗余并保留必要论证；
 - 证据不足时宁可更短，不得补写原文没有的事实。
 """.strip()
 TEXT_TASK_REQUIREMENTS = {
-    "ljg-think": "保留逐层命名、纵向下钻和终点反转；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
-    "ljg-learn": "保留历史、辩证、现象、语言、形式、存在、美感、元反思八刀与最终压缩；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
-    "ljg-roundtable": "标题明确写模拟圆桌；在一次响应中完成 3~5 位真实人物的一轮交锋、主持综述和开放问题；发言只按其广为人知的思想体系拟写，不冒充真实引语，输入无证据的 MBTI 写未知；不等待用户指令；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
-    "ljg-qa": "保留有方向的 Q 链；每个 A 包含结论、形式化、论证步和边界；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
-    "ljg-writes": "保留层层推进的批判性短文，不改成要点报告；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
-    "ljg-word": "保留标题、原始画面、核心意象、解释和一语道破；原文与 Evidence 未提供词源证据时不得断言具体古语言或词根；结尾写‘一语道破（本次提炼）’，不得使用引用块或伪装成他人名言；输出 500～1500 字原稿，按上限提高信息密度，禁止摘要或压缩语义。",
+    "ljg-think": "保留逐层命名、纵向下钻和终点反转；禁止把必要推导改成摘要。",
+    "ljg-learn": "保留历史、辩证、现象、语言、形式、存在、美感、元反思八刀与最终压缩；禁止删去独特洞察。",
+    "ljg-roundtable": "标题明确写模拟圆桌；在一次响应中完成 3~5 位真实人物的一轮交锋、主持综述和开放问题；发言只按其广为人知的思想体系拟写，不冒充真实引语，输入无证据的 MBTI 写未知；不等待用户指令。",
+    "ljg-qa": "保留有方向的 Q 链；每个 A 包含结论、形式化、论证步和边界。",
+    "ljg-writes": "保留层层推进的批判性短文，不改成要点报告。",
+    "ljg-word": "保留标题、原始画面、核心意象、解释和一语道破；原文与 Evidence 未提供词源证据时不得断言具体古语言或词根；结尾写‘一语道破（本次提炼）’，不得使用引用块或伪装成他人名言。",
 }
 OUTPUT_MARKERS = {
     "ljg-learn": ("历史", "辩证", "现象", "语言", "形式", "存在", "美感", "元反思"),
     "ljg-roundtable": ("模拟圆桌", "【", "主持"),
     "ljg-qa": ("形式化", "边界"),
     "ljg-word": ("原始画面", "核心意象", "本次提炼"),
-}
-MIN_OUTPUT_CHARS = {
-    "article-decode": 300,
-    "ljg-learn": 500,
-    "ljg-qa": 500,
-    "ljg-roundtable": 500,
-    "ljg-think": 500,
-    "ljg-word": 250,
-    "ljg-writes": 500,
 }
 TOOL_PATTERNS = {
     "shell_command": re.compile(r"(?m)^```(?:bash|sh)\b|\bdate \+%Y|\bcurl -"),
@@ -86,7 +80,6 @@ class AnalysisTask:
     skill_sha256: str
     question: str | None
     output_path: Path
-    min_output_chars: int
     required_markers: tuple[str, ...]
 
 
@@ -160,17 +153,22 @@ def validate_evidence(evidence: str, source: str) -> str:
 
 
 def build_task_prompt(task: AnalysisTask, source: str, evidence: str) -> str:
+    instructions = task.skill_text
+    try:
+        assert_no_hard_total_length(instructions, context=f"{task.name} prompt")
+        concision = load_concision_prompt()
+    except ValueError as exc:
+        raise OutputValidationError(str(exc)) from exc
     task_input = build_input(source, evidence, task.question)
-    prompt = f"{task.skill_text}\n\n{task_input}{BRIDGE_BOUNDARY}\n"
+    prompt = f"{instructions}\n\n{concision}\n\n{task_input}{BRIDGE_BOUNDARY}\n"
     if len(prompt) > MAX_PROMPT_CHARS:
         raise OutputValidationError(f"{task.name} prompt too large: {len(prompt)} > {MAX_PROMPT_CHARS}")
     return prompt
 
 
 def validate_task_text(task: AnalysisTask, text: str) -> str:
-    visible_chars = len(re.sub(r"\s+", "", text))
-    if visible_chars < task.min_output_chars:
-        raise OutputValidationError(f"{task.name} output is too short: {visible_chars} < {task.min_output_chars}")
+    if not isinstance(text, str) or not text.strip():
+        raise OutputValidationError(f"{task.name} output is empty")
     missing = [marker for marker in task.required_markers if marker not in text]
     if missing:
         raise OutputValidationError(f"{task.name} output misses required form markers: {missing}")
@@ -213,24 +211,33 @@ def record_attempt(result: dict) -> dict:
     return {key: result.get(key) for key in ("status", "reason", "retryAfterSeconds")}
 
 
-def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: float) -> dict:
+def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: float, request_id: str | None = None) -> dict:
     """One bridge conversation per task; uncertain submissions are never auto-resent."""
     started = time.perf_counter()
     digests = {
         "skill_sha256": task.skill_sha256,
         "instructions_sha256": hashlib.sha256(task.skill_text.encode()).hexdigest(),
+        "request_id": request_id,
     }
     attempts: list[dict] = []
     try:
         prompt = build_task_prompt(task, source, evidence)
         digests["input_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
-        result = run_bridge(prompt, max_wait_seconds=max_wait_seconds)
+        digests["prompt_sha256"] = digests["input_sha256"]
+        bridge_args = {
+            "max_wait_seconds": max_wait_seconds,
+            "caller_label": "read-x:long-read-text",
+            "conversation_url": WORKFLOW_NEW_CHAT_URL,
+        }
+        if request_id is not None:
+            bridge_args["request_id"] = request_id
+        result = run_bridge(prompt, **bridge_args)
         attempts.append(record_attempt(result))
-        cooldown = cooldown_wait_seconds(result)
+        cooldown = cooldown_wait_seconds(result) if request_id is None else None
         if cooldown is not None:
             # 提交前冷却：还没有任何内容被提交，按 Bridge 给出的等待时间安全恢复一次。
             time.sleep(cooldown)
-            result = run_bridge(prompt, max_wait_seconds=max_wait_seconds)
+            result = run_bridge(prompt, **bridge_args)
             attempts.append(record_attempt(result))
         output = validate_task_text(task, verified_text(result))
         atomic_write(task.output_path, output)
@@ -265,6 +272,7 @@ def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: f
         **digests,
         "runId": result.get("runId"),
         "run_id": result.get("runId"),
+        "request_id": request_id or result.get("runId"),
         "conversationUrl": result.get("conversationUrl"),
         "conversation_url": result.get("conversationUrl"),
         "verification": result.get("verification"),
@@ -287,25 +295,31 @@ def prepare_tasks(
     article_text = read_input(article_skill_path, "article-decode SKILL.md")
     if skill_name(article_text) != "article-decode":
         raise ValueError("article-decode skill name mismatch")
+    article_instructions = article_text.replace("输出 500～1500 字，", "")
     tasks = [AnalysisTask(
         "article-decode",
-        article_text + "\n\n" + ARTICLE_RUNTIME_OVERRIDE + "\n",
+        article_instructions + "\n\n" + ARTICLE_RUNTIME_OVERRIDE + "\n",
         hashlib.sha256(article_text.encode()).hexdigest(),
         None,
         output_dir / "article-decode.md",
-        MIN_OUTPUT_CHARS["article-decode"],
-        ("证据边界", "我的判断"),
+        ("证据边界", "我的判断", "# 这篇文章真正的核心",
+         "# 基石 / 边缘 / 暗流", "# 作者心中的结构"),
     )]
     for index, (name, question_path) in enumerate(task_specs, 1):
         question = read_input(question_path, f"{name} question").strip()
         text, digest = resolve_skill(name, skill_roots)
+        if name == "ljg-writes":
+            text = text.replace(
+                "总量：600-1000 字。少于 600 -> 没挖够；多于 1000 -> 没砍够。",
+                "篇幅由信息价值和论证复杂度决定，保留必要推理并删除低价值冗余。",
+            )
+            text = text.replace("600-1000 字。", "")
         tasks.append(AnalysisTask(
             name,
             text + "\n\n" + TEXT_RUNTIME_OVERRIDE + "\n\n本次交付要求：" + TEXT_TASK_REQUIREMENTS[name] + "\n",
             digest,
             question,
             output_dir / f"{index:02d}-{name}.md",
-            MIN_OUTPUT_CHARS[name],
             OUTPUT_MARKERS.get(name, ()),
         ))
     existing = [str(task.output_path) for task in tasks if task.output_path.exists()]
@@ -323,6 +337,7 @@ def run(
     timeout: float = 360,
     article_skill_path: Path = ARTICLE_SKILL,
     skill_roots: list[Path] | None = None,
+    request_ids: dict[str, str] | None = None,
 ) -> dict:
     if not 1 <= max_workers <= MAX_TASKS:
         raise ValueError(f"max_workers must be between 1 and {MAX_TASKS}")
@@ -332,11 +347,15 @@ def run(
     evidence = validate_evidence(read_input(evidence_path, "evidence"), source)
     output_dir.mkdir(parents=True, exist_ok=True)
     tasks = prepare_tasks(task_specs, output_dir, article_skill_path, skill_roots)
+    if request_ids is not None:
+        task_names = {task.name for task in tasks}
+        if set(request_ids) != task_names or len(set(request_ids.values())) != len(request_ids):
+            raise ValueError("request_ids must provide one unique preallocated id for every task")
     started = time.perf_counter()
     by_name = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
         futures = {
-            pool.submit(run_task, task, source, evidence, timeout): task.name
+            pool.submit(run_task, task, source, evidence, timeout, request_ids.get(task.name) if request_ids else None): task.name
             for task in tasks
         }
         for future in as_completed(futures):

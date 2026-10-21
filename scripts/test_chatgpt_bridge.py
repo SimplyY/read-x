@@ -78,6 +78,60 @@ def test_command_streams_prompt_and_disables_only_success_cooldown():
     assert "image: true" in image_command
 
 
+def test_observe_command_uses_original_identity_and_never_submits_a_prompt():
+    command = bridge.observe_bridge_command(
+        Path("/tmp/bridge.mjs"),
+        original_run_id="12345678-1234-5678-1234-567812345678",
+        conversation_url="https://chatgpt.com/c/1",
+        caller_label="read-x:long-read-image",
+        max_wait_seconds=420,
+    )[-1]
+    assert "import { observeBridge }" in command
+    assert 'originalRunId: "12345678-1234-5678-1234-567812345678"' in command
+    assert 'callerLabel: "read-x:long-read-image"' in command
+    assert "maxWaitSeconds: 420" in command
+    assert "runBridge" not in command
+    entrypoint_command = bridge.observe_bridge_command(
+        Path("/tmp/bridge.mjs"),
+        original_run_id="12345678-1234-5678-1234-567812345678",
+        conversation_url="https://chatgpt.com/",
+        caller_label="read-x:long-read-text",
+    )[-1]
+    assert "observeBridge" in entrypoint_command
+    try:
+        bridge.observe_bridge_command(
+            Path("/tmp/bridge.mjs"),
+            original_run_id="12345678-1234-5678-1234-567812345678",
+            conversation_url="https://example.com/",
+            caller_label="read-x:long-read-text",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("untrusted observer URL must fail closed")
+
+
+def test_observe_adapter_returns_only_matching_original_run():
+    original = bridge.subprocess.run
+    run_id = "12345678-1234-5678-1234-567812345678"
+
+    def fake(command, **kwargs):
+        assert "observeBridge" in command[-1]
+        return bridge.subprocess.CompletedProcess(command, 0, json.dumps({"status": "needs_review", "runId": run_id, "reason": "original-run-result-pending"}), "")
+
+    bridge.subprocess.run = fake
+    try:
+        result = bridge.observe_bridge(
+            original_run_id=run_id,
+            conversation_url="https://chatgpt.com/c/1",
+            caller_label="read-x:long-read-text",
+            bridge=Path("/tmp/bridge.mjs"),
+        )
+    finally:
+        bridge.subprocess.run = original
+    assert result["runId"] == run_id and result["status"] == "needs_review"
+
+
 def test_verified_image_requires_current_contract():
     assert bridge.verified_image(image_result()) == b"\x89PNG-fake"
     for bad in (image_result(verification="historyVerified"),
@@ -151,6 +205,28 @@ def test_busy_rejection_honors_wait_budget():
         bridge._run_bridge_once = original_once
     assert result["reason"] == "bridge-busy"
     assert len(attempts) == 1
+    assert "busyRetries" not in result
+
+
+def test_preallocated_request_id_is_single_submission_even_when_bridge_is_busy():
+    attempts = []
+    original_once = bridge._run_bridge_once
+
+    def fake_once(prompt, *, bridge, max_wait_seconds, image, conversation_url=None, caller_label=None, request_id=None):
+        attempts.append(request_id)
+        return {"status": "needs_review", "reason": "bridge-busy", "retryAfterSeconds": 30}
+
+    bridge._run_bridge_once = fake_once
+    try:
+        result = bridge.run_bridge(
+            "prompt",
+            bridge=Path("/tmp/bridge.mjs"),
+            request_id="12345678-1234-5678-1234-567812345678",
+        )
+    finally:
+        bridge._run_bridge_once = original_once
+    assert result["reason"] == "bridge-busy"
+    assert attempts == ["12345678-1234-5678-1234-567812345678"]
     assert "busyRetries" not in result
 
 
