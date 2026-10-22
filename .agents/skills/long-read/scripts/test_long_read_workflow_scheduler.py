@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from long_read_workflow_scheduler import due_report_runs, run_due_reports
@@ -40,6 +41,24 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(all(item["reused"] for item in second["reports"]))
         self.assertEqual(first["reports"][-2]["period"], "monthly")
         self.assertEqual(first["reports"][-1]["period"], "weekly")
+
+    def test_unresolved_monthly_delivery_blocks_same_day_weekly_send(self):
+        now = datetime(2026, 11, 1, 10, tzinfo=TZ)
+        calls = []
+
+        def blocked_delivery(*, report_key, **kwargs):
+            calls.append(report_key)
+            return {"status": "needs_review", "report_key": report_key}
+
+        with patch("long_read_workflow_scheduler.deliver_report", side_effect=blocked_delivery):
+            result = run_due_reports(
+                self.state, now=now,
+                delivery_target={"identity": "bot", "profile": "read-x", "user_id": "ou_self",
+                                 "chat_id": "oc_self", "sender_id": "app_bot"},
+            )
+        self.assertEqual(result["reports"][-1]["period"], "monthly")
+        self.assertNotIn("weekly", [item["period"] for item in result["reports"][-1:]])
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,23 @@ def test_failure_card_never_uses_success_title():
                              failure_reason="image-send-failed", delivery_receipt=receipt)
     content = json.dumps(value, ensure_ascii=False)
     assert "main" in content and "长文精读完成" not in content and "自动交付已结束" in content
+    assert "失败详情：image-send-failed" in content
+    assert "芒格分析：image-send-failed" not in content
+
+
+def test_failure_without_a_document_has_no_fake_feishu_home_link():
+    receipt = {
+        "schema": card.DELIVERY_RECEIPT_SCHEMA,
+        "status": "failed", "main_url": None, "munger_embedded": False,
+        "artifacts": {}, "unresolved_actions": [],
+    }
+    value = card.render_card(title="标题", main_url=None,
+                             failure_reason="main-document-unavailable",
+                             delivery_receipt=receipt)
+    content = json.dumps(value, ensure_ascii=False)
+    assert "尚未创建或无法确认" in content
+    assert "打开主文档" not in content
+    assert "https://feishu.cn" not in content
 
 
 def test_missing_receipt_is_processing_not_success():
@@ -61,7 +78,7 @@ def test_image_note_is_appended_without_affecting_munger_state():
     value = card.render_card(title="标题", main_url="https://feishu.cn/docx/main", munger_embedded=True,
                              image_note="待插入", delivery_receipt=successful_receipt())
     content = json.dumps(value, ensure_ascii=False)
-    assert "核心内容图：待插入" in content
+    assert "待插入" in content
     assert "主精读文档（含芒格洞察）" in content
 
 

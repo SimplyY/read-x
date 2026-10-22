@@ -45,6 +45,104 @@ class StoreTests(unittest.TestCase):
     def effect(self, lease, action="insert"):
         return self.store.prepare_effect(lease, "core", action, DIGEST)
 
+    def test_reliability_events_are_append_only_supported_and_field_validated(self):
+        job = self.submit(source_message_id="om_repair")
+        repaired = self.store.record_reliability_event(job["job_id"], "repair_applied", {
+            "repair_id": "fix-42", "failure_fingerprint": "bridge:response-unstable",
+            "summary": "保留原 Bridge 会话以便只读恢复", "change_ref": "abc1234",
+        })
+        repaired_again = self.store.record_reliability_event(job["job_id"], "repair_applied", {
+            "repair_id": "fix-42", "failure_fingerprint": "bridge:response-unstable",
+            "summary": "保留原 Bridge 会话以便只读恢复", "change_ref": "abc1234",
+        })
+        comparison = self.store.record_reliability_event(job["job_id"], "repair_comparison", {
+            "repair_id": "fix-42", "metric": "final_failure_rate",
+            "before_value": 0.2, "after_value": 0.05,
+            "before_sample_size": 20, "after_sample_size": 20,
+            "before_window": "2026-09", "after_window": "2026-10",
+        })
+        self.assertEqual(repaired["status"], "recorded")
+        self.assertTrue(repaired_again["reused"])
+        self.assertEqual(repaired_again["seq"], repaired["seq"])
+        self.assertGreater(comparison["seq"], repaired["seq"])
+        with self.assertRaises(ValueError):
+            self.store.record_reliability_event(job["job_id"], "repair_applied", {
+                "repair_id": "fix-42", "failure_fingerprint": "bridge:unstable",
+                "summary": "no raw data", "change_ref": "abc1234", "article_text": "private",
+            })
+        with self.assertRaises(ValueError):
+            self.store.record_reliability_event(job["job_id"], "repair_comparison", {
+                "repair_id": "fix-42", "metric": "final_failure_rate",
+                "before_value": 1.2, "after_value": 0.1,
+                "before_sample_size": 20, "after_sample_size": 20,
+                "before_window": "2026-09", "after_window": "2026-10",
+            })
+        with self.assertRaises(StoreConflict):
+            self.store.record_reliability_event("missing-job", "manual_intervention", {
+                "category": "reconciliation", "summary": "核验"})
+
+    def test_repair_comparison_requires_real_ordered_windows_and_nonzero_samples(self):
+        job = self.submit(source_message_id="om_repair_windows")
+        base = {
+            "repair_id": "fix-42", "metric": "final_failure_rate",
+            "before_value": 0.2, "after_value": 0.05,
+            "before_sample_size": 20, "after_sample_size": 20,
+            "before_window": "2026-09", "after_window": "2026-10",
+        }
+        invalid_cases = [
+            {"before_window": "2026-99"},
+            {"before_window": "2026-02-29"},
+            {"before_window": "2026-12-01..2026-10-01"},
+            {"before_window": "2026-10", "after_window": "2026-09"},
+            {"before_sample_size": 0},
+            {"after_sample_size": 0},
+        ]
+        for override in invalid_cases:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                self.store.record_reliability_event(
+                    job["job_id"], "repair_comparison", {**base, **override},
+                )
+
+    def test_optional_message_artifact_backfill_is_lease_guarded_and_idempotent(self):
+        job = self.submit(source_message_id="om_optional_backfill")
+        lease = self.store.acquire_lease(job["job_id"], "backfill")
+        self.assertTrue(self.store.ensure_optional_artifact(
+            lease, "content-review-notification", "message",
+        ))
+        version_after_insert = lease.version
+        self.assertFalse(self.store.ensure_optional_artifact(
+            lease, "content-review-notification", "message",
+        ))
+        self.assertEqual(lease.version, version_after_insert)
+        item = next(item for item in self.store.artifacts(job["job_id"])
+                    if item["artifact_key"] == "content-review-notification")
+        self.assertEqual((item["kind"], item["required"], item["status"]), ("message", 0, "pending"))
+        self.assertEqual(sum(event["event_type"] == "optional_artifact_added"
+                             for event in self.store.events(job["job_id"])), 1)
+
+    def test_failed_effect_can_be_confirmed_only_by_exact_readback(self):
+        job = self.submit(source_message_id="om_failed_readback")
+        self.store.connection.execute(
+            "INSERT INTO artifacts(job_id,artifact_key,kind,required) VALUES(?,?,?,0)",
+            (job["job_id"], "notice", "message"),
+        )
+        lease = self.store.acquire_lease(job["job_id"], "failed-readback")
+        effect = self.store.prepare_effect(lease, "notice", "message-send", DIGEST)
+        self.store.begin_effect(lease, effect["op_key"])
+        self.store.finish_effect(lease, effect["op_key"], "failed", metadata={
+            "failure_stage": "notification-send", "reason_code": "api-rejected",
+        })
+        with self.assertRaises(StoreConflict):
+            self.store.reconcile_effect(
+                lease, effect["op_key"], "confirmed", remote_id="om_found",
+                metadata={"verification": "some-readback"},
+            )
+        self.store.reconcile_effect(
+            lease, effect["op_key"], "confirmed", remote_id="om_found",
+            metadata={"verification": "exact-card-readback"},
+        )
+        self.assertEqual(self.store.get_effect(effect["op_key"])["status"], "confirmed")
+
     def test_permissions_pragmas_and_reopen(self):
         job = self.submit(source_message_id="om_source")
         self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
@@ -74,6 +172,24 @@ class StoreTests(unittest.TestCase):
         self.assertNotEqual(first["job_id"], other_app["job_id"])
         self.assertNotEqual(self.submit()["job_id"], self.submit()["job_id"])
         self.assertEqual(len(self.store.events(first["job_id"])), 1)
+
+    def test_corrupt_payload_is_read_as_unadmitted_without_decoding_crash(self):
+        job = self.submit()
+        self.store.connection.execute("UPDATE jobs SET payload_json='{' WHERE job_id=?", (job["job_id"],))
+        decoded = self.store.get_job(job["job_id"])
+        self.assertIsNone(decoded["payload"])
+        self.assertEqual(decoded["payload_decode_error"], "invalid-json")
+        self.assertEqual(self.store.unadmitted_nonterminal_jobs(), [{
+            "job_id": job["job_id"], "status": "pending", "reason_code": "invalid-workflow-payload",
+        }])
+
+        self.store.connection.execute("UPDATE jobs SET payload_json=CAST(x'ff' AS TEXT) WHERE job_id=?", (job["job_id"],))
+        decoded = self.store.get_job(job["job_id"])
+        self.assertIsNone(decoded["payload"])
+        self.assertEqual(decoded["payload_decode_error"], "invalid-json")
+        self.assertEqual(self.store.unadmitted_nonterminal_jobs(), [{
+            "job_id": job["job_id"], "status": "pending", "reason_code": "invalid-workflow-payload",
+        }])
 
     def test_concurrent_submissions_share_one_job(self):
         barrier = threading.Barrier(4)
@@ -140,6 +256,15 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(persisted["request_id"], effect["request_id"])
         with self.assertRaises(UncertainEffect):
             self.store.begin_effect(lease, effect["op_key"])
+
+    def test_effect_duration_is_persisted_from_attempt_to_verified_result(self):
+        lease = self.store.acquire_lease(self.submit()["job_id"], "worker")
+        effect = self.effect(lease)
+        self.store.begin_effect(lease, effect["op_key"])
+        self.clock.value += 0.125
+        self.store.finish_effect(lease, effect["op_key"], "confirmed", remote_id="remote-id")
+        persisted = self.store.get_effect(effect["op_key"])
+        self.assertEqual(persisted["metadata"]["duration_ms"], 125)
 
     def test_preallocated_request_id_is_reused_and_retry_state_is_round_ordered(self):
         lease = self.store.acquire_lease(self.submit()["job_id"], "worker")

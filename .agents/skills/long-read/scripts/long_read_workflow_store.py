@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+import fcntl
 import hashlib
 import json
 import math
@@ -17,8 +19,22 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import time
 import uuid
+
+
+WORKFLOW_CONTRACT_VERSION = "read-x-long-read-delivery/v1"
+REQUIRED_SUBMISSION_INPUTS = {
+    "source.md", "evidence.json", "scoring-result.json", "score-gate.json", "trigger-context.json",
+}
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_QUESTION_SKILL = re.compile(r"ljg-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_REPORT_WINDOW = re.compile(r"(?:\d{4}-\d{2}|\d{4}-\d{2}-\d{2}(?:\.\.\d{4}-\d{2}-\d{2})?)\Z")
+RELIABILITY_EVENT_TYPES = {
+    "manual_intervention", "manual_reconciled", "manual_repair",
+    "repair_applied", "root_cause_fixed", "repair_comparison",
+}
 
 
 class StoreConflict(RuntimeError):
@@ -35,6 +51,92 @@ class UncertainEffect(StoreConflict):
 
 class RetryExhausted(StoreConflict):
     pass
+
+
+def workflow_payload_issue(payload: object, *, app_id: str | None = None,
+                           source_message_id: str | None = None) -> str | None:
+    """Return a safe admission failure code for a persisted workflow payload."""
+    if not isinstance(payload, dict) or payload.get("workflow_contract_version") != WORKFLOW_CONTRACT_VERSION:
+        return "unadmitted-legacy-job"
+    if (payload.get("schema") != "long-read-submission/v1"
+            or payload.get("route") != "long_read"
+            or payload.get("score_status") != "scored"):
+        return "invalid-workflow-payload"
+    if not isinstance(payload.get("snapshot_sha256"), str) or not _SHA256.fullmatch(payload["snapshot_sha256"]):
+        return "invalid-workflow-payload"
+    test_task = payload.get("test_task", False)
+    if not isinstance(test_task, bool):
+        return "invalid-workflow-payload"
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, dict) or not REQUIRED_SUBMISSION_INPUTS.issubset(inputs):
+        return "invalid-workflow-payload"
+    for name, reference in inputs.items():
+        if (not isinstance(name, str) or not name or Path(name).name != name
+                or not isinstance(reference, dict)
+                or not isinstance(reference.get("path"), str)
+                or not Path(reference["path"]).is_absolute()
+                or not isinstance(reference.get("sha256"), str)
+                or not _SHA256.fullmatch(reference["sha256"])):
+            return "invalid-workflow-payload"
+    questions = payload.get("questions", [])
+    if not isinstance(questions, list) or len(questions) > 3:
+        return "invalid-workflow-payload"
+    seen_skills = set()
+    seen_files = set()
+    for question in questions:
+        if not isinstance(question, dict):
+            return "invalid-workflow-payload"
+        skill, filename = question.get("skill"), question.get("file")
+        if (not isinstance(skill, str) or not _QUESTION_SKILL.fullmatch(skill)
+                or not isinstance(filename, str) or Path(filename).name != filename
+                or not filename.startswith("question-") or filename not in inputs
+                or skill in seen_skills or filename in seen_files):
+            return "invalid-workflow-payload"
+        seen_skills.add(skill)
+        seen_files.add(filename)
+    trigger = payload.get("trigger")
+    if (not isinstance(trigger, dict)
+            or not isinstance(trigger.get("feishuProfile"), str) or not trigger["feishuProfile"].strip()
+            or trigger.get("identity", "bot") != "bot"
+            or not isinstance(trigger.get("appId"), str) or not trigger["appId"].strip()
+            or not isinstance(trigger.get("chatType"), str) or trigger["chatType"] not in {"group", "p2p"}
+            or not isinstance(trigger.get("chatId"), str) or not trigger["chatId"].strip()
+            or not isinstance(trigger.get("senderId"), str) or not trigger["senderId"].strip()
+            or trigger.get("senderType") not in {"user", "bot"}
+            or not isinstance(trigger.get("sourceMessageId"), str)
+            or not trigger["sourceMessageId"].startswith("om_")):
+        return "invalid-workflow-payload"
+    if (test_task and trigger.get("readxCanary") is not True) or (
+            "readxCanary" in trigger
+            and (not isinstance(trigger["readxCanary"], bool)
+                 or trigger["readxCanary"] is not test_task)):
+        return "invalid-workflow-payload"
+    if app_id is not None and trigger.get("appId") != app_id:
+        return "invalid-workflow-payload"
+    if source_message_id is not None and trigger.get("sourceMessageId") != source_message_id:
+        return "invalid-workflow-payload"
+    return None
+
+
+@contextmanager
+def state_lock(state_dir: Path):
+    """Serialize snapshot admission with retention cleanup across processes."""
+    state_dir = Path(state_dir)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise ValueError("state directory must be a real directory")
+    path = state_dir / "workflow.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_mode & 0o077:
+            raise ValueError("workflow lock must be a private regular file")
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 VERIFIED_EFFECTS_BY_KIND = {
@@ -95,8 +197,9 @@ def _name(value: str) -> str:
 
 def _metadata(value: dict | None) -> str:
     """Only machine codes and measurements belong in receipts, never raw text."""
-    allowed = {"reason_code", "failure_stage", "duration_ms", "retryable", "code", "verification",
-               "content_sha256", "next_retry_at", "round", "image_sha256"}
+    allowed = {"reason_code", "notification_reason_code", "failure_stage", "duration_ms", "retryable",
+               "retry_allowed", "code", "verification", "content_sha256", "next_retry_at", "next_reconcile_at",
+               "round", "image_sha256"}
     value = {} if value is None else value
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("metadata must contain only approved receipt fields")
@@ -108,6 +211,92 @@ def _metadata(value: dict | None) -> str:
         elif not isinstance(item, (int, float)) or not math.isfinite(item):
             raise ValueError("metadata values must be machine codes or finite measurements")
     return _json(value)
+
+
+def _single_line_text(value, label: str, *, maximum: int) -> str:
+    if (not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError(f"{label} must be non-empty single-line text of at most {maximum} characters")
+    return value.strip()
+
+
+def _reliability_event_details(event_type: str, details: dict) -> dict:
+    """Validate reportable operator events; never accept raw article text fields."""
+    if not isinstance(event_type, str) or event_type not in RELIABILITY_EVENT_TYPES:
+        raise ValueError("unsupported reliability event type")
+    if not isinstance(details, dict):
+        raise ValueError("reliability event details must be an object")
+
+    if event_type in {"manual_intervention", "manual_reconciled", "manual_repair"}:
+        allowed = {"category", "summary", "reference"}
+        if (set(details) - allowed or not isinstance(details.get("category"), str)
+                or details["category"] not in {"recovery", "reconciliation", "repair", "other"}):
+            raise ValueError("manual event requires a supported category and only known fields")
+        result = {
+            "category": details["category"],
+            "summary": _single_line_text(details.get("summary"), "summary", maximum=240),
+        }
+        if "reference" in details:
+            result["reference"] = _name(details["reference"])
+        return result
+
+    if event_type in {"repair_applied", "root_cause_fixed"}:
+        allowed = {"repair_id", "failure_fingerprint", "summary", "change_ref"}
+        if set(details) != allowed:
+            raise ValueError("repair event requires repair_id, failure_fingerprint, summary, and change_ref")
+        return {
+            "repair_id": _name(details["repair_id"]),
+            "failure_fingerprint": _name(details["failure_fingerprint"]),
+            "summary": _single_line_text(details["summary"], "summary", maximum=240),
+            "change_ref": _name(details["change_ref"]),
+        }
+
+    allowed = {
+        "repair_id", "metric", "before_value", "after_value",
+        "before_sample_size", "after_sample_size", "before_window", "after_window",
+    }
+    if (set(details) != allowed or not isinstance(details.get("metric"), str)
+            or details["metric"] not in {
+                "final_failure_rate", "stage_failure_rate", "recovery_rate", "p90_duration_seconds"}):
+        raise ValueError("repair comparison has missing or unsupported fields")
+    normalized = {"repair_id": _name(details["repair_id"]), "metric": details["metric"]}
+    for name in ("before_value", "after_value"):
+        value = details[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+        if details["metric"] != "p90_duration_seconds" and value > 1:
+            raise ValueError(f"{name} must be between 0 and 1 for rate metrics")
+        normalized[name] = float(value)
+    for name in ("before_sample_size", "after_sample_size"):
+        value = details[name]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        normalized[name] = value
+    parsed_windows = []
+    for name in ("before_window", "after_window"):
+        value = details[name]
+        if not isinstance(value, str) or not _REPORT_WINDOW.fullmatch(value):
+            raise ValueError(f"{name} must identify a YYYY-MM or YYYY-MM-DD..YYYY-MM-DD window")
+        try:
+            if len(value) == 7:
+                start = datetime.strptime(value, "%Y-%m").date()
+                end_exclusive = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
+            elif ".." in value:
+                start_text, end_text = value.split("..", 1)
+                start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
+                if end <= start:
+                    raise ValueError
+                end_exclusive = end + timedelta(days=1)
+            else:
+                start = date.fromisoformat(value)
+                end_exclusive = start + timedelta(days=1)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a valid, ascending calendar window") from exc
+        normalized[name] = value
+        parsed_windows.append((start, end_exclusive))
+    if parsed_windows[0][1] > parsed_windows[1][0]:
+        raise ValueError("before_window must end before after_window begins")
+    return normalized
 
 
 SCHEMA = """
@@ -159,8 +348,10 @@ CREATE TABLE IF NOT EXISTS report_outbox (
  UNIQUE(report_key,artifact_key)
 );
 CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+ WHEN COALESCE((SELECT value FROM workflow_meta WHERE key='retention_mode'), '') != 'scrub'
  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+ WHEN COALESCE((SELECT value FROM workflow_meta WHERE key='retention_mode'), '') != 'purge'
  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
 """
 
@@ -187,6 +378,22 @@ class WorkflowStore:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.executescript(SCHEMA)
+        # Replace legacy unconditional triggers once, preserving append-only
+        # history except inside the retention transaction.
+        trigger_rows = self.connection.execute(
+            "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('events_no_update','events_no_delete')"
+        ).fetchall()
+        if len(trigger_rows) != 2 or any("retention_mode" not in row["sql"] for row in trigger_rows):
+            self.connection.executescript("""
+            DROP TRIGGER IF EXISTS events_no_update;
+            DROP TRIGGER IF EXISTS events_no_delete;
+            CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+            WHEN COALESCE((SELECT value FROM workflow_meta WHERE key='retention_mode'), '') != 'scrub'
+            BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+            CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+            WHEN COALESCE((SELECT value FROM workflow_meta WHERE key='retention_mode'), '') != 'purge'
+            BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
+            """)
         self.connection.execute(
             "INSERT OR IGNORE INTO workflow_meta(key,value) VALUES('tracking_started_at',?)",
             (str(self.clock()),),
@@ -250,7 +457,12 @@ class WorkflowStore:
         value = dict(row)
         for key in ("payload_json", "metadata_json", "details_json"):
             if key in value:
-                value[key.removesuffix("_json")] = json.loads(value.pop(key))
+                name = key.removesuffix("_json")
+                try:
+                    value[name] = json.loads(value.pop(key))
+                except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                    value[name] = None
+                    value[f"{name}_decode_error"] = "invalid-json"
         return value
 
     def submit(self, payload: dict, *, app_id: str, source_message_id: str | None = None,
@@ -273,7 +485,7 @@ class WorkflowStore:
         encoded = _json(payload)
         digest = hashlib.sha256(_json({"payload": payload, "artifacts": specs}).encode()).hexdigest()
         with self._transaction():
-            old = self.connection.execute("SELECT * FROM jobs WHERE app_id=? AND source_message_id=?",
+            old = self.connection.execute("SELECT job_id,app_id,source_message_id,input_sha256,CAST(payload_json AS BLOB) AS payload_json,status,version,lease_owner,lease_token,fencing,lease_expires_at,created_at,updated_at FROM jobs WHERE app_id=? AND source_message_id=?",
                                           (app_id, source_message_id)).fetchone() if source_message_id else None
             if old:
                 if old["input_sha256"] != digest:
@@ -293,10 +505,63 @@ class WorkflowStore:
         return result
 
     def get_job(self, job_id: str) -> dict | None:
-        return self._decode(self.connection.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone())
+        row = self.connection.execute(
+            "SELECT job_id,app_id,source_message_id,input_sha256,CAST(payload_json AS BLOB) AS payload_json,status,version,lease_owner,lease_token,fencing,lease_expires_at,created_at,updated_at FROM jobs WHERE job_id=?",
+            (job_id,),
+        ).fetchone()
+        return self._decode(row)
+
+    def record_reliability_event(self, job_id: str, event_type: str, details: dict) -> dict:
+        """Append a validated operator event used by reliability reports."""
+        job_id = _name(job_id)
+        normalized = _reliability_event_details(event_type, details)
+        with self._transaction():
+            exists = self.connection.execute("SELECT 1 FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+            if not exists:
+                raise StoreConflict("reliability event job does not exist")
+            encoded = _json(normalized)
+            prior = self.connection.execute(
+                "SELECT seq,at FROM events WHERE job_id=? AND event_type=? AND details_json=? ORDER BY seq LIMIT 1",
+                (job_id, event_type, encoded),
+            ).fetchone()
+            if prior:
+                return {
+                    "status": "recorded", "job_id": job_id, "event_type": event_type,
+                    "seq": prior["seq"], "at": prior["at"], "details": normalized,
+                    "reused": True,
+                }
+            at = self.clock()
+            cursor = self.connection.execute(
+                "INSERT INTO events(job_id,at,event_type,details_json) VALUES(?,?,?,?)",
+                (job_id, at, event_type, encoded),
+            )
+        return {
+            "status": "recorded", "job_id": job_id, "event_type": event_type,
+            "seq": cursor.lastrowid, "at": at, "details": normalized, "reused": False,
+        }
 
     def list_jobs(self) -> list[dict]:
         return [dict(row) for row in self.connection.execute("SELECT job_id,status,version,created_at,updated_at FROM jobs ORDER BY created_at,job_id")]
+
+    def unadmitted_nonterminal_jobs(self) -> list[dict]:
+        """List nonterminal rows that do not carry the current admission contract."""
+        result = []
+        rows = self.connection.execute(
+            "SELECT job_id,app_id,status,source_message_id,CAST(payload_json AS BLOB) AS payload_bytes FROM jobs WHERE status NOT IN ('succeeded','failed') ORDER BY created_at,job_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_bytes"])
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+                reason_code = "invalid-workflow-payload"
+            else:
+                reason_code = workflow_payload_issue(
+                    payload, app_id=row["app_id"], source_message_id=row["source_message_id"],
+                )
+            if reason_code:
+                result.append({"job_id": row["job_id"], "status": row["status"], "reason_code": reason_code})
+        return result
 
     def acquire_lease(self, job_id: str, owner: str, ttl_seconds: float = 60) -> Lease:
         _name(owner)
@@ -373,6 +638,35 @@ class WorkflowStore:
 
     def artifacts(self, job_id: str) -> list[dict]:
         return [self._decode(row) for row in self.connection.execute("SELECT * FROM artifacts WHERE job_id=? ORDER BY artifact_key", (job_id,))]
+
+    def ensure_optional_artifact(self, lease: Lease, artifact_key: str, kind: str) -> bool:
+        """Add a backward-compatible optional artifact under the current lease."""
+        artifact_key, kind = _name(artifact_key), _name(kind)
+        if kind != "message":
+            raise ValueError("only optional message artifacts may be added during recovery")
+        with self._transaction():
+            self._guard(lease)
+            row = self.connection.execute(
+                "SELECT kind,required FROM artifacts WHERE job_id=? AND artifact_key=?",
+                (lease.job_id, artifact_key),
+            ).fetchone()
+            if row:
+                if row["kind"] != kind or row["required"] != 0:
+                    raise StoreConflict("existing artifact does not match the optional recovery contract")
+                return False
+            self.connection.execute(
+                "INSERT INTO artifacts(job_id,artifact_key,kind,required) VALUES(?,?,?,0)",
+                (lease.job_id, artifact_key, kind),
+            )
+            self._event(lease.job_id, "optional_artifact_added", {
+                "artifact_key": artifact_key, "kind": kind,
+            })
+            self.connection.execute(
+                "UPDATE jobs SET version=version+1,updated_at=? WHERE job_id=?",
+                (self.clock(), lease.job_id),
+            )
+        lease.version += 1
+        return True
 
     def set_artifact(self, lease: Lease, artifact_key: str, status: str, metadata: dict | None = None):
         if status not in {"pending", "confirmed", "failed", "uncertain"}:
@@ -531,15 +825,41 @@ class WorkflowStore:
             raise ValueError("invalid effect outcome")
         if remote_id is not None:
             _name(remote_id)
-        encoded = _metadata(metadata)
         with self._change(lease):
             row = self.connection.execute("SELECT * FROM effects WHERE job_id=? AND op_key=?", (lease.job_id, op_key)).fetchone()
             expected = {"uncertain"} if reconcile else {"attempting"}
+            if reconcile and status == "confirmed":
+                expected.add("failed")
             if not row or row["status"] not in expected:
                 raise StoreConflict("effect is not in the expected state")
-            self.connection.execute("UPDATE effects SET status=?,remote_id=?,metadata_json=?,updated_at=? WHERE op_key=?", (status, remote_id, encoded, self.clock(), op_key))
+            if (reconcile and row["status"] == "failed" and status == "confirmed"
+                    and (not isinstance(metadata, dict)
+                         or metadata.get("verification") != "exact-card-readback")):
+                raise StoreConflict("failed effect confirmation requires exact remote readback")
+            now = self.clock()
+            receipt = {} if metadata is None else dict(metadata)
+            if (row["status"] == "attempting" and "duration_ms" not in receipt
+                    and receipt.get("reason_code") != "worker-interrupted"):
+                receipt["duration_ms"] = max(0, round((now - float(row["updated_at"])) * 1000))
+            encoded = _metadata(receipt)
+            self.connection.execute("UPDATE effects SET status=?,remote_id=?,metadata_json=?,updated_at=? WHERE op_key=?", (status, remote_id, encoded, now, op_key))
             if status in {"failed", "uncertain"}:
-                self.connection.execute("UPDATE artifacts SET status=? WHERE job_id=? AND artifact_key=?", (status, lease.job_id, row["artifact_key"]))
+                artifact = self.connection.execute(
+                    "SELECT metadata_json FROM artifacts WHERE job_id=? AND artifact_key=?",
+                    (lease.job_id, row["artifact_key"]),
+                ).fetchone()
+                try:
+                    artifact_metadata = json.loads(artifact["metadata_json"]) if artifact else {}
+                except (TypeError, json.JSONDecodeError):
+                    artifact_metadata = {}
+                if not isinstance(artifact_metadata, dict):
+                    artifact_metadata = {}
+                artifact_metadata.update(receipt)
+                artifact_encoded = _metadata(artifact_metadata)
+                self.connection.execute(
+                    "UPDATE artifacts SET status=?,metadata_json=? WHERE job_id=? AND artifact_key=?",
+                    (status, artifact_encoded, lease.job_id, row["artifact_key"]),
+                )
             elif reconcile:
                 unresolved = self.connection.execute("SELECT 1 FROM effects WHERE job_id=? AND artifact_key=? AND status IN ('attempting','uncertain') LIMIT 1", (lease.job_id, row["artifact_key"])).fetchone()
                 if not unresolved:
@@ -619,21 +939,34 @@ class WorkflowStore:
     def finish_report_effect(self, report_key: str, artifact_key: str, status: str, *,
                              remote_id: str | None = None, metadata: dict | None = None,
                              reconcile: bool = False):
-        if status not in ({"confirmed", "failed"} if reconcile else {"confirmed", "failed", "uncertain"}):
+        if status not in ({"confirmed", "uncertain"} if reconcile else {"confirmed", "failed", "uncertain"}):
             raise ValueError("invalid report effect outcome")
         if remote_id is not None:
             _name(remote_id)
-        encoded = _metadata(metadata)
-        expected = {"uncertain"} if reconcile else {"attempting"}
+        expected = {"uncertain", "failed"} if reconcile else {"attempting"}
         with self._transaction():
             row = self.connection.execute(
                 "SELECT * FROM report_outbox WHERE report_key=? AND artifact_key=?", (report_key, artifact_key)
             ).fetchone()
             if not row or row["status"] not in expected:
                 raise StoreConflict("report effect is not in the expected state")
+            receipt = {} if metadata is None else dict(metadata)
+            if (reconcile and status == "confirmed"
+                    and receipt.get("verification") not in {"message-id-readback", "history-exact-match"}):
+                raise ValueError("reconciled report confirmation requires exact message readback")
+            if (reconcile and row["status"] == "failed" and status == "uncertain"
+                    and receipt.get("reason_code") not in {
+                        "report-history-incomplete", "report-history-ambiguous", "report-history-no-match",
+                    }):
+                raise ValueError("failed report effect can become uncertain only when history is incomplete or ambiguous")
+            now = self.clock()
+            if (row["status"] == "attempting" and "duration_ms" not in receipt
+                    and receipt.get("reason_code") != "worker-interrupted"):
+                receipt["duration_ms"] = max(0, round((now - float(row["updated_at"])) * 1000))
+            encoded = _metadata(receipt)
             self.connection.execute(
                 "UPDATE report_outbox SET status=?,remote_id=?,metadata_json=?,updated_at=? WHERE outbox_id=?",
-                (status, remote_id, encoded, self.clock(), row["outbox_id"]),
+                (status, remote_id, encoded, now, row["outbox_id"]),
             )
 
     def mark_report_delivered(self, report_key: str):

@@ -12,8 +12,8 @@ import uuid
 
 import run_chatgpt_core_image as core_image
 from feishu_long_read_delivery import (
-    DeliveryError, FeishuLongReadDelivery, UnknownRemoteResult,
-    match_image_messages, verify_image_message,
+    DeliveryError, FeishuLongReadDelivery, RetryableDeliveryError, UnknownRemoteResult,
+    match_image_messages, verify_image_message, message_rate_slot,
 )
 from long_read_workflow_store import WorkflowStore
 
@@ -35,21 +35,22 @@ def _safe_name(value: str) -> str:
 
 
 def _write_private(path: Path, payload: bytes) -> None:
-    resolved = path.resolve(strict=False)
-    resolved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if any(part.is_symlink() for part in (resolved, *resolved.parents)):
+    path = path.absolute()
+    allowed_aliases = {Path("/tmp"), Path("/var")}
+    if any(part.is_symlink() and part not in allowed_aliases for part in (path, *path.parents)):
         raise ValueError("image workflow files must not traverse symlinks")
-    os.chmod(resolved.parent, 0o700)
-    temporary = resolved.with_name(f".{resolved.name}.{uuid.uuid4().hex}.tmp")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, resolved)
-        os.chmod(resolved, 0o600)
-        directory_fd = os.open(resolved.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
         finally:
@@ -344,12 +345,14 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
                                "invalid-mode", "invalid-request-id",
                            })
         if safe_pre_submit:
+            retryable = result.get("reason") in {"bridge-busy", "local-rate-limit-cooldown"}
             store.finish_effect(
                 lease, effect["op_key"], "failed",
-                metadata={"failure_stage": "image-generate", "reason_code": "pre-submit-rejected"},
+                metadata={"failure_stage": "image-generate", "reason_code": result.get("reason", "pre-submit-rejected"),
+                          "retryable": retryable},
             )
-            return {"status": "failed", "reason_code": "pre-submit-rejected",
-                    "retryable": True, "effect": effect}
+            return {"status": "failed", "reason_code": result.get("reason", "pre-submit-rejected"),
+                    "retryable": retryable, "effect": effect}
         store.finish_effect(
             lease, effect["op_key"], "uncertain",
             metadata={"failure_stage": "image-generate", "reason_code": "bridge-image-result-unknown"},
@@ -485,7 +488,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                     "reason_code": "image-block-create-result-unconfirmed"}
     elif block_effect["status"] == "failed":
         return {"status": "failed", "failure_stage": "image-block-create",
-                "reason_code": "previous-image-block-create-failure", "retryable": True}
+                "reason_code": "previous-image-block-create-failure",
+                "retryable": block_effect.get("metadata", {}).get("retryable") is True}
     elif block_effect["status"] == "prepared":
         effect = store.begin_effect(lease, block_effect["op_key"])
         block_id = None
@@ -508,11 +512,13 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                 document_id=document_id, png_path=png_path, image_index=image_index,
                 root=root, client=client, round_number=round_number, clock=clock,
             )
-        except DeliveryError:
+        except DeliveryError as exc:
+            retryable = isinstance(exc, RetryableDeliveryError)
             store.finish_effect(lease, effect["op_key"], "failed",
-                                metadata={"failure_stage": "image-block-create", "reason_code": "api-rejected"})
+                                metadata={"failure_stage": "image-block-create", "reason_code": "api-rejected",
+                                          "retryable": retryable})
             return {"status": "failed", "failure_stage": "image-block-create",
-                    "reason_code": "image-block-create-rejected", "retryable": True}
+                    "reason_code": "image-block-create-rejected", "retryable": retryable}
         else:
             store.finish_effect(
                 lease, effect["op_key"], "confirmed", remote_id=block_id,
@@ -557,7 +563,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                     "reason_code": "image-upload-result-unconfirmed"}
     elif upload_effect["status"] == "failed":
         return {"status": "failed", "failure_stage": "image-upload",
-                "reason_code": "previous-image-upload-failure", "retryable": True}
+                "reason_code": "previous-image-upload-failure",
+                "retryable": upload_effect.get("metadata", {}).get("retryable") is True}
     elif upload_effect["status"] == "prepared":
         attempt = store.begin_effect(lease, upload_effect["op_key"])
         try:
@@ -572,11 +579,13 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                 document_id=document_id, png_path=png_path, image_index=image_index,
                 root=root, client=client, round_number=round_number, clock=clock,
             )
-        except DeliveryError:
+        except DeliveryError as exc:
+            retryable = isinstance(exc, RetryableDeliveryError)
             store.finish_effect(lease, attempt["op_key"], "failed",
-                                metadata={"failure_stage": "image-upload", "reason_code": "api-rejected"})
+                                metadata={"failure_stage": "image-upload", "reason_code": "api-rejected",
+                                          "retryable": retryable})
             return {"status": "failed", "failure_stage": "image-upload",
-                    "reason_code": "image-upload-rejected", "retryable": True}
+                    "reason_code": "image-upload-rejected", "retryable": retryable}
         else:
             store.finish_effect(
                 lease, attempt["op_key"], "confirmed", remote_id=file_token,
@@ -625,7 +634,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                     "reason_code": "image-patch-result-unconfirmed"}
     elif patch_effect["status"] == "failed":
         return {"status": "failed", "failure_stage": "image-block-patch",
-                "reason_code": "previous-image-patch-failure", "retryable": True}
+                "reason_code": "previous-image-patch-failure",
+                "retryable": patch_effect.get("metadata", {}).get("retryable") is True}
     elif patch_effect["status"] == "prepared":
         attempt = store.begin_effect(lease, patch_effect["op_key"])
         try:
@@ -648,11 +658,13 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
                 document_id=document_id, png_path=png_path, image_index=image_index,
                 root=root, client=client, round_number=round_number, clock=clock,
             )
-        except DeliveryError:
+        except DeliveryError as exc:
+            retryable = isinstance(exc, RetryableDeliveryError)
             store.finish_effect(lease, attempt["op_key"], "failed",
-                                metadata={"failure_stage": "image-block-patch", "reason_code": "api-rejected"})
+                                metadata={"failure_stage": "image-block-patch", "reason_code": "api-rejected",
+                                          "retryable": retryable})
             return {"status": "failed", "failure_stage": "image-block-patch",
-                    "reason_code": "image-patch-rejected", "retryable": True}
+                    "reason_code": "image-patch-rejected", "retryable": retryable}
         else:
             store.finish_effect(
                 lease, attempt["op_key"], "confirmed", remote_id=block_id,
@@ -688,10 +700,15 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                 png_path: Path, trigger: dict, sender_app_id: str, client,
                 round_number: int, clock) -> dict:
     message_artifact = f"{image_key}-send"
-    if trigger.get("senderType") == "bot" or trigger.get("chatType") == "p2p":
+    if trigger.get("chatType") == "p2p":
         target = {"chat_id": trigger.get("chatId")}
+        history_chat_id = trigger.get("chatId")
     elif trigger.get("chatType") == "group":
+        if not trigger.get("privateChatId"):
+            return {"status": "needs_review", "failure_stage": "image-send",
+                    "reason_code": "private-chat-readback-target-missing"}
         target = {"user_id": trigger.get("senderId")}
+        history_chat_id = trigger.get("privateChatId")
     else:
         return {"status": "failed", "failure_stage": "image-send",
                 "reason_code": "unsupported-private-message-target", "retryable": False}
@@ -718,7 +735,8 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                 "reason_code": "message-image-upload-result-unconfirmed"}
     elif upload_effect["status"] == "failed":
         return {"status": "failed", "failure_stage": "message-image-upload",
-                "reason_code": "previous-message-image-upload-failure", "retryable": True}
+                "reason_code": "previous-message-image-upload-failure",
+                "retryable": upload_effect.get("metadata", {}).get("retryable") is True}
     elif upload_effect["status"] == "prepared":
         attempt = store.begin_effect(lease, upload_effect["op_key"])
         try:
@@ -728,11 +746,13 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                                 metadata={"failure_stage": "message-image-upload", "reason_code": "upload-result-unknown"})
             return {"status": "uncertain", "failure_stage": "message-image-upload",
                     "reason_code": "message-image-upload-result-unconfirmed"}
-        except DeliveryError:
+        except DeliveryError as exc:
+            retryable = isinstance(exc, RetryableDeliveryError)
             store.finish_effect(lease, attempt["op_key"], "failed",
-                                metadata={"failure_stage": "message-image-upload", "reason_code": "api-rejected"})
+                                metadata={"failure_stage": "message-image-upload", "reason_code": "api-rejected",
+                                          "retryable": retryable})
             return {"status": "failed", "failure_stage": "message-image-upload",
-                    "reason_code": "message-image-upload-rejected", "retryable": True}
+                    "reason_code": "message-image-upload-rejected", "retryable": retryable}
         store.finish_effect(
             lease, attempt["op_key"], "confirmed", remote_id=image_key_value,
             metadata={"verification": "image-key-upload-receipt", "content_sha256": image_sha},
@@ -750,7 +770,7 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
         send_effect = store.prepare_effect(lease, message_artifact, send_action, send_sha)
     elif send_effect["request_sha256"] != send_sha:
         return {"status": "needs_review", "reason_code": "image-message-request-changed"}
-    expected_chat_id = target.get("chat_id")
+    expected_chat_id = history_chat_id
     if send_effect["status"] == "confirmed":
         message_id = send_effect.get("remote_id")
         if not message_id or not _verify_message(
@@ -801,8 +821,18 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                     "reason_code": "bot-cannot-read-target-p2p-history"}
     elif send_effect["status"] == "failed":
         return {"status": "failed", "failure_stage": "image-send",
-                "reason_code": "previous-image-send-failure", "retryable": True}
+                "reason_code": "previous-image-send-failure",
+                "retryable": send_effect.get("metadata", {}).get("retryable") is True}
     elif send_effect["status"] == "prepared":
+        try:
+            if not message_rate_slot(
+                    client, chat_id=history_chat_id, sender_id=sender_app_id,
+                    sender_id_type="app_id", now=float(clock())):
+                return {"status": "deferred", "failure_stage": "image-send",
+                        "reason_code": "message-rate-limit", "retry_at": float(clock()) + 60}
+        except DeliveryError:
+            return {"status": "needs_review", "failure_stage": "image-send",
+                    "reason_code": "message-rate-preflight-unavailable"}
         attempt = store.begin_effect(lease, send_effect["op_key"])
         try:
             message_id = client.send_image_message(
@@ -820,11 +850,13 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                 )
             return {"status": "uncertain", "failure_stage": "image-send",
                     "reason_code": "bot-cannot-read-target-p2p-history"}
-        except DeliveryError:
+        except DeliveryError as exc:
+            retryable = isinstance(exc, RetryableDeliveryError)
             store.finish_effect(lease, attempt["op_key"], "failed",
-                                metadata={"failure_stage": "image-send", "reason_code": "api-rejected"})
+                                metadata={"failure_stage": "image-send", "reason_code": "api-rejected",
+                                          "retryable": retryable})
             return {"status": "failed", "failure_stage": "image-send",
-                    "reason_code": "image-send-rejected", "retryable": True}
+                    "reason_code": "image-send-rejected", "retryable": retryable}
         if not _verify_message(
                 client, message_id, image_key_value,
                 sender_id=sender_app_id, chat_id=expected_chat_id):
@@ -862,6 +894,8 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
         return {"status": "needs_review", "reason_code": "feishu-profile-missing"}
     if not sender_app_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", sender_app_id):
         return {"status": "needs_review", "reason_code": "bot-app-identity-missing"}
+    if trigger.get("chatType") == "group" and not trigger.get("privateChatId"):
+        return {"status": "needs_review", "reason_code": "private-chat-readback-target-missing"}
     client = client or FeishuLongReadDelivery(identity="bot", profile=profile)
     image_artifact = _artifact(store, lease.job_id, image_key)
     round_number = image_artifact["retry_count"]
@@ -883,8 +917,14 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
         # generation or delivery action until that stage has a read-back proof.
         unresolved = [item for item in store.effects_for(lease.job_id, image_key)
                       if item["status"] in {"attempting", "uncertain"}]
-        if unresolved:
+        generation_effects = [item for item in unresolved
+                              if item["action"] == "image-generate"
+                              or item["action"].startswith("image-generate:retry-")]
+        other_unresolved = [item for item in unresolved if item not in generation_effects]
+        if other_unresolved:
             return {"status": "uncertain", "reason_code": "image-stage-recovery-pending"}
+        # _prepare_generation observes the original Bridge request and can
+        # reconcile an ambiguous generation without submitting a new request.
 
     if image_name == "core-image":
         munger_receipt_path = root / "analysis" / "munger-analysis.md.receipt.json"
@@ -941,6 +981,15 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
         png_path=png_path, trigger=trigger, sender_app_id=sender_app_id,
         client=client, round_number=round_number, clock=clock,
     )
+    if sent["status"] == "deferred":
+        store.set_artifact(lease, f"{image_key}-send", "pending", metadata={
+            "failure_stage": sent.get("failure_stage", "image-send"),
+            "reason_code": sent.get("reason_code", "message-rate-limit"),
+            "next_retry_at": float(sent.get("retry_at", float(clock()) + 60)),
+        })
+        return sent
+    if sent["status"] == "needs_review":
+        return sent
     if sent["status"] == "failed":
         failure = _mark_failure(
             store, lease, image_key, stage=sent.get("failure_stage", "image-send"),

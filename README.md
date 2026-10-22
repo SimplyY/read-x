@@ -43,7 +43,8 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 - **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.3；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
-- **长文精读**：`long-read` 编排器，Evidence -> `run_long_read_pipeline.py` 并行独立启动本地模型解码/文字深度链路与（达标时）ChatGPT Bridge 芒格分支（结果拼入主文档）-> Docx XML -> 飞书主文档；分支互不阻断，失败分支按真实状态降级交付
+- **长文精读**：`long-read` 通过 `long_read_workflow_cli.py submit` 持久接管 `route=long_read`，由 Worker 从文字分析推进到程序装配、Document Compiler 主文档发布、图片插入与私聊发送核验；只有全部必需产物确认后才报告最终成功，进程中断后从检查点恢复
+- **工作流留存**：终态输入与产物 30 天后清除并脱敏；未解决任务及未完成报告投递持续保留；逐任务统计与已完成报告快照保留 180 天，之后仅保留无任务标识的生命周期总计
 - **格式保真**：芒格洞察由 ChatGPT Bridge 生成规范 Markdown，作为一级主章节「芒格洞察」拼进主文档，统一渲染 Feishu XML；交付卡单链接并注明「含芒格洞察」；编排层只提供原文和最小任务边界，不强制芒格章节套用固定标题模板，临时 Markdown 交付后清理
 - **卡片输出**：所有结果以飞书交互卡片回复，快速阅读卡附带速读内容，缺失时失败关闭，`--as bot` 身份发送
 
@@ -61,12 +62,15 @@ content-scoring（quality -> 条件 relevance -> decision）
 │ 状态/一句话/轻量卡片   │ long-read 全流程      │
 └──────────────────────┴──────────────────────┘
                                               ↓
-                            Evidence -> article-decode + 文字 ljg
-                                 （ChatGPT web-bridge 独立会话并行，全局 ≤3 路、错开 ≥10 秒）
-                                 -> Docx XML -> 飞书主文档
-                                 -> ChatGPT Bridge 芒格（每篇必跑）-> 芒格洞察章节拼入主文档
-                                 -> 核心内容图（ChatGPT Bridge image 模式）插入文档顶部
-                                 -> 私聊卡片通知 + 核心图 PNG 私聊发送
+                   long_read_workflow_cli.py submit -> SQLite + 私有输入快照
+                                              ↓
+                         持久 Worker：Bridge 分支 -> 程序装配
+                                              ↓
+                         Document Compiler -> 主文档发布与读回
+                                              ↓
+                 图片生成 -> 插入读回 -> 私聊发送读回 -> 唯一完成门
+                                              ↓
+                    周报阈值触发 / 每月报告（同一持久工作流）
 ```
 
 ## Skill 架构
@@ -77,14 +81,16 @@ content-scoring（quality -> 条件 relevance -> decision）
 |-------|------|
 | `link-card` | **入口编排器**。抓取 -> 调 content-scoring -> 路由 -> 卡片输出 |
 | `content-scoring` | **评分引擎**。三维质量、权威性与大问题思考、独立相关性与确定性路由；link-card 与 long-read 共用 |
-| `long-read` | **深度编排器**。Evidence -> ChatGPT web-bridge 独立会话并行 article-decode + 文字 ljg -> 拼接飞书主文档；ChatGPT Bridge 芒格洞察章节拼入主文档 + 核心内容图置顶 |
+| `long-read` | **持久交付工作流**。Evidence 与评分凭据经 CLI 持久接管；Worker 检查点推进 Bridge 分支、程序装配、主文档发布、必需图片交付和结果核验；从中断恢复并生成周/月可靠性报告 |
 | `article-decode` | **X 光解码**。只读原文与 Evidence，产出独立解码原稿 |
 
 调用关系：
 
 - `link-card` 调 `content-scoring`，按脚本返回的 `route` 走卡片或 `long-read`
-- `long-read` 调 `article-decode`（X 光），再调度外部 `ljg-*` 文字 Skill
-- `long-read` 通过 Ego Lite ChatGPT web-bridge 以独立会话生成全部分析内容（article-decode、文字 ljg、芒格洞察、核心内容图），芒格每篇必跑、失败关闭且不阻塞主文档；全局并发 ≤3 路、会话发起错开 ≥10 秒
+- `long-read` 在 `route=long_read` 后调用 `long_read_workflow_cli.py submit`，由持久 Worker 调 `article-decode`、文字 ljg 和芒格分支；已有阶段收据通过后续检查点复用
+- Worker 统一负责主文档与图片交付、通知及唯一成功门；图片生成、插入和发送共享每图最多两轮额外恢复，未知远端结果只读核验
+- 状态通知走持久发件箱；限流或已确认拒绝后至少间隔 60 秒，最多额外尝试两次，沿用同一请求 UUID 并先读完整消息历史核验，超过 Feishu 一小时去重窗口或结果不明确时不自动重发
+- 同一状态库支持周日 09:00 阈值周报、每月 1 日 09:00 月报及漏跑周期补处理；报告仍需配置并核验本人私聊投递目标
 - `content-scoring` 结果传给 `long-read`，long-read 不重评
 
 ## 与 ljg-skills 的关系
@@ -116,10 +122,15 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
+| `.agents/skills/long-read/scripts/long_read_workflow_cli.py` | 持久接管、Worker 推进、任务/报告只读状态、恢复、人工处置/修复证据记录与可靠性报告 CLI |
+| `.agents/skills/long-read/scripts/long_read_workflow_retention.py` | 终态内容清理、统计脱敏与 180 天留存边界 |
+| `.agents/skills/long-read/scripts/long_read_workflow_worker.py` | 长文工作流检查点、分析编排、装配、主文档及图片交付状态机 |
+| `.agents/skills/long-read/scripts/long_read_workflow_reports.py` | 固定窗口周/月统计快照、指标和报告正文 |
 | `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 经 ChatGPT web-bridge 并行运行独立 article-decode 与文字 ljg 会话 |
 | `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 调用 ChatGPT Bridge 生成芒格洞察原稿（每篇必跑） |
 | `.agents/skills/long-read/scripts/run_chatgpt_core_image.py` | 调用 ChatGPT Bridge image 模式对完整精读 markdown 生成核心内容图 PNG |
-| `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 长读编排入口：并行独立启动分析分支与 ChatGPT 分支并汇总交付状态 |
+| `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 旧临时流水线，仅供历史兼容和局部测试；不作为持久交付入口 |
+| `.agents/skills/long-read/scripts/long_read_workflow_scheduler.py` | 固定周/月报告周期与漏跑周期补处理；由常驻 Worker 调用 |
 | `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
 | `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |
 | `scripts/render_long_read_delivery_card.py` | 生成唯一长文交付 Card 2.0 JSON，避免换行转义错误 |

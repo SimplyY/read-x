@@ -29,7 +29,9 @@ def _load_score_evidence(path: Path, scoring_result: Path) -> dict:
     return evidence
 
 
-def _url(value: str) -> str:
+def _url(value: str | None) -> str | None:
+    if value is None:
+        return None
     if urlparse(value).scheme not in {"http", "https"}:
         raise ValueError("document URL must use http or https")
     return value
@@ -48,7 +50,7 @@ DELIVERY_TITLES = {
 }
 
 
-def _delivery_state(receipt: dict | None, main_url: str) -> str:
+def _delivery_state(receipt: dict | None, main_url: str | None) -> str:
     if receipt is None:
         return "processing"
     if not isinstance(receipt, dict) or receipt.get("schema") != DELIVERY_RECEIPT_SCHEMA:
@@ -84,13 +86,21 @@ def _delivery_state(receipt: dict | None, main_url: str) -> str:
     return status
 
 
-def render_card(*, title: str, main_url: str, munger_embedded: bool = False,
+def render_card(*, title: str, main_url: str | None, munger_embedded: bool = False,
                 failure_reason: str | None = None, image_note: str | None = None,
                 delivery_receipt: dict | None = None) -> dict:
     _url(main_url)
     delivery_status = _delivery_state(delivery_receipt, main_url)
     success = delivery_status == "succeeded"
     subtitle = "主精读文档（含芒格洞察）" if success and munger_embedded else "主精读文档"
+    if success and not main_url:
+        raise ValueError("successful delivery requires a main document URL")
+    if success:
+        main_document_content = f"**主精读文档（含芒格洞察）**\n[打开主文档]({main_url})"
+    elif main_url:
+        main_document_content = f"**主精读文档**\n[打开主文档]({main_url})"
+    else:
+        main_document_content = "**主精读文档**\n尚未创建或无法确认"
     elements = [{
         "tag": "column_set", "flex_mode": "bisect", "horizontal_spacing": "8px",
         "columns": [{
@@ -98,11 +108,7 @@ def render_card(*, title: str, main_url: str, munger_embedded: bool = False,
             "background_style": "indigo-50", "padding": "12px",
             "elements": [{
                 "tag": "markdown",
-                "content": (
-                    "**主精读文档（含芒格洞察）**\n"
-                    f"[打开主文档]({main_url})" if success else
-                    f"**主精读文档**\n[打开主文档]({main_url})"
-                ),
+                "content": main_document_content,
             }],
         }],
     }]
@@ -114,9 +120,9 @@ def render_card(*, title: str, main_url: str, munger_embedded: bool = False,
         }[delivery_status]
         elements.append({"tag": "markdown", "content": state_text})
     if not munger_embedded and failure_reason:
-        elements.append({"tag": "markdown", "content": f"芒格分析：{failure_reason}"})
+        elements.append({"tag": "markdown", "content": f"失败详情：{failure_reason}"})
     if image_note:
-        elements.append({"tag": "markdown", "content": f"核心内容图：{image_note}"})
+        elements.append({"tag": "markdown", "content": image_note})
     return {
         "schema": "2.0",
         "config": {"update_multi": True, "width_mode": "default", "summary": {"content": f"{DELIVERY_TITLES[delivery_status]}：{title}"}},

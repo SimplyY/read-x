@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+from html import escape
 import json
 import math
 from pathlib import Path
@@ -13,6 +14,10 @@ from long_read_workflow_store import WorkflowStore
 
 
 REPORT_TZ = ZoneInfo("Asia/Shanghai")
+RELIABILITY_EVENT_TYPES = (
+    "manual_intervention", "manual_reconciled", "manual_repair",
+    "repair_applied", "root_cause_fixed", "repair_comparison",
+)
 
 
 def _canonical(value: object) -> str:
@@ -61,11 +66,21 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return round(values[index], 3)
 
 
+def _report_text(value: object) -> str:
+    """Render validated operator text as one safe Markdown line."""
+    return (escape(str(value), quote=False).replace("\\", "\\\\")
+            .replace("`", "\\`").replace("*", "\\*").replace("_", "\\_")
+            .replace("[", "\\[").replace("]", "\\]").replace("|", "\\|"))
+
+
 def _markdown(snapshot: dict) -> str:
     counts = snapshot["counts"]
+    long_term = snapshot["long_term_counts"]
     duration = snapshot["duration_seconds"]
     rate = snapshot["final_failure_rate"]
     rate_text = "—" if rate is None else f"{rate * 100:.1f}%"
+    long_term_rate = snapshot["long_term_final_failure_rate"]
+    long_term_rate_text = "—" if long_term_rate is None else f"{long_term_rate * 100:.1f}%"
     coverage = "完整" if snapshot["coverage_complete"] else "不完整（仅统计持久工作流上线后数据）"
     trigger_text = "超过 10%（触发周报）" if snapshot["failure_rate_over_10_percent"] else "未超过 10%（周报不触发）"
     long_term_text = (
@@ -91,6 +106,7 @@ def _markdown(snapshot: dict) -> str:
         "- 本统计月无有效任务。" if snapshot["period_type"] == "monthly" and counts["N"] == 0 else "- 有效任务口径：仅纳入持久接管的真实 long_read 任务。",
         f"- 周报阈值：{trigger_text}；长期 ≤10% 目标仅在 N≥50、覆盖完整且无未结项时判定",
         f"- 长期最终失败率目标：{long_term_text}",
+        f"- 长期累计（工作流启用至数据水位）：N {long_term['N']} · S {long_term['S']} · F {long_term['F']} · 未结 {long_term['U'] + long_term['processing']} · F/N {long_term_rate_text}",
         "",
         "## 阶段故障与恢复",
         "",
@@ -116,8 +132,45 @@ def _markdown(snapshot: dict) -> str:
         "",
         f"- 已记录修复：{snapshot['repair_records']} 条；修复前后可比证据：{snapshot['repair_comparisons']} 组",
         "- 趋势比较从完整持久化窗口开始；上线前零散日志不补造历史基线。",
-        "",
     ])
+    repairs = [item for item in snapshot.get("repair_evidence", [])
+               if item["event_type"] in {"repair_applied", "root_cause_fixed"}]
+    comparisons = [item for item in snapshot.get("repair_evidence", [])
+                   if item["event_type"] == "repair_comparison"]
+    interventions = [item for item in snapshot.get("repair_evidence", [])
+                     if item["event_type"] in {"manual_intervention", "manual_reconciled", "manual_repair"}]
+    if repairs:
+        lines.extend(["", "### 已实施修复", ""])
+        lines.extend(
+            f"- `{_report_text(item['details']['repair_id'])}` · "
+            f"`{_report_text(item['details']['failure_fingerprint'])}`："
+            f"{_report_text(item['details']['summary'])}（变更 `{_report_text(item['details']['change_ref'])}`）"
+            for item in repairs
+        )
+    if comparisons:
+        lines.extend(["", "### 修复前后对比", ""])
+        for item in comparisons:
+            details = item["details"]
+            metric = details["metric"]
+            suffix = " 秒" if metric == "p90_duration_seconds" else "%"
+            before = details["before_value"] if suffix == " 秒" else details["before_value"] * 100
+            after = details["after_value"] if suffix == " 秒" else details["after_value"] * 100
+            lines.append(
+                f"- `{_report_text(details['repair_id'])}` · `{metric}`："
+                f"{before:g}{suffix} → {after:g}{suffix}；"
+                f"窗口 `{details['before_window']}`（n={details['before_sample_size']}）→ "
+                f"`{details['after_window']}`（n={details['after_sample_size']}）"
+            )
+    if interventions:
+        lines.extend(["", "### 人工介入明细", ""])
+        lines.extend(
+            f"- {item['event_type']}（{item['details']['category']}）："
+            f"{_report_text(item['details']['summary'])}"
+            + (f"（参考 `{_report_text(item['details']['reference'])}`）"
+               if item['details'].get("reference") else "")
+            for item in interventions
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -136,6 +189,9 @@ def render_report_card(snapshot: dict) -> dict:
         f"有效任务 **{counts['N']}** · 成功 **{counts['S']}** · 失败 **{counts['F']}** · "
         f"待核实 **{counts['U']}** · 处理中 **{counts['processing']}**\n\n"
         f"最终失败占比 **{rate_text}**\n\n"
+        f"自动恢复 **{snapshot['retry_attempts']}** 次 · 恢复后成功 **{snapshot['recovered_successes']}** · "
+        f"人工介入 **{snapshot['manual_interventions']}** · 已记录修复 **{snapshot['repair_records']}** "
+        f"（对比 {snapshot['repair_comparisons']} 组）\n\n"
         f"完整 Markdown 报告文件已作为配套消息发送；数据覆盖{'完整' if snapshot['coverage_complete'] else '尚未覆盖完整统计周期'}。"
     )
     return {
@@ -152,8 +208,11 @@ def render_report_card(snapshot: dict) -> dict:
 
 
 def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None = None) -> dict:
-    report_key, start, end = report_window(period, now=now)
+    report_now = (now or datetime.now(REPORT_TZ)).astimezone(REPORT_TZ)
+    report_key, start, end = report_window(period, now=report_now)
     start_epoch, end_epoch = _epoch(start), _epoch(end)
+    from long_read_workflow_retention import apply_retention, assert_report_window_retained
+    apply_retention(Path(state_dir), now=_epoch(report_now))
     with WorkflowStore(Path(state_dir)) as store:
         connection = store.connection
         prior = connection.execute("SELECT * FROM reports WHERE report_key=?", (report_key,)).fetchone()
@@ -163,12 +222,13 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
             result["snapshot"]["snapshot_sha256"] = result["snapshot_sha256"]
             result["reused"] = True
             return result
+        assert_report_window_retained(store, start_epoch)
         tracked_row = connection.execute("SELECT value FROM workflow_meta WHERE key='tracking_started_at'").fetchone()
         tracked_at = float(tracked_row["value"]) if tracked_row else start_epoch
         rows = connection.execute(
             "SELECT job_id,status,created_at,updated_at,payload_json FROM jobs "
             "WHERE created_at>=? AND created_at<? ORDER BY created_at,job_id",
-            (start_epoch, end_epoch),
+            (tracked_at, end_epoch),
         ).fetchall()
         jobs = []
         for row in rows:
@@ -176,7 +236,9 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
             if payload.get("synthetic") is True or payload.get("test_task") is True:
                 continue
             jobs.append({**dict(row), "payload": payload})
+        window_jobs = [row for row in jobs if start_epoch <= float(row["created_at"]) < end_epoch]
         job_ids = [row["job_id"] for row in jobs]
+        window_job_ids = [row["job_id"] for row in window_jobs]
         statuses_by_job = {row["job_id"]: "pending" for row in jobs}
         terminal_at: dict[str, float] = {}
         artifact_specs: dict[tuple[str, str], dict] = {}
@@ -186,14 +248,34 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
         if job_ids:
             marks = ",".join("?" for _ in job_ids)
             status_rows = connection.execute(
-                f"SELECT DISTINCT job_id FROM events WHERE job_id IN ({marks}) AND event_type='job_status'",
-                job_ids,
+                f"SELECT job_id,details_json,at,seq FROM events "
+                f"WHERE job_id IN ({marks}) AND event_type='job_status' AND at<? ORDER BY at,seq",
+                (*job_ids, end_epoch),
             ).fetchall()
             status_event_jobs = {row["job_id"] for row in status_rows}
-            event_rows = connection.execute(
-                f"SELECT seq,job_id,event_type,details_json,at FROM events WHERE job_id IN ({marks}) AND at>=? AND at<? ORDER BY at,seq",
-                (*job_ids, start_epoch, end_epoch),
+            for row in status_rows:
+                state = json.loads(row["details_json"]).get("status")
+                if isinstance(state, str):
+                    statuses_by_job[row["job_id"]] = state
+                    if state in {"succeeded", "failed"}:
+                        terminal_at[row["job_id"]] = float(row["at"])
+                    else:
+                        terminal_at.pop(row["job_id"], None)
+            if window_job_ids:
+                window_marks = ",".join("?" for _ in window_job_ids)
+                event_rows = connection.execute(
+                    f"SELECT seq,job_id,event_type,details_json,at FROM events "
+                    f"WHERE job_id IN ({window_marks}) AND event_type NOT IN ({','.join('?' for _ in RELIABILITY_EVENT_TYPES)}) "
+                    f"AND at>=? AND at<? ORDER BY at,seq",
+                    (*window_job_ids, *RELIABILITY_EVENT_TYPES, start_epoch, end_epoch),
+                ).fetchall()
+            reliability_rows = connection.execute(
+                f"SELECT seq,job_id,event_type,details_json,at FROM events "
+                f"WHERE job_id IN ({marks}) AND event_type IN ({','.join('?' for _ in RELIABILITY_EVENT_TYPES)}) "
+                f"AND at>=? AND at<? ORDER BY at,seq",
+                (*job_ids, *RELIABILITY_EVENT_TYPES, start_epoch, end_epoch),
             ).fetchall()
+            event_rows.extend(reliability_rows)
             artifacts = connection.execute(
                 f"SELECT job_id,artifact_key,kind FROM artifacts WHERE job_id IN ({marks})", job_ids
             ).fetchall()
@@ -202,19 +284,12 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
                 f"SELECT op_key,job_id,artifact_key,action FROM effects WHERE job_id IN ({marks})", job_ids
             ).fetchall()
             effect_specs = {row["op_key"]: dict(row) for row in effects}
+        event_rows.sort(key=lambda row: (float(row["at"]), int(row["seq"])))
         decoded_events = []
         for row in event_rows:
             event = dict(row)
             event["details"] = json.loads(event.pop("details_json"))
             decoded_events.append(event)
-            if event["event_type"] == "job_status":
-                state = event["details"].get("status")
-                if isinstance(state, str):
-                    statuses_by_job[event["job_id"]] = state
-                    if state in {"succeeded", "failed"}:
-                        terminal_at[event["job_id"]] = float(event["at"])
-                    else:
-                        terminal_at.pop(event["job_id"], None)
         # Retain conservative compatibility for old rows without status events.
         for row in jobs:
             job_id = row["job_id"]
@@ -223,15 +298,38 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
                 statuses_by_job[job_id] = row["status"]
                 if row["status"] in {"succeeded", "failed"}:
                     terminal_at[job_id] = float(row["updated_at"])
-        statuses = [statuses_by_job[row["job_id"]] for row in jobs]
+        statuses = [statuses_by_job[row["job_id"]] for row in window_jobs]
         counts = {
-            "N": len(jobs),
+            "N": len(window_jobs),
             "S": sum(status == "succeeded" for status in statuses),
             "F": sum(status == "failed" for status in statuses),
             "U": sum(status == "needs_review" for status in statuses),
         }
         counts["processing"] = counts["N"] - counts["S"] - counts["F"] - counts["U"]
         failure_rate = counts["F"] / counts["N"] if counts["N"] else None
+        cumulative_statuses = list(statuses_by_job.values())
+        archived_row = connection.execute(
+            "SELECT value FROM workflow_meta WHERE key='lifetime_archived_counts'"
+        ).fetchone()
+        archived = json.loads(archived_row["value"]) if archived_row else {"N": 0, "S": 0, "F": 0}
+        if (not isinstance(archived, dict)
+                or any(type(archived.get(key, 0)) is not int or archived.get(key, 0) < 0
+                       for key in ("N", "S", "F"))
+                or archived.get("S", 0) + archived.get("F", 0) > archived.get("N", 0)):
+            raise ValueError("retained lifetime counters are invalid")
+        long_term_counts = {
+            "N": int(archived.get("N", 0)) + len(jobs),
+            "S": int(archived.get("S", 0)) + sum(status == "succeeded" for status in cumulative_statuses),
+            "F": int(archived.get("F", 0)) + sum(status == "failed" for status in cumulative_statuses),
+            "U": sum(status == "needs_review" for status in cumulative_statuses),
+        }
+        long_term_counts["processing"] = (
+            long_term_counts["N"] - long_term_counts["S"]
+            - long_term_counts["F"] - long_term_counts["U"]
+        )
+        long_term_failure_rate = (
+            long_term_counts["F"] / long_term_counts["N"] if long_term_counts["N"] else None
+        )
         fingerprints: dict[str, int] = {}
         failed_effect_artifacts = set()
         stage_ms: list[float] = []
@@ -266,15 +364,30 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
                 reason = metadata.get("reason_code") or "unknown"
                 fingerprint = f"{stage}:{reason}"
                 fingerprints[fingerprint] = fingerprints.get(fingerprint, 0) + 1
-        recovered_successes = sum(statuses_by_job[row["job_id"]] == "succeeded" and row["job_id"] in retried_jobs for row in jobs)
+        recovered_successes = sum(statuses_by_job[row["job_id"]] == "succeeded" and row["job_id"] in retried_jobs for row in window_jobs)
         manual_interventions = sum(event["event_type"] in {"manual_intervention", "manual_reconciled", "manual_repair"} for event in decoded_events)
         repair_records = sum(event["event_type"] in {"repair_applied", "root_cause_fixed"} for event in decoded_events)
         repair_comparisons = sum(event["event_type"] == "repair_comparison" for event in decoded_events)
-        created_at_by_job = {row["job_id"]: float(row["created_at"]) for row in jobs}
-        durations = [max(0.0, terminal_at[job_id] - created_at_by_job[job_id]) for job_id in terminal_at]
+        repair_evidence = [
+            {"event_type": event["event_type"], "job_id": event["job_id"],
+             "at": float(event["at"]), "details": event["details"]}
+            for event in decoded_events
+            if event["event_type"] in {
+                "manual_intervention", "manual_reconciled", "manual_repair",
+                "repair_applied", "root_cause_fixed", "repair_comparison",
+            }
+        ]
+        created_at_by_job = {row["job_id"]: float(row["created_at"]) for row in window_jobs}
+        durations = [max(0.0, terminal_at[job_id] - created_at_by_job[job_id])
+                     for job_id in terminal_at if job_id in created_at_by_job]
         coverage_complete = start_epoch >= tracked_at
         has_unresolved = counts["U"] + counts["processing"] > 0
-        long_term_eligible = counts["N"] >= 50 and coverage_complete and not has_unresolved
+        long_term_has_unresolved = long_term_counts["U"] + long_term_counts["processing"] > 0
+        long_term_coverage_complete = tracked_row is not None and tracked_at <= end_epoch
+        long_term_eligible = (
+            long_term_counts["N"] >= 50 and long_term_coverage_complete
+            and not long_term_has_unresolved
+        )
         snapshot = {
             "schema": "read-x-long-read-reliability-report/v1", "version": 1,
             "report_key": report_key, "period_type": period,
@@ -286,12 +399,17 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
             "data_watermark": end_epoch, "data_watermark_local": end.strftime("%Y-%m-%d %H:%M %Z"),
             "tracking_started_at": tracked_at, "coverage_complete": coverage_complete,
             "counts": counts, "final_failure_rate": failure_rate,
+            "long_term_counts": long_term_counts,
+            "long_term_final_failure_rate": long_term_failure_rate,
+            "long_term_coverage_complete": long_term_coverage_complete,
+            "long_term_has_unresolved": long_term_has_unresolved,
             "failure_rate_over_10_percent": bool(counts["N"] and failure_rate > 0.10),
             "has_unresolved": has_unresolved,
             "long_term_target_eligible": long_term_eligible,
-            "long_term_target_met": bool(long_term_eligible and failure_rate is not None and failure_rate <= 0.10),
+            "long_term_target_met": bool(long_term_eligible and long_term_failure_rate is not None and long_term_failure_rate <= 0.10),
             "retry_attempts": retry_attempts, "recovered_successes": recovered_successes,
             "manual_interventions": manual_interventions,
+            "repair_evidence": repair_evidence,
             "failure_fingerprints": [
                 {"fingerprint": key, "count": value}
                 for key, value in sorted(fingerprints.items(), key=lambda item: (-item[1], item[0]))[:10]

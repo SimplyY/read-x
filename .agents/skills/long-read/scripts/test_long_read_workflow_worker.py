@@ -5,16 +5,40 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 
 import long_read_workflow_worker as worker
 import long_read_document_supplement as document_supplement
-from long_read_workflow_store import WorkflowStore
+from long_read_workflow_store import WORKFLOW_CONTRACT_VERSION, WorkflowStore, workflow_payload_issue
 
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def admission_payload(*, app_id="app-test", source_message_id="om_test") -> dict:
+    return {
+        "schema": "long-read-submission/v1",
+        "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
+        "snapshot_sha256": "a" * 64,
+        "inputs": {
+            name: {"path": f"/private/tmp/{name}", "sha256": "b" * 64}
+            for name in ("source.md", "evidence.json", "scoring-result.json", "score-gate.json", "trigger-context.json")
+        },
+        "route": "long_read", "score_status": "scored",
+        "questions": [],
+        "trigger": {
+            "feishuProfile": "deep", "identity": "bot", "appId": app_id,
+            "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_test",
+            "senderType": "user", "sourceMessageId": source_message_id,
+        },
+    }
 
 
 def fixture(root: Path) -> tuple[Path, str]:
@@ -35,7 +59,7 @@ def fixture(root: Path) -> tuple[Path, str]:
             "interest_score": 0.6, "interest_label": "高兴趣",
         }, ensure_ascii=False).encode(),
         "score-gate.json": b'{"message_id":"om_score"}',
-        "trigger-context.json": b'{"chatType":"group","senderId":"ou_test","feishuProfile":"deep","identity":"bot"}',
+        "trigger-context.json": b'{"appId":"app-test","chatType":"p2p","chatId":"oc_private","privateChatId":"oc_private","senderId":"ou_test","senderType":"user","feishuProfile":"deep","identity":"bot"}',
         "question-01-ljg-think.md": "这个机制的边界是什么？".encode(),
     }
     manifest = json.dumps({name: {"sha256": digest(value), "bytes": len(value)} for name, value in sorted(values.items())},
@@ -52,10 +76,16 @@ def fixture(root: Path) -> tuple[Path, str]:
     snapshot.chmod(0o700)
     payload = {
         "schema": "long-read-submission/v1",
+        "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
         "snapshot_sha256": snapshot_digest,
         "inputs": {name: {"path": str(snapshot / name), "sha256": digest(value)} for name, value in values.items()},
         "questions": [{"skill": "ljg-think", "file": "question-01-ljg-think.md"}],
         "route": "long_read", "score_status": "scored", "artifact_plan_finalized": False,
+        "trigger": {
+            "feishuProfile": "deep", "identity": "bot", "appId": "app-test",
+            "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_test",
+            "senderType": "user", "sourceMessageId": "om_test",
+        },
     }
     artifacts = [
         {"key": "analysis:article-decode", "kind": "analysis"},
@@ -64,12 +94,17 @@ def fixture(root: Path) -> tuple[Path, str]:
         {"key": "analysis:ljg-think", "kind": "analysis"},
         {"key": "main-document", "kind": "document"},
         {"key": "document-notification", "kind": "message"},
+        {"key": "content-review-notification", "kind": "message", "required": False},
+        {"key": "document-publish-review-notification", "kind": "message", "required": False},
+        {"key": "final-notification", "kind": "message"},
+        {"key": "core-image-recovery-notification", "kind": "message", "required": False},
         {"key": "core-image", "kind": "image"},
         {"key": "core-image-insert", "kind": "image_insert"},
         {"key": "core-image-send", "kind": "message"},
         {"key": "munger-image", "kind": "image", "required": False},
         {"key": "munger-image-insert", "kind": "image_insert", "required": False},
         {"key": "munger-image-send", "kind": "message", "required": False},
+        {"key": "munger-image-recovery-notification", "kind": "message", "required": False},
     ]
     with WorkflowStore(state) as store:
         job = store.submit(payload, app_id="app-test", source_message_id="om_test", artifacts=artifacts)
@@ -144,6 +179,82 @@ def asset_fetcher(prompt_id: str) -> dict:
     }
 
 
+def fake_effect(store, lease, artifact_key, action, request_sha):
+    effect = store.find_effect(lease.job_id, artifact_key, action)
+    if effect is None:
+        effect = store.prepare_effect(lease, artifact_key, action, request_sha)
+    if effect["status"] == "prepared":
+        effect = store.begin_effect(lease, effect["op_key"])
+        store.finish_effect(lease, effect["op_key"], "confirmed", remote_id=f"remote-{artifact_key}-{action}",
+                            metadata={"verification": "fake-readback"})
+    return store.get_effect(effect["op_key"])
+
+
+def fake_notifications(*, event, store, lease, payload, root, **kwargs):
+    if event == "document":
+        artifact_key, action = "document-notification", "message-send"
+    elif event == "content_review":
+        artifact_key, action = "content-review-notification", "message-send"
+    elif event == "document_review":
+        artifact_key, action = "document-publish-review-notification", "message-send"
+    elif event == "image_recovery":
+        artifact_key = f"{kwargs['image_key']}-recovery-notification"
+        retries = kwargs.get("retries_used", 0)
+        action = "message-send" if not retries else f"message-send:retry-{retries}"
+    else:
+        artifact_key, action = "final-notification", "message-send"
+    effect = fake_effect(store, lease, artifact_key, action,
+                         digest(json.dumps({"event": event, "args": {key: value for key, value in kwargs.items()
+                                                                      if key != "clock"}}, sort_keys=True).encode()))
+    store.set_artifact(lease, artifact_key, "confirmed", metadata={"verification": "fake-readback"})
+    return {"status": "confirmed", "message_id": effect.get("remote_id")}
+
+
+def fake_image_delivery(*, store, lease, image_key, **kwargs):
+    artifact = next(item for item in store.artifacts(lease.job_id) if item["artifact_key"] == image_key)
+    round_number = artifact["retry_count"]
+    for key, base_action in ((image_key, "image-generate"),
+                             (f"{image_key}-insert", "image-block-create"),
+                             (f"{image_key}-insert", "image-upload"),
+                             (f"{image_key}-insert", "image-block-patch"),
+                             (f"{image_key}-send", "message-image-upload"),
+                             (f"{image_key}-send", "message-send")):
+        previous = store.latest_effect_for_action(lease.job_id, key, base_action)
+        if previous and previous["status"] == "confirmed":
+            continue
+        action = base_action if round_number == 0 else f"{base_action}:retry-{round_number}"
+        fake_effect(store, lease, key, action, digest(f"{key}:{action}".encode()))
+    store.set_artifact(lease, image_key, "confirmed", metadata={"verification": "fake-readback"})
+    store.set_artifact(lease, f"{image_key}-insert", "confirmed", metadata={"verification": "fake-readback"})
+    store.set_artifact(lease, f"{image_key}-send", "confirmed", metadata={"verification": "fake-readback"})
+    return {"status": "confirmed", "image": image_key}
+
+
+def fake_retrying_image_delivery(*, store, lease, clock, image_key, **kwargs):
+    artifact = next(item for item in store.artifacts(lease.job_id) if item["artifact_key"] == image_key)
+    if image_key == "core-image" and artifact["retry_count"] == 0 and artifact["status"] == "pending":
+        effect = store.find_effect(lease.job_id, image_key, "image-generate")
+        if effect is None:
+            effect = store.prepare_effect(lease, image_key, "image-generate", digest(b"first-image-generation"))
+        effect = store.begin_effect(lease, effect["op_key"])
+        store.finish_effect(lease, effect["op_key"], "failed", metadata={
+            "failure_stage": "image-generate", "reason_code": "test-temporary-failure",
+        })
+        retry_at = float(clock()) + 240
+        store.set_artifact(lease, image_key, "failed", metadata={
+            "failure_stage": "image-generate", "reason_code": "test-temporary-failure",
+            "retryable": True, "next_retry_at": retry_at,
+        })
+        return {"status": "retry_scheduled", "retry_at": retry_at,
+                "failure_stage": "image-generate", "reason_code": "test-temporary-failure"}
+    if image_key == "core-image" and artifact["status"] == "failed":
+        retry_at = artifact["metadata"]["next_retry_at"]
+        if float(clock()) < retry_at:
+            return {"status": "retry_scheduled", "retry_at": retry_at}
+        store.consume_image_retry(lease, image_key)
+    return fake_image_delivery(store=store, lease=lease, image_key=image_key, **kwargs)
+
+
 class FakeDocumentCompiler:
     def __init__(self, *, publish_status: str = "confirmed", recovery_status: str = "uncertain"):
         self.publish_status = publish_status
@@ -183,26 +294,344 @@ class WorkerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_content_checkpoints_persist_but_do_not_claim_delivery_complete(self):
+    def test_deferred_notification_outbox_is_scheduled_while_job_needs_review(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "deferred-notice")
+            request = store.prepare_effect(
+                lease, "content-review-notification", "message-send", digest(b"notice"),
+            )
+            store.set_artifact(lease, "content-review-notification", "pending", metadata={
+                "failure_stage": "notification-send", "reason_code": "message-rate-limit",
+                "next_retry_at": 1060.0,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, 1059.0))
+            self.assertTrue(worker._job_is_due(store, job, 1060.0))
+            self.assertEqual(store.get_effect(request["op_key"])["status"], "prepared")
+
+    def test_failed_notification_effect_carries_retry_due_time_through_crash_window(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "crash-window-notice")
+            request = store.prepare_effect(
+                lease, "document-notification", "message-send", digest(b"notice"),
+            )
+            attempt = store.begin_effect(lease, request["op_key"])
+            now = time.time()
+            retry_at = now + worker.workflow_notifications.NOTIFICATION_RETRY_DELAY_SECONDS
+            store.finish_effect(lease, attempt["op_key"], "failed", metadata={
+                "reason_code": "api-rejected", "retryable": True, "next_retry_at": retry_at,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+
+            artifact = next(item for item in store.artifacts(self.job_id)
+                            if item["artifact_key"] == "document-notification")
+            self.assertEqual(artifact["status"], "failed")
+            self.assertEqual(artifact["metadata"]["next_retry_at"], retry_at)
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, retry_at - 1))
+            self.assertTrue(worker._job_is_due(store, job, retry_at))
+
+    def test_exhausted_notification_outbox_is_scheduled_only_for_paced_readback(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "exhausted-notice")
+            request = store.prepare_effect(
+                lease, "document-notification", "message-send", digest(b"notice"),
+            )
+            for _ in range(worker.workflow_notifications.NOTIFICATION_RETRY_LIMIT + 1):
+                attempt = store.begin_effect(lease, request["op_key"])
+                store.finish_effect(
+                    lease, attempt["op_key"], "failed",
+                    metadata={"reason_code": "api-rejected", "retryable": True,
+                              "next_reconcile_at": time.time() + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS},
+                )
+            now = time.time()
+            store.set_artifact(lease, "document-notification", "failed", metadata={
+                "reason_code": "notification-retry-exhausted",
+                "next_reconcile_at": now + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, now + 1))
+            self.assertTrue(worker._job_is_due(
+                store, job, now + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS,
+            ))
+            self.assertEqual(store.get_effect(request["op_key"])["status"], "failed")
+
+    def test_failed_notification_outbox_retries_only_after_persisted_backoff(self):
+        now = time.time()
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "retryable-notice")
+            request = store.prepare_effect(
+                lease, "document-notification", "message-send", digest(b"notice"),
+            )
+            attempt = store.begin_effect(lease, request["op_key"])
+            retry_at = now + worker.workflow_notifications.NOTIFICATION_RETRY_DELAY_SECONDS
+            store.finish_effect(lease, attempt["op_key"], "failed", metadata={
+                "reason_code": "api-rejected", "retryable": True, "next_retry_at": retry_at,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, retry_at - 1))
+            self.assertTrue(worker._job_is_due(store, job, retry_at))
+
+    def test_uncertain_notification_history_is_reconciled_on_its_persisted_due_time(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "uncertain-notice")
+            request = store.prepare_effect(
+                lease, "document-notification", "message-send", digest(b"notice"),
+            )
+            attempt = store.begin_effect(lease, request["op_key"])
+            store.finish_effect(
+                lease, attempt["op_key"], "uncertain",
+                metadata={"reason_code": "send-response-unknown"},
+            )
+            now = time.time()
+            store.set_artifact(lease, "document-notification", "uncertain", metadata={
+                "reason_code": "notification-history-incomplete",
+                "next_reconcile_at": now + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, now + 1))
+            self.assertTrue(worker._job_is_due(
+                store, job, now + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS,
+            ))
+
+    def test_retryable_notification_with_uncertain_history_is_scheduled_before_budget_expires(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "retryable-uncertain-notice")
+            request = store.prepare_effect(
+                lease, "document-notification", "message-send", digest(b"notice"),
+            )
+            attempt = store.begin_effect(lease, request["op_key"])
+            now = time.time()
+            store.finish_effect(lease, attempt["op_key"], "failed", metadata={
+                "reason_code": "api-rejected", "retryable": True,
+                "next_retry_at": now + worker.workflow_notifications.NOTIFICATION_RETRY_DELAY_SECONDS,
+            })
+            reconcile_at = now + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS
+            store.set_artifact(lease, "document-notification", "uncertain", metadata={
+                "reason_code": "notification-history-incomplete",
+                "next_reconcile_at": reconcile_at,
+            })
+            store.set_status(lease, "needs_review")
+            store.release_lease(lease)
+            job = store.get_job(self.job_id)
+
+            self.assertFalse(worker._job_is_due(store, job, reconcile_at - 1))
+            self.assertTrue(worker._job_is_due(store, job, reconcile_at))
+
+    def test_explicit_worker_refuses_unadmitted_legacy_job_without_claiming_it(self):
+        state = Path(self.temporary.name) / "legacy-state"
+        with WorkflowStore(state) as store:
+            job = store.submit({"schema": "long-read-submission/v1"}, app_id="legacy-app",
+                               artifacts=[{"key": "old-analysis", "kind": "analysis"}])
+            before_events = len(store.events(job["job_id"]))
+            self.assertFalse(worker._job_is_due(store, store.get_job(job["job_id"]), time.time()))
+        result = worker.process_job(
+            state, job["job_id"],
+            bridge_fn=lambda *_args, **_kwargs: self.fail("legacy job must not submit to Bridge"),
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason_code"], "unadmitted-legacy-job")
+        with WorkflowStore(state) as store:
+            current = store.get_job(job["job_id"])
+            self.assertEqual(current["status"], "pending")
+            self.assertIsNone(current["lease_owner"])
+            self.assertEqual(len(store.events(job["job_id"])), before_events)
+
+    def test_current_contract_marker_does_not_admit_incomplete_payload(self):
+        state = Path(self.temporary.name) / "incomplete-state"
+        with WorkflowStore(state) as store:
+            job = store.submit({
+                "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
+                "schema": "long-read-submission/v1",
+                "route": "long_read",
+                "score_status": "scored",
+            }, app_id="incomplete-app", artifacts=[{"key": "old-analysis", "kind": "analysis"}])
+            before_events = len(store.events(job["job_id"]))
+            self.assertFalse(worker._job_is_due(store, store.get_job(job["job_id"]), time.time()))
+        result = worker.process_job(
+            state, job["job_id"],
+            bridge_fn=lambda *_args, **_kwargs: self.fail("incomplete payload must not submit to Bridge"),
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid-workflow-payload")
+        with WorkflowStore(state) as store:
+            current = store.get_job(job["job_id"])
+            self.assertEqual(current["status"], "pending")
+            self.assertIsNone(current["lease_owner"])
+            self.assertEqual(len(store.events(job["job_id"])), before_events)
+
+    def test_current_contract_marker_does_not_admit_traversal_question_or_mismatched_source(self):
+        state = Path(self.temporary.name) / "malformed-question-state"
+        payload = admission_payload(app_id="malformed-app", source_message_id="om_store-source")
+        payload["inputs"]["question-01-ljg-think.md"] = {
+            "path": "/private/tmp/question-01-ljg-think.md", "sha256": "c" * 64,
+        }
+        payload["questions"] = [{"skill": "../outside", "file": "question-01-ljg-think.md"}]
+        self.assertEqual(workflow_payload_issue(
+            payload, app_id="malformed-app", source_message_id="om_store-source",
+        ), "invalid-workflow-payload")
+        valid = admission_payload(app_id="malformed-app", source_message_id="om_store-source")
+        self.assertIsNone(workflow_payload_issue(
+            valid, app_id="malformed-app", source_message_id="om_store-source",
+        ))
+        self.assertEqual(workflow_payload_issue(
+            valid, app_id="malformed-app", source_message_id="om_other-source",
+        ), "invalid-workflow-payload")
+        with WorkflowStore(state) as store:
+            job = store.submit(payload, app_id="malformed-app", source_message_id="om_store-source",
+                               artifacts=[{"key": "old-analysis", "kind": "analysis"}])
+            before_events = len(store.events(job["job_id"]))
+            self.assertFalse(worker._job_is_due(store, store.get_job(job["job_id"]), time.time()))
+        result = worker.process_job(
+            state, job["job_id"],
+            bridge_fn=lambda *_args, **_kwargs: self.fail("mismatched payload must not submit to Bridge"),
+        )
+        self.assertEqual(result["reason_code"], "invalid-workflow-payload")
+        with WorkflowStore(state) as store:
+            current = store.get_job(job["job_id"])
+            self.assertEqual(current["status"], "pending")
+            self.assertIsNone(current["lease_owner"])
+            self.assertEqual(len(store.events(job["job_id"])), before_events)
+
+    def test_legacy_admitted_canary_without_explicit_identity_remains_recoverable(self):
+        payload = admission_payload()
+        payload["test_task"] = True
+        payload["trigger"].pop("identity")
+        payload["trigger"]["readxCanary"] = True
+        self.assertIsNone(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ))
+
+    def test_canary_marker_is_required_for_test_tasks_and_must_match(self):
+        payload = admission_payload()
+        payload["test_task"] = True
+        self.assertEqual(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ), "invalid-workflow-payload")
+        payload["trigger"]["readxCanary"] = False
+        self.assertEqual(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ), "invalid-workflow-payload")
+        payload["trigger"]["readxCanary"] = True
+        self.assertIsNone(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ))
+
+    def test_test_task_without_canary_marker_is_rejected_before_lease(self):
+        state = Path(self.temporary.name) / "unmarked-canary-state"
+        payload = admission_payload()
+        payload["test_task"] = True
+        with WorkflowStore(state) as store:
+            job = store.submit(payload, app_id="app-test", source_message_id="om_test",
+                               artifacts=[{"key": "analysis", "kind": "analysis"}])
+            before_events = len(store.events(job["job_id"]))
+        result = worker.process_job(
+            state, job["job_id"],
+            bridge_fn=lambda *_args, **_kwargs: self.fail("unmarked canary must not submit to Bridge"),
+            observe_fn=lambda *_args, **_kwargs: self.fail("unmarked canary must not observe Bridge"),
+        )
+        self.assertEqual(result["reason_code"], "invalid-workflow-payload")
+        with WorkflowStore(state) as store:
+            current = store.get_job(job["job_id"])
+            self.assertEqual(current["status"], "pending")
+            self.assertIsNone(current["lease_owner"])
+            self.assertEqual(len(store.events(job["job_id"])), before_events)
+
+    def test_persisted_trigger_source_mismatch_is_rejected_before_lease(self):
+        state = Path(self.temporary.name) / "source-mismatch-state"
+        payload = admission_payload(app_id="source-mismatch-app", source_message_id="om_payload-source")
+        with WorkflowStore(state) as store:
+            job = store.submit(payload, app_id="source-mismatch-app", source_message_id="om_database-source",
+                               artifacts=[{"key": "analysis", "kind": "analysis"}])
+            before_events = len(store.events(job["job_id"]))
+        result = worker.process_job(
+            state, job["job_id"],
+            bridge_fn=lambda *_args, **_kwargs: self.fail("mismatched source must not submit to Bridge"),
+            observe_fn=lambda *_args, **_kwargs: self.fail("mismatched source must not observe Bridge"),
+            prompt_fetcher=lambda *_args, **_kwargs: self.fail("mismatched source must not fetch Prompt"),
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid-workflow-payload")
+        with WorkflowStore(state) as store:
+            current = store.get_job(job["job_id"])
+            self.assertEqual(current["status"], "pending")
+            self.assertIsNone(current["lease_owner"])
+            self.assertEqual(len(store.events(job["job_id"])), before_events)
+
+    def test_damaged_json_job_does_not_abort_due_scan(self):
+        state = Path(self.temporary.name) / "damaged-json-state"
+        with WorkflowStore(state) as store:
+            damaged = store.submit({"legacy": True}, app_id="damaged-app",
+                                   artifacts=[{"key": "old-analysis", "kind": "analysis"}])
+            store.connection.execute("UPDATE jobs SET payload_json='{' WHERE job_id=?", (damaged["job_id"],))
+            good = store.submit(admission_payload(app_id="good-app"), app_id="good-app", source_message_id="om_test",
+                                artifacts=[{"key": "analysis", "kind": "analysis"}])
+            # Force the damaged legacy row to sort ahead of the valid candidate.
+            store.connection.execute("UPDATE jobs SET created_at=0 WHERE job_id=?", (damaged["job_id"],))
+
+        calls = []
+        with patch.object(worker, "process_job", side_effect=lambda _state, job_id, **_kwargs:
+                          calls.append(job_id) or {"status": "blocked", "job_id": job_id}):
+            worker.run_once(state)
+        self.assertEqual(calls, [good["job_id"]])
+
+    def test_due_worker_retries_a_deferred_recovery_notice_before_the_image_retry(self):
+        state = Path(self.temporary.name) / "deferred-notice-state"
+        with WorkflowStore(state, clock=lambda: 1000.0) as store:
+            job = store.submit(admission_payload(app_id="app"), app_id="app", artifacts=[
+                {"key": "core-image", "kind": "image"},
+                {"key": "core-image-recovery-notification", "kind": "message", "required": False},
+                {"key": "final-notification", "kind": "message"},
+            ])
+            lease = store.acquire_lease(job["job_id"], "test", 3600)
+            store.set_artifact(lease, "core-image", "failed", metadata={
+                "retryable": True, "next_retry_at": 1240.0,
+                "failure_stage": "image-generate", "reason_code": "temporary",
+            })
+            store.prepare_effect(
+                lease, "core-image-recovery-notification", "message-send", "a" * 64,
+            )
+            store.set_artifact(lease, "core-image-recovery-notification", "pending", metadata={
+                "next_retry_at": 1060.0, "reason_code": "message-rate-limit",
+            })
+            store.set_status(lease, "waiting")
+            store.release_lease(lease)
+            current = store.get_job(job["job_id"])
+            self.assertFalse(worker._job_is_due(store, current, 1059.0))
+            self.assertTrue(worker._job_is_due(store, current, 1060.0))
+
+    def test_worker_confirms_the_full_required_delivery_contract(self):
         bridge = FakeBridge()
         result = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
         )
-        self.assertEqual(result["status"], "waiting_for_delivery_stages")
-        self.assertFalse(result["delivery_complete"])
-        self.assertEqual(result["next_stage"], "document_compiler_publish_and_images")
+        self.assertEqual(result["status"], "succeeded", result)
+        self.assertTrue(result["delivery_complete"])
         self.assertEqual(len(bridge.submissions), 4)
         self.assertTrue(all(item[1] == "read-x:long-read-text" for item in bridge.submissions))
         self.assertTrue(all(item[2] == "https://chatgpt.com/" for item in bridge.submissions))
         with WorkflowStore(self.state) as store:
             job = store.get_job(self.job_id)
-            self.assertEqual(job["status"], "waiting")
+            self.assertEqual(job["status"], "succeeded")
             self.assertEqual({item["status"] for item in store.artifacts(self.job_id) if item["artifact_key"].startswith("analysis:")}, {"confirmed"})
-            effects = store.connection.execute("SELECT request_id,status FROM effects WHERE job_id=?", (self.job_id,)).fetchall()
-            self.assertEqual(len(effects), 5)
+            effects = store.connection.execute("SELECT request_id,status,action,metadata_json FROM effects WHERE job_id=?", (self.job_id,)).fetchall()
+            bridge_effects = [item for item in effects if item["action"] == "bridge-submit"]
+            self.assertEqual(len(bridge_effects), 4)
             self.assertTrue(all(item["status"] == "confirmed" for item in effects))
-            self.assertEqual(len({item["request_id"] for item in effects}), 5)
+            self.assertTrue(all(isinstance(json.loads(item["metadata_json"]).get("duration_ms"), int)
+                                for item in effects))
+            self.assertEqual(len({item["request_id"] for item in bridge_effects}), 4)
             self.assertTrue(job["payload"]["artifact_plan_finalized"])
             self.assertIn("analysis:document-supplement", job["payload"]["required_artifacts"])
             self.assertEqual({item["artifact_key"]: item for item in store.artifacts(self.job_id)}
@@ -217,13 +646,239 @@ class WorkerTests(unittest.TestCase):
         for path in (self.state / "jobs" / self.job_id / "analysis").iterdir():
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_unconfirmed_required_image_never_sends_final_success(self):
+        bridge = FakeBridge()
+        notifications = []
+
+        def uncertain_image(*, image_key, **_kwargs):
+            self.assertEqual(image_key, "core-image")
+            return {
+                "status": "uncertain", "failure_stage": "image-insert",
+                "reason_code": "image-insert-result-unconfirmed",
+            }
+
+        def record_notification(**kwargs):
+            notifications.append(kwargs["event"])
+            return fake_notifications(**kwargs)
+
+        result = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            image_delivery_fn=uncertain_image, notification_fn=record_notification,
+        )
+        self.assertEqual(result["status"], "needs_review", result)
+        self.assertEqual(notifications, ["document", "image_recovery"])
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            self.assertEqual(job["status"], "needs_review")
+            self.assertIsNone(store.find_effect(self.job_id, "final-notification", "message-send"))
+            artifacts = {item["artifact_key"]: item for item in store.artifacts(self.job_id)}
+            self.assertEqual(artifacts["core-image"]["status"], "uncertain")
+
+    def test_subprocess_kill_after_bridge_side_effect_recovers_same_request(self):
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+            source_sha = digest(source_path.read_bytes())
+        output = self.state / "jobs" / self.job_id / "analysis" / "article-decode.md"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        marker = Path(self.temporary.name) / "remote-effect.json"
+        child = r'''
+import hashlib, json, os, sys, threading
+from pathlib import Path
+sys.path.insert(0, sys.argv[4])
+from long_read_workflow_store import WorkflowStore
+from long_read_workflow_worker import _run_text_branch
+state, job_id, marker, scripts = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+prompt = "durable subprocess request"
+prompt_sha = hashlib.sha256(prompt.encode()).hexdigest()
+with WorkflowStore(state) as store:
+    lease = store.acquire_lease(job_id, "killed-child", 0.05)
+    job = store.get_job(job_id)
+    source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+    source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    def remote_side_effect(_prompt, **kwargs):
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"request_id": kwargs["request_id"]}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os._exit(86)
+    _run_text_branch(store=store, lease=lease, lock=threading.RLock(),
+        artifact_key="analysis:article-decode", output=Path(sys.argv[5]),
+        source_sha=source_sha, prompt=prompt, validate=lambda value: value,
+        prompt_assets=[], bridge_fn=remote_side_effect)
+'''
+        child_result = subprocess.run(
+            [sys.executable, "-c", child, str(self.state), self.job_id,
+             str(marker), str(Path(__file__).parent), str(output)],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(child_result.returncode, 86, child_result.stderr)
+        self.assertTrue(marker.is_file())
+        remote = json.loads(marker.read_text(encoding="utf-8"))
+        time.sleep(0.08)
+
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "parent-recovery", 30)
+            observed = []
+            text = "# Recovered after a real child-process exit\n"
+            def observe(**kwargs):
+                observed.append(kwargs["original_run_id"])
+                self.assertEqual(kwargs["original_run_id"], remote["request_id"])
+                return {
+                    "status": "succeeded", "runId": remote["request_id"], "format": "markdown",
+                    "verification": "live-dom+snapshot", "submissionConfirmed": True,
+                    "conversationUrl": f"https://chatgpt.com/c/{remote['request_id']}",
+                    "actualConversationUrl": f"https://chatgpt.com/c/{remote['request_id']}",
+                    "text": text, "outputSha256": digest(text.encode()),
+                }
+            result = worker._run_text_branch(
+                store=store, lease=lease, lock=threading.RLock(),
+                artifact_key="analysis:article-decode", output=output,
+                source_sha=digest(Path(job["payload"]["inputs"]["source.md"]["path"]).read_bytes()),
+                prompt=None, prompt_sha=digest(b"durable subprocess request"),
+                validate=lambda value: value, observe_fn=observe,
+                bridge_fn=lambda *_args, **_kwargs: self.fail("uncertain work must be observed, never resubmitted"),
+            )
+            store.release_lease(lease)
+            persisted = store.find_effect(self.job_id, "analysis:article-decode", "bridge-submit")
+        self.assertEqual(result["status"], "confirmed", result)
+        self.assertTrue(result["recovered"])
+        self.assertEqual(observed, [remote["request_id"]])
+        self.assertEqual(persisted["status"], "confirmed")
+        self.assertEqual(persisted["request_id"], remote["request_id"])
+        self.assertEqual(persisted["attempts"], 1)
+        self.assertEqual(marker.read_text(encoding="utf-8"), json.dumps(remote))
+        self.assertEqual(output.read_text(encoding="utf-8"), text.strip())
+
+    def test_image_retry_waits_four_minutes_and_resumes_without_repeating_successful_stages(self):
+        bridge = FakeBridge()
+        now = [1000.0]
+        kwargs = {
+            "bridge_fn": bridge.run, "observe_fn": bridge.observe,
+            "prompt_fetcher": asset_fetcher, "document_compiler": FakeDocumentCompiler(),
+            "image_delivery_fn": fake_retrying_image_delivery,
+            "notification_fn": fake_notifications, "clock": lambda: now[0],
+        }
+        first = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(first["status"], "waiting", first)
+        self.assertEqual(first["next_retry_at"], 1240.0)
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            self.assertFalse(worker._job_is_due(store, job, 1239.0))
+            self.assertTrue(worker._job_is_due(store, job, 1240.0))
+            self.assertEqual(next(item for item in store.artifacts(self.job_id)
+                                  if item["artifact_key"] == "munger-image")["status"], "confirmed")
+        now[0] = 1240.0
+        second = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(second["status"], "succeeded", second)
+        with WorkflowStore(self.state) as store:
+            core = {item["artifact_key"]: item for item in store.artifacts(self.job_id)}
+            self.assertEqual(core["core-image"]["retry_count"], 1)
+            self.assertEqual(core["core-image"]["status"], "confirmed")
+            self.assertEqual(core["munger-image"]["status"], "confirmed")
+            effects = store.effects_for(self.job_id, "core-image")
+            self.assertEqual({item["action"] for item in effects}, {"image-generate", "image-generate:retry-1"})
+
+    def test_rate_deferred_recovery_notice_is_persisted_and_sent_before_image_retry(self):
+        bridge = FakeBridge()
+        now = [1000.0]
+        notification_calls = []
+
+        def notification_fn(*, event, store, lease, payload, root, **kwargs):
+            if event == "image_recovery":
+                notification_calls.append(float(now[0]))
+                if len(notification_calls) == 1:
+                    image_key = kwargs["image_key"]
+                    retries = kwargs.get("retries_used", 0)
+                    artifact_key = f"{image_key}-recovery-notification"
+                    action = "message-send" if not retries else f"message-send:retry-{retries}"
+                    request = {key: value for key, value in kwargs.items() if key != "clock"}
+                    store.prepare_effect(
+                        lease, artifact_key, action,
+                        digest(json.dumps({"event": event, "args": request}, sort_keys=True).encode()),
+                    )
+                    return {"status": "deferred", "reason_code": "message-rate-limit"}
+            return fake_notifications(event=event, store=store, lease=lease,
+                                     payload=payload, root=root, **kwargs)
+
+        kwargs = {
+            "bridge_fn": bridge.run, "observe_fn": bridge.observe,
+            "prompt_fetcher": asset_fetcher, "document_compiler": FakeDocumentCompiler(),
+            "image_delivery_fn": fake_retrying_image_delivery,
+            "notification_fn": notification_fn, "clock": lambda: now[0],
+        }
+        first = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(first["status"], "waiting", first)
+        self.assertEqual(first["stage"], "image-recovery-notification")
+        self.assertEqual(first["next_retry_at"], 1060.0)
+        with WorkflowStore(self.state) as store:
+            artifacts = {item["artifact_key"]: item for item in store.artifacts(self.job_id)}
+            self.assertEqual(artifacts["core-image-recovery-notification"]["status"], "pending")
+            self.assertEqual(artifacts["core-image-recovery-notification"]["metadata"]["next_retry_at"], 1060.0)
+            job = store.get_job(self.job_id)
+            self.assertTrue(worker._job_is_due(store, job, 1059.0))
+            self.assertTrue(worker._job_is_due(store, job, 1060.0))
+
+        now[0] = 1059.0
+        second = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(second["status"], "waiting", second)
+        self.assertEqual(second["next_retry_at"], 1060.0)
+        self.assertEqual(notification_calls, [1000.0])
+
+        now[0] = 1060.0
+        third = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(third["status"], "waiting", third)
+        self.assertEqual(third["next_retry_at"], 1240.0)
+        self.assertEqual(notification_calls, [1000.0, 1060.0, 1060.0])
+
+        now[0] = 1240.0
+        fourth = worker.process_job(self.state, self.job_id, **kwargs)
+        self.assertEqual(fourth["status"], "succeeded", fourth)
+        with WorkflowStore(self.state) as store:
+            artifacts = {item["artifact_key"]: item for item in store.artifacts(self.job_id)}
+            self.assertEqual(artifacts["core-image"]["retry_count"], 1)
+            self.assertEqual(artifacts["core-image-recovery-notification"]["status"], "confirmed")
+
+    def test_legacy_job_backfills_content_review_notice_before_sending(self):
+        with WorkflowStore(self.state) as store:
+            store.connection.execute(
+                "DELETE FROM artifacts WHERE job_id=? AND artifact_key='content-review-notification'",
+                (self.job_id,),
+            )
+        bridge = FakeBridge(lose_response_for="name: ljg-think")
+        notices = []
+
+        def record_notice(**kwargs):
+            notices.append(kwargs["event"])
+            return fake_notifications(**kwargs)
+
+        result = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            notification_fn=record_notice,
+        )
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(notices, ["content_review"])
+        self.assertEqual(result["content_review_notification"]["status"], "confirmed")
+        with WorkflowStore(self.state) as store:
+            artifact = next(item for item in store.artifacts(self.job_id)
+                            if item["artifact_key"] == "content-review-notification")
+            self.assertEqual((artifact["kind"], artifact["required"], artifact["status"]),
+                             ("message", 0, "confirmed"))
+            self.assertEqual(sum(event["event_type"] == "optional_artifact_added"
+                                 for event in store.events(self.job_id)), 1)
+
     def test_lost_bridge_response_recovers_original_request_without_second_submission(self):
         bridge = FakeBridge(lose_response_for="name: ljg-think")
         first = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            notification_fn=fake_notifications,
         )
         self.assertEqual(first["status"], "needs_review")
+        self.assertEqual(first["content_review_notification"]["status"], "confirmed")
         self.assertEqual(len(bridge.submissions), 3)
         original_count = len(bridge.submissions)
         calls = []
@@ -236,8 +891,9 @@ class WorkerTests(unittest.TestCase):
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=counted_observe,
             prompt_fetcher=lambda _prompt_id: (_ for _ in ()).throw(AssertionError("resume must not refetch or resubmit Prompt")),
             document_compiler=FakeDocumentCompiler(),
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
         )
-        self.assertEqual(second["status"], "waiting_for_delivery_stages", second)
+        self.assertEqual(second["status"], "succeeded", second)
         self.assertEqual(len(bridge.submissions), original_count + 1)
         self.assertEqual(len(calls), 1)
         self.assertTrue((self.state / "jobs" / self.job_id / "analysis" / "ljg-think.md").is_file())
@@ -247,7 +903,7 @@ class WorkerTests(unittest.TestCase):
         request_meta = self.state / "jobs" / self.job_id / "analysis" / "munger-analysis.md.request.json"
         self.assertEqual(request_meta.stat().st_mode & 0o777, 0o600)
         with WorkflowStore(self.state) as store:
-            self.assertEqual(store.get_job(self.job_id)["status"], "waiting")
+            self.assertEqual(store.get_job(self.job_id)["status"], "succeeded")
             self.assertTrue(all(item["status"] == "confirmed" for item in store.artifacts(self.job_id) if item["artifact_key"].startswith("analysis:")))
 
     def test_prompt_governance_failure_isolated_to_munger_branch(self):
@@ -255,7 +911,7 @@ class WorkerTests(unittest.TestCase):
         result = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=lambda _prompt_id: (_ for _ in ()).throw(RuntimeError("governance unavailable")),
-            document_compiler=FakeDocumentCompiler(),
+            document_compiler=FakeDocumentCompiler(), notification_fn=fake_notifications,
         )
         self.assertEqual(result["status"], "needs_review")
         self.assertEqual(len(bridge.submissions), 3)
@@ -283,7 +939,7 @@ class WorkerTests(unittest.TestCase):
         first = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=lambda _prompt_id: (_ for _ in ()).throw(RuntimeError("governance unavailable")),
-            document_compiler=FakeDocumentCompiler(),
+            document_compiler=FakeDocumentCompiler(), notification_fn=fake_notifications,
         )
         self.assertEqual(first["status"], "needs_review")
         with WorkflowStore(self.state) as store:
@@ -292,23 +948,31 @@ class WorkerTests(unittest.TestCase):
         second = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
         )
-        self.assertEqual(second["status"], "waiting_for_delivery_stages", second)
+        self.assertEqual(second["status"], "succeeded", second)
 
     def test_document_publish_response_loss_recovers_without_second_publish(self):
         bridge = FakeBridge()
         compiler = FakeDocumentCompiler(publish_status="uncertain", recovery_status="uncertain")
+        notifications = []
+        def notice(**kwargs):
+            notifications.append(kwargs["event"])
+            return fake_notifications(**kwargs)
         first = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
-            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler, notification_fn=notice,
         )
         self.assertEqual(first["status"], "needs_review")
+        self.assertEqual(first["document_review_notification"]["status"], "confirmed")
+        self.assertEqual(notifications, ["document_review"])
         self.assertEqual(first["document_delivery"]["status"], "uncertain")
         self.assertEqual(compiler.publish_calls, 1)
         self.assertEqual(compiler.recover_calls, 1)
         second = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
-            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler, notification_fn=notice,
+            image_delivery_fn=fake_image_delivery,
         )
         self.assertEqual(second["document_delivery"]["status"], "uncertain")
         self.assertEqual(compiler.publish_calls, 1)
@@ -319,13 +983,92 @@ class WorkerTests(unittest.TestCase):
             )]
             self.assertEqual(len(effects), 1)
             self.assertEqual(effects[0]["status"], "uncertain")
-    def test_mismatched_local_receipt_is_not_reused(self):
+
+    def test_unconfirmed_document_review_notice_is_reconciled_before_final_success(self):
         bridge = FakeBridge()
+        compiler = FakeDocumentCompiler(publish_status="uncertain", recovery_status="uncertain")
+        review_reasons = []
+        review_attempts = []
+        now = [time.time()]
+
+        def notice(**kwargs):
+            if kwargs["event"] != "document_review":
+                return fake_notifications(**kwargs)
+            store, lease = kwargs["store"], kwargs["lease"]
+            reason = kwargs["reason_code"]
+            review_reasons.append(reason)
+            request_sha = digest(json.dumps({"reason_code": reason}, sort_keys=True).encode())
+            effect = store.find_effect(lease.job_id, "document-publish-review-notification", "message-send")
+            if effect is None:
+                effect = store.prepare_effect(
+                    lease, "document-publish-review-notification", "message-send", request_sha,
+                )
+            else:
+                self.assertEqual(effect["request_sha256"], request_sha)
+            review_attempts.append(effect["status"])
+            if effect["status"] == "prepared":
+                effect = store.begin_effect(lease, effect["op_key"])
+                store.finish_effect(
+                    lease, effect["op_key"], "uncertain",
+                    metadata={"failure_stage": "notification-send", "reason_code": "lost-response",
+                              "next_reconcile_at": now[0] + worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS},
+                )
+                return {"status": "uncertain", "reason_code": "notification-send-result-unconfirmed"}
+            if effect["status"] == "uncertain":
+                store.reconcile_effect(
+                    lease, effect["op_key"], "confirmed", remote_id="review-message",
+                    metadata={"verification": "exact-card-readback"},
+                )
+                store.set_artifact(lease, "document-publish-review-notification", "confirmed", metadata={
+                    "failure_stage": "document-publish", "reason_code": reason,
+                    "verification": "exact-card-readback",
+                })
+                return {"status": "confirmed", "message_id": "review-message", "recovered": True}
+            self.fail(f"unexpected review notification effect state: {effect['status']}")
+
         first = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
-            prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            prompt_fetcher=asset_fetcher, document_compiler=compiler, notification_fn=notice,
+            clock=lambda: now[0],
         )
-        self.assertEqual(first["status"], "waiting_for_delivery_stages")
+        self.assertEqual(first["status"], "needs_review")
+        self.assertEqual(first["document_review_notification"]["status"], "uncertain")
+        with WorkflowStore(self.state) as store:
+            review_effect = store.find_effect(self.job_id, "document-publish-review-notification", "message-send")
+            self.assertEqual(review_effect["status"], "uncertain")
+            persisted_review = next(item for item in store.artifacts(self.job_id)
+                                    if item["artifact_key"] == "document-publish-review-notification")
+            self.assertTrue(persisted_review["metadata"]["reason_code"])
+
+        compiler.recovery_status = "confirmed"
+        now[0] += worker.workflow_notifications.NOTIFICATION_RECONCILE_INTERVAL_SECONDS
+        second = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            image_delivery_fn=fake_image_delivery, notification_fn=notice, clock=lambda: now[0],
+        )
+        self.assertEqual(second["status"], "succeeded", second)
+        self.assertEqual(review_attempts, ["prepared", "uncertain"])
+        self.assertEqual(review_reasons[0], review_reasons[1])
+        self.assertEqual(compiler.publish_calls, 1)
+        self.assertEqual(compiler.recover_calls, 2)
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            review_effect = store.find_effect(self.job_id, "document-publish-review-notification", "message-send")
+            final_effect = store.find_effect(self.job_id, "final-notification", "message-send")
+            self.assertEqual(job["status"], "succeeded")
+            self.assertEqual(review_effect["status"], "confirmed")
+            self.assertEqual(final_effect["status"], "confirmed")
+
+    def test_mismatched_local_receipt_is_not_reused(self):
+        bridge = FakeBridge()
+        compiler = FakeDocumentCompiler(publish_status="uncertain", recovery_status="uncertain")
+        first = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            notification_fn=fake_notifications,
+        )
+        self.assertEqual(first["status"], "needs_review")
         receipt = self.state / "jobs" / self.job_id / "analysis" / "article-decode.md.receipt.json"
         record = json.loads(receipt.read_text(encoding="utf-8"))
         record["caller_label"] = "another-caller"
@@ -340,9 +1083,10 @@ class WorkerTests(unittest.TestCase):
         second = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=observe,
             prompt_fetcher=lambda _prompt_id: (_ for _ in ()).throw(AssertionError("confirmed Bridge work must not refetch the Prompt")),
-            document_compiler=FakeDocumentCompiler(),
+            document_compiler=FakeDocumentCompiler(recovery_status="confirmed"),
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
         )
-        self.assertEqual(second["status"], "waiting_for_delivery_stages")
+        self.assertEqual(second["status"], "succeeded")
         self.assertEqual(len(bridge.submissions), count)
         self.assertEqual(len(observed), 1)
 

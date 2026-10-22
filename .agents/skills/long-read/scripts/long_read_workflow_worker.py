@@ -16,7 +16,9 @@ from urllib.parse import urlparse
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_text
-from long_read_workflow_store import Lease, WorkflowStore
+from long_read_workflow_store import (
+    Lease, WorkflowStore, workflow_payload_issue,
+)
 from long_read_document_compiler import (
     DocumentCompilerAdapter, DocumentCompilerError, DocumentCompilerUnknown,
 )
@@ -24,6 +26,7 @@ import run_chatgpt_munger as munger
 import run_isolated_analyses as isolated
 import long_read_document_supplement as document_supplement
 import long_read_document_assembler as document_assembler
+import long_read_workflow_notifications as workflow_notifications
 
 
 CALLER = "read-x:long-read-text"
@@ -419,7 +422,7 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
     job_id = lease.job_id
     trigger = payload.get("trigger") or {}
     profile = trigger.get("feishuProfile")
-    identity = trigger.get("identity")
+    identity = trigger.get("identity", "bot")
     try:
         plan, env = adapter.prepare_plan(
             job_id=job_id, document_dir=root / "document",
@@ -525,8 +528,71 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
     return reconcile_readback()
 
 
+def _notify(*, store: WorkflowStore, lease: Lease, payload: dict, root: Path,
+            event: str, notification_fn=None, **kwargs) -> dict:
+    if event == "document_review":
+        artifact_key = "document-publish-review-notification"
+        artifact = next((item for item in store.artifacts(lease.job_id)
+                         if item["artifact_key"] == artifact_key), None)
+        if artifact is None:
+            raise ValueError("document review notification artifact is missing")
+        metadata = dict(artifact.get("metadata", {}))
+        reason_code = metadata.get("notification_reason_code", metadata.get("reason_code"))
+        if not isinstance(reason_code, str) or not reason_code:
+            reason_code = str(kwargs.get("reason_code") or "document-publish-result-unconfirmed")
+            metadata.update({"failure_stage": "document-publish", "reason_code": reason_code,
+                             "notification_reason_code": reason_code})
+            store.set_artifact(lease, artifact_key, artifact["status"], metadata=metadata)
+        # Keep the original card body stable so a later read-only recovery can
+        # match the same send effect after a lost response.
+        kwargs["reason_code"] = reason_code
+    if notification_fn is not None:
+        return notification_fn(event=event, store=store, lease=lease,
+                               payload=payload, root=root, **kwargs)
+    if event == "document":
+        return workflow_notifications.notify_document_progress(
+            store=store, lease=lease, payload=payload, root=root, **kwargs,
+        )
+    if event == "document_review":
+        return workflow_notifications.notify_document_publish_review(
+            store=store, lease=lease, payload=payload, root=root, **kwargs,
+        )
+    if event == "content_review":
+        return workflow_notifications.notify_content_review(
+            store=store, lease=lease, payload=payload, root=root, **kwargs,
+        )
+    if event == "image_recovery":
+        return workflow_notifications.notify_image_recovery(
+            store=store, lease=lease, payload=payload, root=root, **kwargs,
+        )
+    if event == "final":
+        return workflow_notifications.notify_final(
+            store=store, lease=lease, payload=payload, root=root, **kwargs,
+        )
+    raise ValueError(f"unsupported notification event: {event}")
+
+
+def _deliver_image(*, store: WorkflowStore, lease: Lease, payload: dict, root: Path,
+                   image_key: str, image_name: str, source_path: Path,
+                   document_id: str, image_index: int, image_delivery_fn=None,
+                   clock=time.time) -> dict:
+    if image_delivery_fn is not None:
+        return image_delivery_fn(
+            store=store, lease=lease, payload=payload, root=root,
+            image_key=image_key, image_name=image_name, source_path=source_path,
+            document_id=document_id, image_index=image_index, clock=clock,
+        )
+    from long_read_image_delivery import deliver_image
+    return deliver_image(
+        store=store, lease=lease, payload=payload, root=root,
+        image_key=image_key, image_name=image_name, source_path=source_path,
+        document_id=document_id, image_index=image_index, clock=clock,
+    )
+
+
 def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *, bridge_fn, observe_fn,
-                         prompt_fetcher, document_compiler=None) -> dict:
+                         prompt_fetcher, document_compiler=None, image_delivery_fn=None,
+                         notification_fn=None, clock=time.time) -> dict:
     job_id = lease.job_id
     root = _artifact_root(state_dir, job_id)
     lock = threading.RLock()
@@ -677,10 +743,16 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         )
         outcomes.append({"name": "document-supplement", **supplement_outcome})
     else:
-        pending = current_artifacts.get("analysis:document-supplement", {})
-        outcomes.append({"name": "document-supplement", "artifact": "analysis:document-supplement",
-                         "status": "needs_review", "reason": "required-text-inputs-not-confirmed"})
-        unresolved = True
+        article_status = current_artifacts.get("analysis:article-decode", {}).get("status")
+        if article_status == "failed":
+            _mark_artifact(store, lease, "analysis:document-supplement", "failed",
+                           "required-article-decode-failed", failure_stage="assembly")
+            outcomes.append({"name": "document-supplement", "artifact": "analysis:document-supplement",
+                             "status": "failed", "reason": "required-article-decode-failed"})
+        else:
+            outcomes.append({"name": "document-supplement", "artifact": "analysis:document-supplement",
+                             "status": "needs_review", "reason": "required-text-inputs-not-confirmed"})
+            unresolved = True
 
     artifacts = store.artifacts(job_id)
     unresolved |= any(item["status"] == "needs_review" for item in outcomes)
@@ -769,13 +841,17 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             markdown=assembled, xml=xml,
         )
 
-    if not unresolved and not retryable_governance_failure:
+    content_plan_ready = all(
+        item["status"] in {"confirmed", "failed"}
+        for item in artifacts if item["kind"] == "analysis" and item["required"]
+    )
+    if (not unresolved and not retryable_governance_failure and content_plan_ready
+            and not payload.get("artifact_plan_finalized")):
         required = {item["artifact_key"] for item in artifacts if item["required"]}
         munger_artifact = next((item for item in artifacts if item["artifact_key"] == "analysis:munger-analysis"), None)
         if munger_artifact and munger_artifact["status"] == "confirmed":
             required.update({"munger-image", "munger-image-insert", "munger-image-send"})
-        if not store.get_job(job_id)["payload"].get("artifact_plan_finalized"):
-            store.finalize_artifact_plan(lease, required)
+        store.finalize_artifact_plan(lease, required)
 
     document_delivery = None
     if candidate_result is not None:
@@ -789,39 +865,390 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         item["required"] and item["kind"] == "analysis" and item["status"] in {"pending", "uncertain"}
         for item in artifacts
     )
-    candidate_missing = candidate_result is None
-    needs_review = unresolved or retryable_governance_failure or required_analysis_unresolved or candidate_missing
+    needs_review = unresolved or retryable_governance_failure or required_analysis_unresolved
     store.set_status(lease, "needs_review" if needs_review else "waiting")
-    required_analysis_failed = any(
-        item["required"] and item["kind"] == "analysis" and item["status"] == "failed"
-        for item in artifacts
+    if needs_review:
+        document_review_notification = None
+        if document_delivery and document_delivery.get("status") in {"needs_review", "uncertain"}:
+            document_review_notification = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="document_review", notification_fn=notification_fn,
+                reason_code=document_delivery.get("reason", "document-publish-result-unconfirmed"),
+                clock=clock,
+            )
+        content_review_notification = None
+        content_needs_review = required_analysis_unresolved or retryable_governance_failure
+        content_review_artifact = next(
+            (item for item in store.artifacts(job_id)
+             if item["artifact_key"] == "content-review-notification"),
+            None,
+        )
+        if content_needs_review:
+            if content_review_artifact is None:
+                # Older durable jobs predate this optional outbox artifact.
+                # Add it only while holding the current lease, before any send.
+                store.ensure_optional_artifact(
+                    lease, "content-review-notification", "message",
+                )
+            content_review_notification = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="content_review", notification_fn=notification_fn,
+                clock=clock,
+            )
+        return {
+            "status": "needs_review", "job_id": job_id, "delivery_complete": False,
+            "content_branches": outcomes, "elapsed_seconds": round(time.monotonic() - started, 3),
+            "next_stage": "resolve_content_recovery", "document_candidate": candidate_result,
+            "document_delivery": document_delivery,
+            "document_review_notification": document_review_notification,
+            "content_review_notification": content_review_notification,
+            "required_artifacts": [item["artifact_key"] for item in store.artifacts(job_id) if item["required"]],
+        }
+
+    if document_delivery and document_delivery.get("status") == "confirmed":
+        review_key = "document-publish-review-notification"
+        review_effects = store.effects_for(job_id, review_key)
+        unresolved_review = next(
+            (effect for effect in review_effects if effect["status"] in {"attempting", "uncertain"}),
+            None,
+        )
+        if unresolved_review:
+            review_artifact = next(
+                (item for item in store.artifacts(job_id) if item["artifact_key"] == review_key),
+                None,
+            )
+            metadata = (review_artifact or {}).get("metadata", {})
+            reason_code = metadata.get("notification_reason_code", metadata.get("reason_code"))
+            if not isinstance(reason_code, str) or not reason_code:
+                store.set_status(lease, "needs_review")
+                return _delivery_result(
+                    store, job_id, "needs_review", stage="document-publish-review-notification",
+                    reason="original-review-notification-payload-unavailable",
+                )
+            notice = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="document_review", notification_fn=notification_fn,
+                reason_code=reason_code, clock=clock,
+            )
+            if notice.get("status") != "confirmed":
+                store.set_status(lease, "needs_review")
+                return _delivery_result(
+                    store, job_id, "needs_review", stage="document-publish-review-notification",
+                    reason=notice.get("reason_code", "notification-send-result-unconfirmed"),
+                    notification=notice.get("status"),
+                )
+
+    # Content can be useful even when a required branch failed. That must not
+    # strand the job before delivery-state reporting; downstream impossible
+    # artifacts are marked as known failures below.
+    delivery_result = _advance_delivery(
+        store=store, lease=lease, payload=payload, root=root, snapshot=snapshot,
+        candidate=candidate_result, document_delivery=document_delivery,
+        image_delivery_fn=image_delivery_fn, notification_fn=notification_fn,
+        clock=clock,
+        content_error=next((item.get("reason") for item in outcomes if item.get("status") == "failed"), None),
     )
-    return {
-        "status": ("needs_review" if needs_review else
-                   "partial_content_ready_for_delivery" if required_analysis_failed else
-                   "waiting_for_delivery_stages"),
-        "job_id": job_id,
-        "delivery_complete": False,
+    delivery_result.update({
         "content_branches": outcomes,
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "next_stage": "document_compiler_publish_and_images" if candidate_result else "resolve_content_recovery",
         "document_candidate": candidate_result,
         "document_delivery": document_delivery,
         "required_artifacts": [item["artifact_key"] for item in store.artifacts(job_id) if item["required"]],
-    }
+    })
+    return delivery_result
+
+
+def _delivery_result(store: WorkflowStore, job_id: str, status: str, **extra) -> dict:
+    return {"status": status, "job_id": job_id, "delivery_complete": status == "succeeded", **extra}
+
+
+def _mark_failed_if_open(store: WorkflowStore, lease: Lease, artifact_key: str,
+                         reason: str, stage: str) -> None:
+    artifact = next((item for item in store.artifacts(lease.job_id)
+                     if item["artifact_key"] == artifact_key), None)
+    if artifact and artifact["required"] and artifact["status"] == "pending":
+        store.set_artifact(lease, artifact_key, "failed", metadata={
+            "failure_stage": stage, "reason_code": re.sub(r"[^A-Za-z0-9_.:/+-]", "-", reason)[:120],
+        })
+
+
+def _defer_recovery_notification(*, store: WorkflowStore, lease, image_key: str,
+                                 reason_code: str, clock) -> dict:
+    notification_key = f"{image_key}-recovery-notification"
+    retry_at = float(clock()) + 60
+    store.set_artifact(lease, notification_key, "pending", metadata={
+        "failure_stage": "notification", "reason_code": reason_code,
+        "next_retry_at": retry_at,
+    })
+    store.set_status(lease, "waiting")
+    return _delivery_result(
+        store, lease.job_id, "waiting", stage="image-recovery-notification",
+        image=image_key, next_retry_at=retry_at, reason=reason_code,
+    )
+
+
+def _advance_delivery(*, store: WorkflowStore, lease: Lease, payload: dict, root: Path,
+                      snapshot: Path, candidate: dict | None, document_delivery: dict | None,
+                      image_delivery_fn=None, notification_fn=None, clock=time.time,
+                      content_error: str | None = None) -> dict:
+    """Advance only durable, independently verifiable delivery stages."""
+    job_id = lease.job_id
+    artifacts = {item["artifact_key"]: item for item in store.artifacts(job_id)}
+    document_id = (document_delivery or {}).get("document_id")
+    delivery_failure_reason = content_error
+
+    if candidate is None:
+        reason = content_error or "required-content-branch-failed"
+        delivery_failure_reason = reason
+        _mark_failed_if_open(store, lease, "main-document", reason, "content-assembly")
+        _mark_failed_if_open(store, lease, "document-notification", "main-document-unavailable", "notification")
+        for key in ("core-image", "core-image-insert", "core-image-send",
+                    "munger-image", "munger-image-insert", "munger-image-send"):
+            _mark_failed_if_open(store, lease, key, "main-document-unavailable", "upstream-delivery")
+        delivery_failed = True
+    else:
+        delivery_failed = False
+        publish_state = (document_delivery or {}).get("status")
+        if publish_state in {"needs_review", "uncertain"}:
+            store.set_status(lease, "needs_review")
+            notice = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="document_review", notification_fn=notification_fn,
+                reason_code=(document_delivery or {}).get("reason", "document-publish-result-unconfirmed"),
+                clock=clock,
+            )
+            return _delivery_result(store, job_id, "needs_review", stage="document-publish",
+                                    reason=(document_delivery or {}).get("reason"),
+                                    notification=notice.get("status"))
+        if publish_state == "failed":
+            delivery_failure_reason = "main-document-publish:" + str(
+                (document_delivery or {}).get("reason", "known-failure"))
+            _mark_failed_if_open(store, lease, "document-notification", "main-document-publish-failed", "notification")
+            for key in ("core-image", "core-image-insert", "core-image-send",
+                        "munger-image", "munger-image-insert", "munger-image-send"):
+                _mark_failed_if_open(store, lease, key, "main-document-publish-failed", "upstream-delivery")
+            delivery_failed = True
+        elif publish_state != "confirmed" or not document_id:
+            store.set_status(lease, "needs_review")
+            notice = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="document_review", notification_fn=notification_fn,
+                reason_code="main-document-result-unconfirmed", clock=clock,
+            )
+            return _delivery_result(store, job_id, "needs_review", stage="document-publish",
+                                    reason="main-document-result-unconfirmed",
+                                    notification=notice.get("status"))
+
+        if not delivery_failed:
+            progress = _notify(store=store, lease=lease, payload=payload, root=root,
+                               event="document", notification_fn=notification_fn,
+                               document_id=document_id, clock=clock)
+            if progress.get("status") != "confirmed":
+                status = progress.get("status")
+                if status == "failed":
+                    delivery_failure_reason = "document-notification:" + str(
+                        progress.get("reason_code", "known-failure"))
+                    _mark_failed_if_open(store, lease, "document-notification",
+                                         progress.get("reason_code", "document-notification-failed"),
+                                         "notification")
+                    delivery_failed = True
+                elif status == "deferred":
+                    store.set_status(lease, "waiting")
+                    return _delivery_result(store, job_id, "waiting", stage="document-notification",
+                                            reason=progress.get("reason_code"))
+                else:
+                    store.set_status(lease, "needs_review")
+                    return _delivery_result(store, job_id, "needs_review", stage="document-notification",
+                                            reason=progress.get("reason_code"))
+
+    # If the main document is missing or a required text stage failed, no
+    # image can satisfy the combined insert-and-private-send contract.
+    if delivery_failed:
+        final_status = "failed"
+        failure_reason = delivery_failure_reason or "main-document-unavailable"
+    else:
+        image_specs = [("core-image", "core-image", "核心内容图", 1)]
+        if artifacts.get("munger-image", {}).get("required"):
+            image_specs.append(("munger-image", "munger-image", "芒格洞察图", 2))
+        failure_reason = None
+        scheduled_retry = None
+        for image_key, image_name, display_name, image_index in image_specs:
+            image_states = {item["artifact_key"]: item for item in store.artifacts(job_id)}
+            if all(image_states[key]["status"] == "confirmed" for key in (
+                    image_key, f"{image_key}-insert", f"{image_key}-send")):
+                continue
+            recovery_key = f"{image_key}-recovery-notification"
+            recovery = image_states.get(recovery_key)
+            recovery_meta = recovery.get("metadata", {}) if recovery else {}
+            recovery_retry_at = recovery_meta.get("next_retry_at")
+            recovery_effects = store.effects_for(job_id, recovery_key)
+            has_prepared_recovery_notice = any(item["status"] == "prepared" for item in recovery_effects)
+            if (recovery and recovery["status"] == "pending" and has_prepared_recovery_notice
+                    and isinstance(recovery_retry_at, (int, float))
+                    and float(recovery_retry_at) > float(clock())):
+                pending_notice_retry = {
+                    "stage": "image-recovery-notification", "image": image_key,
+                    "next_retry_at": float(recovery_retry_at),
+                    "retries_used": image_states[image_key]["retry_count"],
+                }
+                if (scheduled_retry is None
+                        or pending_notice_retry["next_retry_at"] < scheduled_retry["next_retry_at"]):
+                    scheduled_retry = pending_notice_retry
+                continue
+            if recovery and recovery["status"] == "pending" and has_prepared_recovery_notice:
+                image_state = image_states[image_key]
+                image_meta = image_state.get("metadata", {})
+                notice = _notify(
+                    store=store, lease=lease, payload=payload, root=root,
+                    event="image_recovery", notification_fn=notification_fn,
+                    image_key=image_key, image_name=display_name, document_id=document_id,
+                    failure_stage=image_meta.get("failure_stage", "unknown"),
+                    reason_code=image_meta.get("reason_code", "unknown"),
+                    retries_used=image_state["retry_count"],
+                    retry_at=image_meta.get("next_retry_at"), clock=clock,
+                )
+                if notice.get("status") == "deferred":
+                    return _defer_recovery_notification(
+                        store=store, lease=lease, image_key=image_key,
+                        reason_code=notice.get("reason_code", "message-rate-limit"), clock=clock,
+                    )
+                if notice.get("status") != "confirmed":
+                    store.set_status(lease, "needs_review")
+                    return _delivery_result(
+                        store, job_id, "needs_review", stage="image-recovery-notification",
+                        image=image_key, reason=notice.get("reason_code"),
+                    )
+            outcome = _deliver_image(
+                store=store, lease=lease, payload=payload, root=root,
+                image_key=image_key, image_name=image_name,
+                source_path=snapshot / "source.md", document_id=document_id,
+                image_index=image_index, image_delivery_fn=image_delivery_fn, clock=clock,
+            )
+            state = outcome.get("status")
+            if state in {"retry_scheduled", "failed"}:
+                latest = next(item for item in store.artifacts(job_id) if item["artifact_key"] == image_key)
+                metadata = latest.get("metadata", {})
+                retryable = metadata.get("retryable") is True and bool(metadata.get("next_retry_at"))
+                if retryable:
+                    notice = _notify(
+                        store=store, lease=lease, payload=payload, root=root,
+                        event="image_recovery", notification_fn=notification_fn,
+                        image_key=image_key, image_name=display_name, document_id=document_id,
+                        failure_stage=metadata.get("failure_stage", outcome.get("failure_stage", "unknown")),
+                        reason_code=metadata.get("reason_code", outcome.get("reason_code", "unknown")),
+                        retries_used=latest["retry_count"], retry_at=metadata["next_retry_at"],
+                        clock=clock,
+                    )
+                    if notice.get("status") == "deferred":
+                        return _defer_recovery_notification(
+                            store=store, lease=lease, image_key=image_key,
+                            reason_code=notice.get("reason_code", "message-rate-limit"), clock=clock,
+                        )
+                    if notice.get("status") != "confirmed":
+                        store.set_status(lease, "needs_review")
+                        return _delivery_result(store, job_id, "needs_review", stage="image-recovery-notification",
+                                                image=image_key, reason=notice.get("reason_code"))
+                    next_retry = {
+                        "stage": metadata.get("failure_stage"), "image": image_key,
+                        "next_retry_at": metadata["next_retry_at"],
+                        "retries_used": latest["retry_count"],
+                    }
+                    if (scheduled_retry is None
+                            or next_retry["next_retry_at"] < scheduled_retry["next_retry_at"]):
+                        scheduled_retry = next_retry
+                    continue
+                failure_reason = f"{image_key}:{metadata.get('failure_stage', outcome.get('failure_stage', 'unknown'))}:{metadata.get('reason_code', outcome.get('reason_code', 'unknown'))}"
+                for dependent in (f"{image_key}-insert", f"{image_key}-send"):
+                    _mark_failed_if_open(store, lease, dependent, "image-delivery-failed", "upstream-delivery")
+                continue
+            if state in {"uncertain", "needs_review"}:
+                details = outcome.get("reason_code", "image-result-unconfirmed")
+                latest = next(item for item in store.artifacts(job_id) if item["artifact_key"] == image_key)
+                if latest["status"] == "pending":
+                    store.set_artifact(lease, image_key, "uncertain", metadata={
+                        "failure_stage": outcome.get("failure_stage", "image-delivery"),
+                        "reason_code": details,
+                    })
+                notice = _notify(
+                    store=store, lease=lease, payload=payload, root=root,
+                    event="image_recovery", notification_fn=notification_fn,
+                    image_key=image_key, image_name=display_name, document_id=document_id,
+                    failure_stage=outcome.get("failure_stage", "unknown"), reason_code=details,
+                    retries_used=latest["retry_count"], retry_at=None, clock=clock,
+                )
+                store.set_status(lease, "needs_review")
+                return _delivery_result(store, job_id, "needs_review", stage="image-delivery",
+                                        image=image_key, reason=details,
+                                        notification=notice.get("status"))
+            if state == "deferred":
+                store.set_status(lease, "waiting")
+                return _delivery_result(store, job_id, "waiting", stage=outcome.get("failure_stage"),
+                                        image=image_key, next_retry_at=outcome.get("retry_at"),
+                                        reason=outcome.get("reason_code"))
+            if state != "confirmed":
+                store.set_status(lease, "needs_review")
+                return _delivery_result(store, job_id, "needs_review", stage="image-delivery",
+                                        image=image_key, reason=outcome.get("reason_code", "unsupported-image-state"))
+
+        if scheduled_retry:
+            store.set_status(lease, "waiting")
+            return _delivery_result(store, job_id, "waiting", **scheduled_retry)
+
+        states = {item["artifact_key"]: item for item in store.artifacts(job_id)}
+        required = [item for item in states.values()
+                    if item["required"] and item["artifact_key"] != "final-notification"]
+        unresolved = any(item["status"] in {"pending", "uncertain"} for item in required)
+        terminal_failure = any(item["status"] == "failed" for item in required)
+        if unresolved:
+            store.set_status(lease, "waiting")
+            return _delivery_result(store, job_id, "waiting", stage="required-artifacts")
+        final_status = "failed" if terminal_failure else "succeeded"
+        if terminal_failure:
+            failed_keys = [item["artifact_key"] for item in required if item["status"] == "failed"]
+            failure_reason = failure_reason or ",".join(failed_keys[:5])
+
+    final = _notify(store=store, lease=lease, payload=payload, root=root,
+                    event="final", notification_fn=notification_fn,
+                    status=final_status, document_id=document_id,
+                    failure_reason=failure_reason, clock=clock)
+    if final.get("status") != "confirmed":
+        if final.get("status") == "deferred":
+            store.set_status(lease, "waiting")
+            return _delivery_result(store, job_id, "waiting", stage="final-notification",
+                                    reason=final.get("reason_code"))
+        store.set_status(lease, "needs_review")
+        return _delivery_result(store, job_id, "needs_review", stage="final-notification",
+                                reason=final.get("reason_code"))
+    store.set_status(lease, final_status)
+    return _delivery_result(store, job_id, final_status, document_id=document_id,
+                            final_notification=final)
 
 
 def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", lease_seconds: float = 900,
                 bridge_fn=run_bridge, observe_fn=observe_bridge, prompt_fetcher=None,
-                document_compiler=None) -> dict:
+                document_compiler=None, image_delivery_fn=None, notification_fn=None,
+                clock=time.time) -> dict:
     state_dir = Path(state_dir).absolute()
     lock = threading.RLock()
     with WorkflowStore(state_dir) as store:
+        job = store.get_job(job_id)
+        if not job:
+            return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
+                    "reason_code": "job-not-found"}
+        payload = job.get("payload")
+        admission_issue = workflow_payload_issue(
+            payload, app_id=job.get("app_id"), source_message_id=job.get("source_message_id"),
+        )
+        if admission_issue:
+            return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
+                    "reason_code": admission_issue}
         lease = store.acquire_lease(job_id, owner, lease_seconds)
         try:
             result = _advance_claimed_job(store, lease, state_dir, bridge_fn=bridge_fn,
                                           observe_fn=observe_fn, prompt_fetcher=prompt_fetcher,
-                                          document_compiler=document_compiler)
+                                          document_compiler=document_compiler,
+                                          image_delivery_fn=image_delivery_fn,
+                                          notification_fn=notification_fn, clock=clock)
         except Exception as exc:
             with lock:
                 try:
@@ -847,12 +1274,138 @@ def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x
     if not db.is_file() or db.is_symlink():
         return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
     with WorkflowStore(state_dir) as store:
-        rows = store.connection.execute(
-            "SELECT DISTINCT j.job_id FROM jobs j JOIN artifacts a ON a.job_id=j.job_id "
-            "WHERE j.status NOT IN ('succeeded','failed') AND a.artifact_key LIKE 'analysis:%' "
-            "AND a.status IN ('pending','uncertain') ORDER BY j.created_at LIMIT 1"
-        ).fetchall()
-    if not rows:
+        now = time.time()
+        jobs = store.list_jobs()
+        selected = next((job["job_id"] for job in jobs if _job_is_due(store, job, now)), None)
+    if selected is None:
         return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
-    return process_job(state_dir, rows[0]["job_id"], owner=owner)
+    return process_job(state_dir, selected, owner=owner)
 
+
+def _job_is_due(store: WorkflowStore, job: dict, now: float) -> bool:
+    admitted = store.get_job(job["job_id"])
+    payload = admitted.get("payload") if admitted else None
+    if workflow_payload_issue(
+            payload, app_id=admitted.get("app_id") if admitted else None,
+            source_message_id=admitted.get("source_message_id") if admitted else None):
+        return False
+    if job["status"] in {"succeeded", "failed"}:
+        return False
+    row = store.connection.execute(
+        "SELECT lease_expires_at FROM jobs WHERE job_id=?", (job["job_id"],)
+    ).fetchone()
+    if row and row["lease_expires_at"] and row["lease_expires_at"] > now:
+        return False
+    artifacts = store.artifacts(job["job_id"])
+    if job["status"] == "needs_review":
+        # Only uncertain remote actions are eligible for automatic, read-only
+        # reconciliation, plus explicitly scheduled outbox delivery attempts.
+        unresolved_effect = store.connection.execute(
+            "SELECT 1 FROM effects WHERE job_id=? AND status IN ('attempting','uncertain') "
+            "AND action NOT LIKE 'message-send%' LIMIT 1",
+            (job["job_id"],),
+        ).fetchone() is not None
+        return unresolved_effect or _notification_retry_due(store, artifacts, now)
+    if _notification_retry_due(store, artifacts, now):
+        return True
+    if any(item["kind"] == "analysis" and item["required"]
+           and item["status"] in {"pending", "uncertain"} for item in artifacts):
+        return True
+    for item in artifacts:
+        if (item["required"] or not item["artifact_key"].endswith("-recovery-notification")
+                or item["status"] != "pending"):
+            continue
+        effects = store.effects_for(job["job_id"], item["artifact_key"])
+        if not any(effect["status"] == "prepared" for effect in effects):
+            continue
+        retry_at = item.get("metadata", {}).get("next_retry_at")
+        if not isinstance(retry_at, (int, float)) or float(retry_at) <= now:
+            return True
+    by_key = {item["artifact_key"]: item for item in artifacts}
+    deferred_images = {}
+    for key in ("core-image", "munger-image"):
+        item = by_key.get(key)
+        if not item or not item["required"]:
+            continue
+        metadata = item.get("metadata", {})
+        retry_at = metadata.get("next_retry_at")
+        retryable_failure = item["status"] == "failed" and metadata.get("retryable") is True
+        send_item = by_key.get(f"{key}-send", {})
+        send_retry_at = send_item.get("metadata", {}).get("next_retry_at")
+        deferred_send = send_item.get("status") == "pending" and isinstance(send_retry_at, (int, float))
+        due_at = retry_at if retryable_failure else send_retry_at
+        if (retryable_failure or deferred_send) and isinstance(due_at, (int, float)) and float(due_at) > now:
+            deferred_images[key] = float(due_at)
+    for item in artifacts:
+        if not item["required"]:
+            continue
+        if deferred_images and item["artifact_key"] == "final-notification":
+            continue
+        if any(item["artifact_key"] in {key, f"{key}-insert", f"{key}-send"}
+               for key in deferred_images):
+            continue
+        if item["artifact_key"] in {"core-image", "munger-image"} and item["status"] == "failed":
+            metadata = item.get("metadata", {})
+            retry_at = metadata.get("next_retry_at")
+            if metadata.get("retryable") is True and isinstance(retry_at, (int, float)):
+                if float(retry_at) <= now:
+                    return True
+                continue
+        if item["status"] in {"pending", "uncertain"}:
+            retry_at = item.get("metadata", {}).get("next_retry_at")
+            if isinstance(retry_at, (int, float)) and float(retry_at) > now:
+                continue
+            return True
+    return False
+
+
+def _notification_retry_due(store: WorkflowStore, artifacts: list[dict], now: float) -> bool:
+    """Schedule message sends and paced read-only checks for unresolved outbox effects."""
+    retry_limit = workflow_notifications.NOTIFICATION_RETRY_LIMIT + 1
+    idempotency_window = workflow_notifications.FEISHU_MESSAGE_IDEMPOTENCY_WINDOW_SECONDS
+    for artifact in artifacts:
+        if artifact["kind"] != "message":
+            continue
+        metadata = artifact.get("metadata", {})
+        for effect in store.effects_for(artifact["job_id"], artifact["artifact_key"]):
+            is_message_send = (effect["action"] == "message-send"
+                               or effect["action"].startswith("message-send:"))
+            if not is_message_send:
+                continue
+            if effect["status"] == "attempting":
+                return True
+            if effect["status"] == "prepared":
+                if artifact["status"] != "pending":
+                    continue
+                retry_at = metadata.get("next_retry_at")
+                if not isinstance(retry_at, (int, float)) or float(retry_at) <= now:
+                    return True
+                continue
+            if effect["status"] == "failed" and effect.get("metadata", {}).get("retryable") is True:
+                if artifact["status"] == "uncertain":
+                    reconcile_at = metadata.get(
+                        "next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"),
+                    )
+                    if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
+                        return True
+                    continue
+                retry_at = metadata.get("next_retry_at", effect.get("metadata", {}).get("next_retry_at"))
+                if artifact["status"] in {"pending", "failed"}:
+                    if not isinstance(retry_at, (int, float)):
+                        retry_at = float(effect["updated_at"]) + workflow_notifications.NOTIFICATION_RETRY_DELAY_SECONDS
+                    if (float(retry_at) <= now and effect["attempts"] < retry_limit
+                            and now - float(effect["created_at"]) < idempotency_window):
+                        return True
+                if artifact["status"] in {"failed", "uncertain"} and (
+                        effect["attempts"] >= retry_limit
+                        or now - float(effect["created_at"]) >= idempotency_window):
+                    reconcile_at = metadata.get("next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"))
+                    if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
+                        return True
+                continue
+            if (effect["status"] == "uncertain" and artifact["status"] == "uncertain"
+                    or effect["status"] == "failed" and artifact["status"] in {"failed", "uncertain"}):
+                reconcile_at = metadata.get("next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"))
+                if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
+                    return True
+    return False

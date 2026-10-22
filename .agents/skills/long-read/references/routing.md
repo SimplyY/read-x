@@ -48,126 +48,67 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 
 核心内容图不属于本表，也不是文字 ljg；它由 `run_chatgpt_core_image.py` 基于拼接完成的全文生成，每篇必产出。
 
-## 4. 隔离协议
+## 4. 持久接管与隔离生成
 
-主 Agent 选定互不重复的问题和文字 Skill 后，只调用 `scripts/run_long_read_pipeline.py`；编排入口并行独立拉起分析分支（内部运行 `scripts/run_isolated_analyses.py`）与 ChatGPT 芒格分支（`scripts/run_chatgpt_munger.py`，每篇必跑）。脚本严格校验 Evidence Schema 与原文逐字引文、预检所有输入和 Skill，再用 `ThreadPoolExecutor` 为 `article-decode` 和 0~3 个文字 ljg 分别经现有 Ego Lite ChatGPT web-bridge 发起独立会话（每个任务一个 `chatgpt.com/c/new` 新会话，互不可见）；全局并发 ≤3 路、会话发起错开 ≥10 秒由 Bridge 槽位与错峰器保证，Bridge 忙时按给定等待时间有界排队。外部 ljg 的完整 Skill 若要求 shell、引用文件、交互或本地写入，脚本追加固定运行覆盖，跳过这些不可用动作并直接返回最终 Markdown；命令、路径或交付残留会被生产门禁拒绝且不落盘。禁止传入：
-
-- 用户画像；
-- `article-decode` 或其他 ljg 的结果；
-- 主 Agent 的预设结论；
-- 期望答案或本轮问题诊断。
-
-`article-decode` 只获得原文、Evidence 和自身 Skill；每条 ljg 额外获得自己的唯一问题。主 Agent 不读取这些 Skill，不生成任务原稿。脚本输出按声明顺序编号，使用临时文件加原子替换，并把完整结果写入本轮 `summary.json`；单条 ljg 失败不影响其他结果。脚本或 ChatGPT web-bridge 不可用时按第 7 节降级，禁止退回主上下文、SubAgent、fresh thread 或嵌套 `codex exec`。
-
-## 5. 文档拼接
-
-主 Agent 串行维护 `.wx_doc.xml`；ChatGPT Bridge 芒格结果必须先落为本轮临时 Markdown，再作为一级主章节「芒格洞察」拼进主文档，**禁止创建第二篇文档**，也禁止把模型纯文本直接拼进文档。编排层只传递原文、实时读取并冻结的 `read-x.munger-analysis` 资产（正文内嵌芒格之魂全文，独立成篇）和最小边界，不把固定八标题或其他外层模板塞进模型请求：
-
-1. `article-decode` 完整原稿作为主文；
-2. 每条 ljg 的完整 ChatGPT 原稿放入附录，不设统一硬性总字数要求；主 Agent 只排版，不压缩；
-3. 拆分超过 100 字的段落；
-4. 按 `output-schema.md` 转成 XML。
-
-不得让第二个 Agent 接管全文润色；全文只由主 Agent拼接，避免再次平均化语言。
-
-## 6. 文档与卡片交付
-
-### 主文档
+唯一生产入口是 `.agents/skills/long-read/scripts/long_read_workflow_cli.py`。在同一任务快照中提交原文、Evidence、`scoring_result`、评分卡凭据、可信触发上下文和选中的问题文件：
 
 ```bash
-lark-cli docs +create \
-  --content @.wx_doc.xml \
-  --parent-position my_library \
-  --as bot
+python3 .agents/skills/long-read/scripts/long_read_workflow_cli.py submit \
+  --source <run_dir>/source.md \
+  --evidence <run_dir>/evidence.json \
+  --scoring-result <run_dir>/scoring-result.json \
+  --score-gate <run_dir>/score-gate.json \
+  --trigger-context <run_dir>/trigger-context.json \
+  --app-id <trusted-app-id> \
+  --feishu-profile <trusted-profile> \
+  --source-message-id <bridge_context.sourceMessageId> \
+  --question ljg-think <run_dir>/question-01.md
 ```
 
-创建前必须读取当前 CLI 内置的 `lark-doc` XML、style、create workflow。开发验证使用 `--dry-run`，不得创建测试文档。
+`--question` 可按实际选取重复 0–3 次。只有返回 `status=accepted` 才表示输入快照和任务记录均已持久化。重复入站由应用身份与来源消息 ID 去重；用户再次主动提交相同 URL 仍创建新任务。
 
-文档成功后必须用 link-card 生成的 `<run_dir>/score-gate.json` 和同一轮 `<run_dir>/scoring-result.json` 生成并校验交付卡 JSON，再执行：
+持久 Worker 为文字分析和芒格分支保存独立检查点、请求 ID、提示词与输入哈希、Bridge 收据、输出哈希、失败分类和耗时。`article-decode`、各文字 ljg 与芒格分析继续使用独立 ChatGPT Bridge 会话；全局并发 ≤3 路、请求错开 ≥10 秒。输出须包含有效提交确认、`verification=live-dom+snapshot`、会话 URL 和匹配哈希；非零进程退出码视为失败。提交状态不明时只观察原请求，不自动重发。
 
-```bash
-# 群聊场景私聊触发者
-lark-cli im +messages-send --as bot --user-id <senderId> \
-  --msg-type interactive --content "$(cat /tmp/link_card.json)" \
-  --jq '.data.message_id'
+模型输入边界保持不变：
 
-# p2p 场景使用当前私聊 chatId，只发一次
-lark-cli im +messages-send --as bot --chat-id <chatId> \
-  --msg-type interactive --content "$(cat /tmp/link_card.json)" \
-  --jq '.data.message_id'
-```
+- `article-decode` 只获得完整原文与客观 Evidence；
+- 每条文字 ljg 只获得完整原文、客观 Evidence 和分配给它的唯一问题；
+- 不传用户画像、评分解释、其他分析结果、预设结论或前序对话。
 
-主文档创建与核心内容图生成并行进行。ChatGPT Bridge 芒格结果属于主文档交付前的后处理，成功时作为一级主章节「芒格洞察」拼入主文档，不创建第二篇文档；失败时保留主文档交付。交付卡必须由 `scripts/render_long_read_delivery_card.py` 生成，经 JSON 解析后发送；发送后读回消息确认没有字面量 `\\n`。
+Evidence Schema 与逐字引文在提交前校验。确定性输出校验失败不重试。必跑分支失败时保留其他有效成果，但任务整体不得报告成功。
 
-### 核心内容图
+进度使用只读 `status`。`run-worker` 推进一个待处理任务；`resume --job-id <id>` 接续指定任务。部署后的受管常驻 Worker 使用 `run-worker --serve`，在同一进程内检查报告周期并推进长文任务。该模式要求报告私聊目标预先持久保存在状态库；缺少目标不能启动，运行时目标断言必须与保存值一致。恢复先只读核验未决副作用，已确认的分支和产物按哈希、请求 ID 与收据复用。
 
-拼接完成的全文落盘 `<run_dir>/main-doc.md` 后，与文档创建并行运行：
+## 5. 程序装配
 
-```bash
-python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
-  --source <run_dir>/main-doc.md \
-  --output <run_dir>/core-image.png \
-  --summary <run_dir>/core-image-summary.json
-```
+程序将通过校验的原文、Evidence、评分及各分支原稿装配成同一版本的 Markdown 与 Docx XML。`chatgpt-munger.md` 成功时作为一级主章节「芒格洞察」写入主文档，不创建第二篇文档。不得手工压缩、改写或删去成功分支的分析内容。
 
-脚本经 Ego Lite ChatGPT web-bridge image 模式生成一张 16:9 核心内容信息图；输出必须通过 `verification=live-dom+snapshot`、有效会话 URL 与 `outputSha256` 校验。图片与文档都就绪后插入文档顶部（标题后、溯源和原文链接前）。芒格洞察图生成成功后，再以同一段落为锚点把芒格洞察图插到核心内容图之后：
+主文档结构与格式以 `SKILL.md` 和 `output-schema.md` 为准。生成收据同时绑定 Markdown/XML 哈希与输入版本；缺少收据、文件损坏或输入变化时不能复用旧文件。文档发布通过工作流内的 Document Compiler 适配器完成，复用稳定业务键、发布收据和只读恢复。发布状态不明且缺少文档 ID 时进入待核实，不换键重建。
 
-```bash
-lark-cli docs +media-insert --as bot --doc <文档URL> \
-  --file <run_dir>/core-image.png \
-  --selection-with-ellipsis <原文链接段落文本> \
-  --before --caption 核心内容图 --align center
-```
+## 6. 端到端交付与安全恢复
 
-禁止：
+主文档通过发布和内容读回后可以先交付进度通知，但只能表述“主文档已交付，整体处理中”。卡片和任务状态由工作流总状态驱动，禁止从分析完成或单一消息成功推断最终成功。
 
-- 在主文档 XML 创建校验前生成或插入图片；
-- 插入失败后自动重试插入（防止重复插入）；
-- 对同一轮文章生成第二张核心内容图。
+每张必需图片按以下步骤推进并分别留存副作用意图、远端标识和读回结果：
 
-### 芒格洞察图
+1. Bridge 生成并核验图片字节及哈希；
+2. 飞书创建图片块、上传素材、填充图片并精确读回块 ID、位置、图片 token 与图题；
+3. 上传该图并单独发送给经验证的本人私聊，再按消息 ID 或完整近期历史读回确认。
 
-`chatgpt-munger.md` 成功落盘后，用同一脚本单独生成：
+同一图片的生成、插入与发送共享最多两轮额外恢复，正常间隔至少 240 秒。每轮从失败阶段恢复；不可恢复错误立即停止。丢响应或读回不完整时进入只读核验；无法唯一确认时保留待核实，不重复创建块或消息。缺少可信私聊目标、发送身份或频率预检数据时停止发送。
 
-```bash
-python3 .agents/skills/long-read/scripts/run_chatgpt_core_image.py \
-  --source <run_dir>/chatgpt-munger.md \
-  --output <run_dir>/munger-image.png \
-  --summary <run_dir>/munger-image-summary.json
-```
+只有必跑文字分支、主文档发布与读回、主文档通知，以及每张必需图片的生成/插入/单独发送全部确认后，才能发送最终成功通知。任一必需结果失败或未知时明确报告缺失产物和阶段，保留持久状态供恢复；未知状态不能算成功。
 
-这张图不是第二张核心内容图；它先插入主文档顶部、核心内容图之后，再作为独立交付图按触发者身份单独发送一次，失败时不发送。
+不要直接调用 `lark-cli` 写文档、插图、发图片或写索引来绕过工作流。共享身份、消息频率、幂等、读回和持续发送时长门禁仍须满足。
 
-### PNG 私聊发送
+## 7. 周期可靠性报告
 
-核心图 PNG 以 bot 身份私聊发给触发者，按 `chatType` 只执行一条、只发一次（禁止同时执行 `--chat-id` 与 `--user-id`）：
+报告使用同一持久数据库，以任务接管时间归属统计窗口。Asia/Shanghai 周日 09:00 检查此前连续 7 天；仅当明确最终失败占比 `F/N > 10%` 才发送，`N=0` 不触发。待核实和处理中计入 `N`，不计入明确失败分子。每月 1 日 09:00 必须发送上个自然月报告，无有效任务时也发送“无有效任务”。
 
-- p2p：`lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --image <run_dir>/core-image.png`
-- 群聊：`lark-cli im +messages-send --as bot --user-id <bridge_context.senderId> --image <run_dir>/core-image.png`
-- `senderType=bot`：回退 `--chat-id` 发原群
+报告固定截止快照、范围、版本和数据水位，包含成功/失败/未结数量、阶段故障、恢复结果、人工介入、耗时、重复故障指纹与修复前后证据。月报和周报同日先月报；月报未确认交付时，不发送周报。每份报告由完整 Markdown 附件和 Card 2.0 摘要组成，两者都须读回确认。
 
-## 7. 降级
+先用 `configure-report-target` 只读验证当前用户身份、本人的 open_id、bot app_id、私聊类型和精确会话成员，再将报告目标存入受保护状态库；已有配置只有显式 `--replace` 才能更改。`run-worker --serve` 在长文 Worker 的每轮调度中检查报告周期；`run-due-reports` 用于只检查或补跑上线后漏掉的周期。每次投递前重新验证目标；不匹配或不可读时不执行任何写操作。投递时只读取保存目标，并拒绝与其不一致的运行时参数。报告发件箱结果不确定时只读核验，不能重发。周报是否发送由固定快照中的 `F/N > 10%` 决定，不按待核实项触发。
 
-- 抓取失败：说明失败，不编造正文。
-- `article-decode` 或执行脚本失败：保留已成功的文字 ljg 输出和 Evidence，主文档降级交付并在交付内容中明确列出缺失的分析分支；ChatGPT 分支不受影响照常运行；禁止角色扮演回退。
-- 单条文字 ljg 失败：跳过该附录，继续交付其他结果；该分支的每次尝试错误记录保留在 `pipeline-summary.json`。
-- ChatGPT 分支失败：主文档按「主精读完成，ChatGPT 待复核」交付，整轮不得标成「精读完成」。
-- 核心内容图生成失败：主文档照常交付（无图），交付卡注明「核心图待复核」，不发送 PNG，禁止自动重发。
-- 图片插入失败：主文档照常交付，交付卡注明「核心图待插入」，PNG 仍私聊发送一次，禁止自动重试插入。
-- 文档创建失败：回退为高密度卡片。
-- 卡片发送失败：记录失败，不重复发送。
+## 8. 旧临时路径
 
-## 8. 临时文件
-
-每次消息先创建独立的 `/tmp/readx-longread.XXXXXX`，在其中保存 `source.md`、`evidence.json`、问题文件和 `analyses/*.md`；交付后只清理本轮目录。其他产物按实际使用清理：
-
-- `.wx_tmp.md`
-- `.wx_evidence.json`
-- `.wx_doc.xml`
-- `main-doc.md`
-- `/tmp/link_card.json`
-- `core-image.png`、`core-image-summary.json`
-- `munger-image.png`、`munger-image-summary.json`
-- `chatgpt-munger.md`、`chatgpt-munger-summary.json`
-
-不要删除与本轮无关的既有文件。
+`run_long_read_pipeline.py` 和直接的 `lark-cli docs +media-insert`、`lark-cli im +messages-send` 命令只保留作历史实现或局部测试，不是生产接管和交付入口。不得把旧流水线的完成状态当作持久工作流完成状态，也不得从旧临时目录推断本轮任务成功。

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from zoneinfo import ZoneInfo
 
-from long_read_workflow_reports import create_report_snapshot, report_window
+from long_read_workflow_reports import create_report_snapshot, render_report_card, report_window
 from long_read_workflow_store import StoreConflict, UncertainEffect, WorkflowStore
 
 
@@ -15,10 +15,10 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 
 def add_job(state: Path, *, status: str, created_at: float, source_id: str,
-            synthetic: bool = False, retries: int = 0):
+            synthetic: bool = False, test_task: bool = False, retries: int = 0):
     timeline = {"now": created_at}
     with WorkflowStore(state, clock=lambda: timeline["now"]) as store:
-        job = store.submit({"route": "long_read", "synthetic": synthetic}, app_id="app", source_message_id=source_id,
+        job = store.submit({"route": "long_read", "synthetic": synthetic, "test_task": test_task}, app_id="app", source_message_id=source_id,
                            artifacts=[{"key": "delivery", "kind": "document", "required": True}])
         lease = store.acquire_lease(job["job_id"], "test", 60)
         if status == "succeeded":
@@ -60,11 +60,11 @@ class ReportSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.state = Path(self.temporary.name) / "state"
-        with WorkflowStore(self.state):
-            pass
         self.now = datetime(2026, 10, 20, 12, tzinfo=TZ)
         _, self.start, self.end = report_window("weekly", now=self.now)
         self.start_epoch = self.start.timestamp()
+        with WorkflowStore(self.state, clock=lambda: self.start_epoch - 86400):
+            pass
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -99,6 +99,26 @@ class ReportSnapshotTests(unittest.TestCase):
         self.assertIsNone(result["snapshot"]["final_failure_rate"])
         self.assertIn("本统计月无有效任务", result["markdown"])
 
+    def test_long_term_target_uses_cumulative_real_tasks_not_one_report_window(self):
+        with WorkflowStore(self.state) as store:
+            store.connection.execute(
+                "UPDATE workflow_meta SET value=? WHERE key='tracking_started_at'",
+                (str(self.start_epoch - 86400),),
+            )
+        for index in range(49):
+            add_job(self.state, status="succeeded", created_at=self.start_epoch - 5000 + index,
+                    source_id=f"old-ok-{index}")
+        add_job(self.state, status="failed", created_at=self.start_epoch - 4000,
+                source_id="old-failed")
+        result = create_report_snapshot(self.state, "weekly", now=self.now)
+        snapshot = result["snapshot"]
+        self.assertEqual(snapshot["counts"]["N"], 0)
+        self.assertEqual(snapshot["long_term_counts"], {"N": 50, "S": 49, "F": 1, "U": 0, "processing": 0})
+        self.assertAlmostEqual(snapshot["long_term_final_failure_rate"], 0.02)
+        self.assertTrue(snapshot["long_term_target_eligible"])
+        self.assertTrue(snapshot["long_term_target_met"])
+        self.assertIn("长期累计", result["markdown"])
+
     def test_period_snapshot_is_immutable_and_reused_on_recovery(self):
         add_job(self.state, status="failed", created_at=self.start_epoch + 100, source_id="failed")
         first = create_report_snapshot(self.state, "weekly", now=self.now)
@@ -127,6 +147,33 @@ class ReportSnapshotTests(unittest.TestCase):
         self.assertEqual(result["snapshot"]["counts"], {"N": 1, "S": 0, "F": 0, "U": 0, "processing": 1})
         self.assertEqual(result["snapshot"]["duration_seconds"]["completed_samples"], 0)
 
+    def test_late_resolution_enters_later_cumulative_metric_without_rewriting_old_snapshot(self):
+        timeline = {"now": self.start_epoch + 100}
+        with WorkflowStore(self.state, clock=lambda: timeline["now"]) as store:
+            job = store.submit({"route": "long_read"}, app_id="app", source_message_id="late-cumulative",
+                               artifacts=[{"key": "delivery", "kind": "document", "required": True}])
+        first = create_report_snapshot(self.state, "weekly", now=self.now)
+        self.assertEqual(first["snapshot"]["counts"]["processing"], 1)
+        timeline["now"] = self.end.timestamp() + 60
+        with WorkflowStore(self.state, clock=lambda: timeline["now"]) as store:
+            lease = store.acquire_lease(job["job_id"], "test", 60)
+            store.set_status(lease, "running")
+            effect = store.prepare_effect(lease, "delivery", "document-publish", "b" * 64)
+            store.begin_effect(lease, effect["op_key"])
+            store.finish_effect(lease, effect["op_key"], "confirmed")
+            store.set_artifact(lease, "delivery", "confirmed")
+            store.finalize_artifact_plan(lease, {"delivery"})
+            store.set_status(lease, "succeeded")
+            store.release_lease(lease)
+        second = create_report_snapshot(
+            self.state, "weekly", now=datetime(2026, 10, 27, 12, tzinfo=TZ),
+        )
+        self.assertEqual(second["snapshot"]["counts"]["N"], 0)
+        self.assertEqual(second["snapshot"]["long_term_counts"]["S"], 1)
+        self.assertEqual(second["snapshot"]["long_term_counts"]["processing"], 0)
+        reused = create_report_snapshot(self.state, "weekly", now=self.now)
+        self.assertEqual(reused["snapshot"]["counts"]["processing"], 1)
+
     def test_failure_fingerprint_and_stage_duration_come_from_in_window_event_receipts(self):
         with WorkflowStore(self.state, clock=lambda: self.start_epoch + 100) as store:
             job = store.submit({"route": "long_read"}, app_id="app", source_message_id="stage-failure",
@@ -149,13 +196,66 @@ class ReportSnapshotTests(unittest.TestCase):
         self.assertEqual(result["snapshot"]["stage_duration_ms"]["median"], 240.0)
         self.assertEqual(result["snapshot"]["stage_duration_coverage"], "完整记录")
 
+    def test_report_snapshot_markdown_and_card_include_repair_and_intervention_evidence(self):
+        job_id = add_job(
+            self.state, status="failed", created_at=self.start_epoch + 100,
+            source_id="repair-evidence",
+        )
+        with WorkflowStore(self.state, clock=lambda: self.start_epoch + 300) as store:
+            store.record_reliability_event(job_id, "repair_applied", {
+                "repair_id": "fix-42", "failure_fingerprint": "bridge:unstable",
+                "summary": "保留原会话并只读恢复", "change_ref": "abc1234",
+            })
+            store.record_reliability_event(job_id, "repair_comparison", {
+                "repair_id": "fix-42", "metric": "final_failure_rate",
+                "before_value": 0.2, "after_value": 0.05,
+                "before_sample_size": 20, "after_sample_size": 20,
+                "before_window": "2026-09", "after_window": "2026-10",
+            })
+            store.record_reliability_event(job_id, "manual_intervention", {
+                "category": "reconciliation", "summary": "确认旧请求不可观察并保留待核实",
+            })
+        report = create_report_snapshot(self.state, "weekly", now=self.now)
+        snapshot = report["snapshot"]
+        self.assertEqual(snapshot["repair_records"], 1)
+        self.assertEqual(snapshot["repair_comparisons"], 1)
+        self.assertEqual(snapshot["manual_interventions"], 1)
+        self.assertEqual(len(snapshot["repair_evidence"]), 3)
+        self.assertIn("保留原会话并只读恢复", report["markdown"])
+        self.assertIn("2026-09", report["markdown"])
+        card_markdown = render_report_card(snapshot)["body"]["elements"][0]["content"]
+        self.assertIn("人工介入 **1**", card_markdown)
+        self.assertIn("已记录修复 **1**", card_markdown)
+
+    def test_repair_evidence_is_reported_by_event_window_for_older_job(self):
+        job_id = add_job(
+            self.state, status="failed", created_at=self.start_epoch - 1000,
+            source_id="older-repair-evidence",
+        )
+        with WorkflowStore(self.state, clock=lambda: self.start_epoch + 300) as store:
+            store.record_reliability_event(job_id, "repair_applied", {
+                "repair_id": "fix-old", "failure_fingerprint": "bridge:unstable",
+                "summary": "修复旧任务涉及的恢复问题", "change_ref": "abc1234",
+            })
+        report = create_report_snapshot(self.state, "weekly", now=self.now)
+        self.assertEqual(report["snapshot"]["counts"]["N"], 0)
+        self.assertEqual(report["snapshot"]["repair_records"], 1)
+        self.assertEqual(len(report["snapshot"]["repair_evidence"]), 1)
+
     def test_synthetic_jobs_do_not_enter_the_denominator(self):
         add_job(self.state, status="failed", created_at=self.start_epoch + 100, source_id="only-synthetic", synthetic=True)
         result = create_report_snapshot(self.state, "weekly", now=self.now)
         self.assertEqual(result["status"], "suppressed_weekly")
         self.assertEqual(result["snapshot"]["counts"]["N"], 0)
 
-    def test_report_outbox_requires_readback_reconciliation_before_reuse(self):
+    def test_explicit_test_tasks_do_not_enter_the_denominator(self):
+        add_job(self.state, status="failed", created_at=self.start_epoch + 100,
+                source_id="only-test-task", test_task=True)
+        result = create_report_snapshot(self.state, "weekly", now=self.now)
+        self.assertEqual(result["status"], "suppressed_weekly")
+        self.assertEqual(result["snapshot"]["counts"]["N"], 0)
+
+    def test_report_outbox_uncertain_upload_cannot_be_reused_or_pseudo_confirmed(self):
         report = create_report_snapshot(self.state, "monthly", now=datetime(2026, 10, 21, 12, tzinfo=TZ))
         with WorkflowStore(self.state) as store:
             first = store.prepare_report_effect(report["report_key"], "markdown-upload", "1" * 64)
@@ -168,17 +268,11 @@ class ReportSnapshotTests(unittest.TestCase):
             store.finish_report_effect(report["report_key"], "markdown-upload", "uncertain")
             with self.assertRaises(UncertainEffect):
                 store.begin_report_effect(report["report_key"], "markdown-upload")
-            store.finish_report_effect(report["report_key"], "markdown-upload", "confirmed",
-                                       remote_id="file_report", reconcile=True)
+            with self.assertRaises(ValueError):
+                store.finish_report_effect(report["report_key"], "markdown-upload", "confirmed",
+                                           remote_id="file_report", reconcile=True)
             with self.assertRaises(StoreConflict):
                 store.mark_report_delivered(report["report_key"])
-            for artifact_key, remote_id in (("markdown-send", "om_file"), ("card-send", "om_card")):
-                request = store.prepare_report_effect(report["report_key"], artifact_key, "3" * 64)
-                store.begin_report_effect(report["report_key"], artifact_key)
-                store.finish_report_effect(report["report_key"], artifact_key, "confirmed", remote_id=remote_id)
-            store.mark_report_delivered(report["report_key"])
-            status = store.connection.execute("SELECT status FROM reports WHERE report_key=?", (report["report_key"],)).fetchone()["status"]
-            self.assertEqual(status, "delivered")
 
 
 if __name__ == "__main__":

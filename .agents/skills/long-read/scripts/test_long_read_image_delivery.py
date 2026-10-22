@@ -9,8 +9,8 @@ import tempfile
 import unittest
 
 import run_chatgpt_core_image as core_image
-from feishu_long_read_delivery import DeliveryError, UnknownRemoteResult
-from long_read_image_delivery import deliver_image
+from feishu_long_read_delivery import DeliveryError, RetryableDeliveryError, UnknownRemoteResult
+from long_read_image_delivery import _write_private, deliver_image
 from long_read_workflow_store import WorkflowStore
 
 
@@ -20,6 +20,9 @@ PNG = b"\x89PNG\r\n\x1a\nread-x-test-image"
 class FakeImageRunner:
     def __init__(self):
         self.calls = 0
+        self.raise_after_submit = False
+        self.pending_recoveries = 0
+        self.recover_calls = 0
 
     def run(self, source_path, output_path, *, summary_path, conversation_url,
             prompt_fetcher, request_id):
@@ -40,7 +43,19 @@ class FakeImageRunner:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(PNG)
         summary_path.write_text(json.dumps(summary), encoding="utf-8")
-        return {**summary, "output": str(output_path)}
+        result = {**summary, "output": str(output_path)}
+        if self.raise_after_submit:
+            self.raise_after_submit = False
+            raise RuntimeError("response lost after image generation")
+        return result
+
+    def recover(self, source_path, output_path, summary_path, *, request_id, observe_fn=None):
+        self.recover_calls += 1
+        if self.pending_recoveries:
+            self.pending_recoveries -= 1
+            return {"status": "needs_review", "runId": request_id}
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        return {**summary, "status": "succeeded", "output": str(output_path)}
 
     @staticmethod
     def _reuse_image(output, summary, source_sha, request_id, conversation_url):
@@ -55,7 +70,8 @@ class FakeImageRunner:
 
 
 class FakeFeishu:
-    def __init__(self, *, lose_create=False, lose_send=False, unreadable_create=False):
+    def __init__(self, *, lose_create=False, lose_send=False, unreadable_create=False,
+                 create_error=None):
         self.blocks = [
             {"block_id": "title", "block_type": 3, "parent_id": "doc_1"},
             {"block_id": "source", "block_type": 3, "parent_id": "doc_1"},
@@ -63,6 +79,7 @@ class FakeFeishu:
         self.lose_create = lose_create
         self.lose_send = lose_send
         self.unreadable_create = unreadable_create
+        self.create_error = create_error
         self.created_blocks = 0
         self.message_sends = 0
         self.messages = {}
@@ -81,6 +98,8 @@ class FakeFeishu:
         return dict(item)
 
     def create_image_block(self, *, document_id, parent_block_id, index, client_token):
+        if self.create_error is not None:
+            raise self.create_error
         self.created_blocks += 1
         block_id = f"img_block_{self.created_blocks}"
         self.blocks.insert(index, {"block_id": block_id, "block_type": 27,
@@ -124,6 +143,7 @@ class FakeFeishu:
         actual_chat = chat_id or "oc_private"
         self.messages[message_id] = {
             "message_id": message_id, "msg_type": "image", "chat_id": actual_chat,
+            "create_time": 1000,
             "sender": {"id": "app_bot", "id_type": "app_id"},
             "body": {"content": json.dumps({"image_key": image_key})},
         }
@@ -180,6 +200,31 @@ class ImageWorkflowTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
+    def test_private_writer_rejects_symlink_destination_without_touching_target(self):
+        outside = Path(self.temporary.name) / "outside.bin"
+        outside.write_bytes(b"original")
+        link = self.state / "jobs" / "linked-image.png"
+        link.symlink_to(outside)
+
+        with self.assertRaises(ValueError):
+            _write_private(link, b"replacement")
+
+        self.assertEqual(outside.read_bytes(), b"original")
+        self.assertTrue(link.is_symlink())
+
+    def test_private_writer_rejects_symlink_parent_without_creating_outside_file(self):
+        outside_dir = Path(self.temporary.name) / "outside-dir"
+        outside_dir.mkdir()
+        linked_parent = self.state / "linked-dir"
+        linked_parent.symlink_to(outside_dir, target_is_directory=True)
+        target = linked_parent / "image.png"
+
+        with self.assertRaises(ValueError):
+            _write_private(target, b"image")
+
+        self.assertFalse((outside_dir / "image.png").exists())
+        self.assertTrue(linked_parent.is_symlink())
+
     def deliver(self):
         return deliver_image(
             store=self.store, lease=self.lease, payload=self.payload, root=self.root,
@@ -217,6 +262,44 @@ class ImageWorkflowTests(unittest.TestCase):
         self.assertEqual(self.client.message_sends, 1)
         self.assertEqual(len(self.client.messages), 1)
 
+    def test_lost_generation_response_is_observed_without_second_submission(self):
+        self.image_runner.raise_after_submit = True
+        self.image_runner.pending_recoveries = 1
+        first = self.deliver()
+        self.assertEqual(first["status"], "uncertain")
+        self.assertEqual(self.image_runner.calls, 1)
+        self.assertEqual(self.image_runner.recover_calls, 1)
+
+        second = self.deliver()
+        self.assertEqual(second["status"], "confirmed")
+        self.assertEqual(self.image_runner.calls, 1)
+        self.assertEqual(self.image_runner.recover_calls, 2)
+        self.assertEqual(self.client.created_blocks, 1)
+        self.assertEqual(self.client.message_sends, 1)
+
+    def test_permanent_insert_rejection_does_not_consume_image_retry_budget(self):
+        self.client.create_error = DeliveryError("invalid document block parameters")
+        result = self.deliver()
+        self.assertEqual(result["status"], "failed")
+        artifact = next(item for item in self.store.artifacts(self.job_id)
+                        if item["artifact_key"] == "core-image")
+        self.assertEqual(artifact["status"], "failed")
+        self.assertEqual(artifact["retry_count"], 0)
+        self.assertFalse(artifact["metadata"]["retryable"])
+        effect = self.store.latest_effect_for_action(self.job_id, "core-image-insert", "image-block-create")
+        self.assertEqual(effect["status"], "failed")
+        self.assertFalse(effect["metadata"]["retryable"])
+
+    def test_documented_transient_insert_rejection_schedules_one_bounded_round(self):
+        self.client.create_error = RetryableDeliveryError("Feishu API code=99991400: rate limited")
+        result = self.deliver()
+        self.assertEqual(result["status"], "retry_scheduled")
+        self.assertEqual(result["next_retry_at"], 1240.0)
+        artifact = next(item for item in self.store.artifacts(self.job_id)
+                        if item["artifact_key"] == "core-image")
+        self.assertEqual(artifact["retry_count"], 0)
+        self.assertTrue(artifact["metadata"]["retryable"])
+
     def test_unconfirmed_insert_stops_before_private_send(self):
         self.client.unreadable_create = True
         self.client.lose_create = True
@@ -225,6 +308,36 @@ class ImageWorkflowTests(unittest.TestCase):
         self.assertEqual(self.client.message_sends, 0)
         effect = self.store.latest_effect_for_action(self.job_id, "core-image-insert", "image-block-create")
         self.assertEqual(effect["status"], "uncertain")
+
+    def test_private_message_preflight_defers_when_it_would_be_the_fifth_send(self):
+        for index in range(4):
+            message_id = f"om_existing_{index}"
+            self.client.messages[message_id] = {
+                "message_id": message_id, "msg_type": "text", "chat_id": "oc_private",
+                "create_time": 1000,
+                "sender": {"id": "app_bot", "id_type": "app_id"},
+                "body": {"content": "{}"},
+            }
+        result = self.deliver()
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(self.client.message_sends, 0)
+        self.assertEqual(result["retry_at"], 1060.0)
+        send_artifact = next(item for item in self.store.artifacts(self.job_id)
+                             if item["artifact_key"] == "core-image-send")
+        self.assertEqual(send_artifact["status"], "pending")
+        self.assertEqual(send_artifact["metadata"]["next_retry_at"], 1060.0)
+
+    def test_group_trigger_without_verified_private_history_target_stops_before_generation(self):
+        self.payload["trigger"] = {
+            "feishuProfile": "read-x", "appId": "app_bot", "identity": "bot",
+            "chatType": "group", "senderId": "ou_user", "senderType": "user",
+        }
+        result = self.deliver()
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["reason_code"], "private-chat-readback-target-missing")
+        self.assertEqual(self.image_runner.calls, 0)
+        self.assertEqual(self.client.created_blocks, 0)
+        self.assertEqual(self.client.message_sends, 0)
 
 
 if __name__ == "__main__":

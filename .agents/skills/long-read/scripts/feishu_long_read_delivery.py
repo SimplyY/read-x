@@ -7,6 +7,7 @@ before each write and reconcile a lost response through the read methods here.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -18,8 +19,28 @@ class DeliveryError(RuntimeError):
     """A Feishu call returned a known failure or invalid read response."""
 
 
+class RetryableDeliveryError(DeliveryError):
+    """A known Feishu transient error that can be safely retried as a new round."""
+
+
 class UnknownRemoteResult(DeliveryError):
     """A write may have reached Feishu; do not resubmit it automatically."""
+
+
+_RETRYABLE_FEISHU_CODES = {
+    # Official Feishu common error codes: API/message rate limits and listed
+    # internal errors whose troubleshooting guidance explicitly permits retry.
+    "99991400", "1000004", "1000005", "11247", "2200", "1500", "1503",
+    "1551", "1557", "1642", "1663", "1665", "1668", "11311", "1000003",
+}
+
+
+def _raise_api_error(payload: dict) -> None:
+    code = payload.get("code", payload.get("error_code"))
+    detail = payload.get("msg") or payload.get("error") or payload.get("message") or "Feishu rejected request"
+    error_type = RetryableDeliveryError if str(code) in _RETRYABLE_FEISHU_CODES else DeliveryError
+    prefix = f"Feishu API code={code}: " if code not in (None, "") else ""
+    raise error_type(prefix + str(detail))
 
 
 def _object(value: Any, label: str) -> dict:
@@ -31,9 +52,9 @@ def _object(value: Any, label: str) -> dict:
 def _data(payload: dict) -> dict:
     """Accept lark-cli's normal envelope and the raw OpenAPI envelope."""
     if payload.get("ok") is False:
-        raise DeliveryError(str(payload.get("error") or payload.get("message") or "lark-cli rejected request"))
+        _raise_api_error(payload)
     if "code" in payload and payload.get("code") != 0:
-        raise DeliveryError(f"Feishu API code={payload.get('code')}: {payload.get('msg', '')}")
+        _raise_api_error(payload)
     data = payload.get("data")
     if not isinstance(data, dict):
         raise DeliveryError("Feishu response is missing data object")
@@ -86,6 +107,28 @@ class FeishuLongReadDelivery:
         self.runner = runner
         self.timeout = timeout
 
+    def auth_status(self) -> dict:
+        """Read and verify the current CLI identity using auth status's own flags."""
+        command = [self.binary, "auth", "status", "--json", "--verify"]
+        env = dict(os.environ)
+        env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+        env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+        try:
+            result = self.runner(command, capture_output=True, text=True,
+                                 timeout=self.timeout, check=False, env=env)
+        except (subprocess.TimeoutExpired, TimeoutError, OSError) as exc:
+            raise DeliveryError("Feishu current identity verification could not complete") from exc
+        stdout = getattr(result, "stdout", "") or ""
+        if getattr(result, "returncode", 1) != 0:
+            raise DeliveryError("Feishu current identity verification failed")
+        try:
+            payload = _object(json.loads(stdout), "lark-cli auth status")
+        except (ValueError, TypeError, DeliveryError) as exc:
+            raise DeliveryError("Feishu current identity verification returned malformed output") from exc
+        if payload.get("ok") is False:
+            raise DeliveryError("Feishu current identity verification was rejected")
+        return payload
+
     def _run(self, args: list[str], *, write: bool) -> dict:
         command = [self.binary, *args, "--as", self.identity, "--profile", self.profile, "--format", "json"]
         try:
@@ -114,7 +157,7 @@ class FeishuLongReadDelivery:
                     or ("code" in payload and payload.get("code") not in (0, None))
                 )
                 if explicit_rejection:
-                    raise DeliveryError(f"lark-cli rejected Feishu write: {detail}")
+                    _raise_api_error(payload)
                 raise UnknownRemoteResult("Feishu write exited nonzero without a confirmed rejection")
             raise DeliveryError(f"lark-cli failed ({getattr(result, 'returncode', '?')}): {detail}")
         try:
@@ -126,7 +169,7 @@ class FeishuLongReadDelivery:
         # Validate known API rejections, but preserve uncertainty for writes
         # whose successful side effect has no usable receipt.
         if payload.get("ok") is False or ("code" in payload and payload.get("code") != 0):
-            raise DeliveryError(str(payload.get("error") or payload.get("msg") or "Feishu API rejected request"))
+            _raise_api_error(payload)
         return payload
 
     @staticmethod
@@ -383,6 +426,7 @@ class FeishuLongReadDelivery:
             "container_id_type": "chat", "container_id": chat_id,
             "start_time": str(start_time), "end_time": str(end_time),
             "page_size": 50, "sort_type": "ByCreateTimeAsc",
+            "card_msg_content_type": "user_card_content",
         }
         page_token = None
         seen_tokens: set[str] = set()
@@ -396,13 +440,48 @@ class FeishuLongReadDelivery:
             if not isinstance(items, list):
                 raise DeliveryError("message history response is incomplete")
             messages.extend(_object(item, "message") for item in items)
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            if has_more is False:
                 return messages
+            if has_more is not True:
+                raise DeliveryError("message history response is missing a valid has_more flag")
             next_token = data.get("page_token")
             if not isinstance(next_token, str) or not next_token or next_token in seen_tokens:
                 raise DeliveryError("message history pagination is incomplete")
             seen_tokens.add(next_token)
             page_token = next_token
+
+
+def message_rate_slot(client, *, chat_id: str, sender_id: str,
+                      sender_id_type: str = "app_id", now: float) -> bool:
+    """Require a complete rolling-minute history and keep sends below five."""
+    start_time, end_time = max(0, int(now) - 60), int(now)
+    messages = client.list_chat_messages(
+        chat_id=chat_id, start_time=start_time, end_time=end_time,
+    )
+    sent_by_identity = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            raise DeliveryError("recent message history is incomplete")
+        created = message.get("create_time") or message.get("created_at")
+        sender = message.get("sender")
+        observed_id = sender.get("id") if isinstance(sender, dict) else None
+        observed_type = sender.get("id_type") if isinstance(sender, dict) else None
+        try:
+            timestamp = int(created)
+        except (TypeError, ValueError) as exc:
+            raise DeliveryError("recent message history has an unreadable timestamp") from exc
+        # Feishu message create_time is milliseconds; list time-window
+        # parameters and our policy clock are Unix seconds.
+        if timestamp >= 100_000_000_000:
+            timestamp //= 1000
+        if not isinstance(observed_id, str) or not observed_id or not isinstance(observed_type, str) or not observed_type:
+            raise DeliveryError("recent message history has an unreadable sender")
+        if timestamp < start_time or timestamp > end_time:
+            continue
+        if observed_id == sender_id and observed_type == sender_id_type:
+            sent_by_identity += 1
+    return sent_by_identity < 4
 
 
 def match_image_messages(messages: list[dict], *, chat_id: str, image_key: str,

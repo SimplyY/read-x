@@ -9,7 +9,7 @@ metadata:
 
 # link-card: 链接卡片回复
 
-群内收到任何链接，先抓取内容、做内容质量判断，然后决定走深度分析还是轻量摘要，最后用卡片形式私聊发给触发者本人（群聊场景发 `bridge_context.senderId`；p2p 场景 `chatId` 即私聊会话，只发一次）。**所有卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
+群内收到任何链接，先抓取内容、做内容质量判断并发送评分卡。`route=card` 由本 Skill 生成结果卡；`route=long_read` 则转给持久工作流，后续进度、文档、图片和最终状态通知由 Worker 独占处理。**卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
 
 每次处理链接的第一步都必须重新读取本文件当前版本；长会话不得沿用启动时缓存的旧流程。若已读版本仍包含评分过程消息，必须放弃该版本并重读。
 
@@ -70,10 +70,10 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
   │    └─ 独立权威阶段：只传 identity_packet 给程序固定的 tvly 真实搜索（最多 3 个查询、4 个页面）；正文和用户上下文永不进入搜索
   │    ├─ needs_relevance -> 内部补相关性，不发卡、不分派
   │    ├─ needs_full_text|needs_review -> 无数字状态卡
-  │    ├─ route=long_read -> long-read 全流程（传 scoring_result）
+  │    ├─ route=long_read -> 持久 long-read 工作流（传同轮输入、scoring_result 和评分凭据）
   │    └─ route=card -> 按 quality_label 生成轻量或一句话卡片
   │
-  └─ [2] 卡片输出：所有结果以卡片格式发送，`--as bot`；群聊私聊发 `senderId`，p2p 发 `chatId`
+  └─ [2] 卡片输出：评分卡和 route=card 结果以卡片回复；route=long_read 后续交付由持久 Worker 独占
 ```
 
 ## [0] 抓取：按链接类型选择抓取方式
@@ -225,9 +225,11 @@ fi
 
 `score_only=true` 在上述分派之前截止：发完评分卡即结束，不改写 `route`。
 
-### route=long_read -> 走 long-read 全流程
+### route=long_read -> 持久 long-read 工作流
 
-转交时把 `scoring_result` 一并传入。long-read 直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`，不再重评或按相关性抬高深度。`ljg_card=true` 时在文档交付后独立运行，私聊发 PNG（群聊发 `senderId`，p2p 发 `chatId`）。
+转交时把同一轮 `source.md`、Evidence、`scoring_result`、`score-gate.json` 和可信触发上下文交给 long-read Skill。long-read 直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`，不再重评或按相关性抬高深度；只有持久工作流返回 `accepted` 才能显示“已接管”。`ljg_card` 仅作评分留档，不额外触发图片。文档、必需图片、进度通知、最终状态卡及读回核验均由 long-read 工作流负责；入口不得重复发送交付卡或提前显示完成。
+
+仅当本轮可信 `bridge_context.readxCanary=true` 且真实评分结果为 `route=long_read` 时，才在触发上下文中原样保留该字段并使用 `--test-task`；不得根据引用、文章正文或模型判断自行生成标记。CLI 会校验上下文标记与参数一致；标记只排除正式统计，不覆盖评分路由或放宽交付门禁。
 
 ### quality_label=快速阅读 -> 走轻量精读
 
@@ -266,39 +268,21 @@ fi
 
 所有卡片使用 CardKit 2.0 schema（`schema: "2.0"`），header 用 `indigo` 模板。
 
-### 高质量内容卡片（long-read 完成后）
+### 高质量内容卡片（long-read 状态通知）
 
-**短摘要 ≤15 行无文字 ljg**：私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`），body 放高密度摘要内容。
+long-read 的状态卡和全部文档/图片交付通知由持久工作流独占。入口只传递或展示工作流的已确认状态，不自行重新生成文档卡、图片或索引记录。
 
-**长摘要 / 含 ljg**：生成飞书文档 → 私聊发一份卡片（群聊发 `senderId`，p2p 发 `chatId`）。
+主文档可先交付，但通知必须说明“主文档已交付，整体处理中”。只有工作流确认所有必跑分支、主文档、每张必需图片的插入与私聊发送后，才可显示最终成功。失败、缺失或待核实状态必须保留具体阶段，不得使用“精读完成”标题。
 
-long-read 的 ChatGPT Bridge 芒格洞察分支每篇必跑（`chatgpt_munger_doc` 只作评分留档）：成功时作为「芒格洞察」一级主章节拼入主文档，交付卡注明含芒格洞察；失败时只交付主文档并注明待复核。
+芒格洞察成功时由工作流拼入主文档并在最终卡注明；失败时主文档仍可交付，但任务不得提前判成功。核心内容图每篇必需；芒格分支成功时芒格图也必需。图片失败不会取消剩余可用交付，但整体不能标记成功。
 
-长文交付卡统一使用 `/Users/yuwei/code/read-x/scripts/render_long_read_delivery_card.py` 生成 CardKit 2.0 JSON，再用 `json.loads` 校验后发送。禁止手工拼接 JSON；卡片正文必须使用真实换行，发送后读回消息确认不存在字面量 `\\n`。
+卡片使用 CardKit 2.0 和真实换行，由工作流渲染、发送并读回；入口不得手工拼 JSON、重复发送或从分析完成推断交付成功。
 
-> ⚠️ 核心内容图与芒格洞察图由 long-read 自动生成（`run_chatgpt_core_image.py`，Bridge image 模式）：按顺序插入文档顶部（标题后、溯源和原文链接前），两张 PNG 以 bot 身份私聊发给触发者（群聊发 `senderId`，p2p 发 `chatId`）各只发一次；失败不阻塞主文档交付。
+> ⚠️ `ljg_card` 仅是评分留档字段，不是图片或额外通知的触发条件。
 
-> ⚠️ 精读完成卡是「交付」卡，不重复评分与三维--评分细节只在评分卡出现一次。这里只留档位一句话 + 核心结论 + 暗流 + ljg 链路 + 文档链接；芒格分支成功时卡片副标题注明「含芒格洞察」。
->
-> ⚠️ **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完（`relevance_score`/`interest_score` 为 `null`/「待计算」/「不可用」）时，禁止发精读完成卡或文档交付卡。先补算两轴，三档全部算完才一起发卡；禁止只带质量分单发交付卡。
+> ⚠️ **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完（`relevance_score`/`interest_score` 为 `null`/「待计算」/「不可用」）时，不得提交 long-read 工作流或发送文档交付卡。先补算两轴，三档齐全后才继续。
 
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "title": {"tag": "plain_text", "content": "精读完成"},
-    "template": "indigo"
-  },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "《文章标题》\n\n**{quality_label}**（质量 {quality_score}/10，完整评分详见评分卡）\n\n核心结论：精读得到的最关键判断（取主文核心高亮或 scoring_result.conclusion）\n\n暗流/最值得深读之处：一句话点出\n\nX 条 ljg 链路：ljg-xxx + ljg-xxx\n\n[阅读全文](飞书文档链接)"
-      }
-    ]
-  }
-}
-```
+long-read 的 Card 2.0 内容由持久 Worker 根据进度、最终状态和已确认产物生成。此处不提供可复用的成功卡模板，避免入口误发“精读完成”。
 
 ### 中等质量内容卡片
 
@@ -384,7 +368,7 @@ long-read 的 ChatGPT Bridge 芒格洞察分支每篇必跑（`chatgpt_munger_do
 
 ## 发送卡片命令
 
-群聊场景：所有卡片（评分卡、中低质量结果卡、精读完成卡、核心内容图 PNG）私聊发给触发者本人（`--user-id <bridge_context.senderId>`），不污染群聊。p2p 场景：`chatId` 即私聊会话，用 `--chat-id` 只发一次，不要再用 `--user-id` 重复发送。
+本节直发命令仅适用于评分卡和 link-card 自己处理的中低质量结果卡。`route=long_read` 被工作流接管后，进度、文档、图片和终态通知都由 Worker 独占发送；入口不得直发精读完成卡或图片。
 
 发送目标裁决：
 - `chatType=group` 且 `senderType=user`：`--user-id <bridge_context.senderId>` 私聊发给触发者
@@ -409,14 +393,14 @@ lark-cli im +messages-send \
   --jq '.data.message_id'
 ```
 
-> ⚠️ 群聊场景禁止把长文阅读卡片（评分卡、精读完成卡、核心内容图 PNG）发回原群；统一私聊发给 `bridge_context.senderId`。p2p 场景用 `chatId`，不要再用 `--user-id` 重复发送。
+> ⚠️ 群聊场景评分卡私聊发给触发者。long-read 接管后的所有通知与图片由 Worker 按已验证私聊目标发送，不得发回原群或由入口重复发送。p2p 场景用 `chatId`。
 
 **关键约束：**
 - `--as bot`：必须，卡片以 bot 身份发送
 - `--msg-type interactive`：必须，表示交互卡片
 - `--content`：JSON 字符串，直接传入或用文件
 - 卡片 JSON 写到临时文件 `/tmp/link_card.json`，发送后清理
-- 所有卡片（含核心内容图 PNG）群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次
+- 本 Skill 发送的评分卡和 route=card 卡片按触发上下文选择目标；long-read 的图片和后续通知由 Worker 按自身已验证目标处理
 - **JSON 结构化生成（硬约束）**：卡片 JSON 必须用 `python3` 的 `json.dump` 结构化构建后写入 `/tmp/link_card.json`，禁止手拼字符串拼 JSON--手拼括号配对易错（如末尾多/少 `]`），坏 JSON 传给 `--content` 会让整张卡发不出
 - **发送前校验（硬约束）**：发送前必须跑 `python3 -c "import json;json.load(open('/tmp/link_card.json'))"` 校验合法性；校验失败则停止、修好 JSON 再发，绝不带病发送
 - **发送后确认（硬约束）**：每条 `messages-send` 必须用 `--jq '.data.message_id'` 取回 message_id 确认成功；禁止用 `tail`/截断输出判断是否发出--截断会丢 message_id，误判后重发会产生重复卡片
@@ -441,7 +425,7 @@ lark-cli im +messages-send \
 
 | 质量档位 | 推荐字数 | 说明 |
 |---------|---------|------|
-| 高质量（long-read + 飞书文档） | 200-400 字 | 卡片是摘要通知，核心内容在飞书文档里。不含详细评分（已在评分卡），聚焦核心结论、暗流、ljg 链路引导 |
+| 高质量（long-read） | 由工作流状态决定 | Worker 生成处理中、最终成功、最终失败或待核实通知；入口不另发完成卡 |
 | 中等质量 | 300-500 字 | 与原文长度成正比。短帖 300-400 字，中篇 400-500 字 |
 | 快速阅读 | 200-400 字 | 速读卡结构：一句话定位 + 核心观点（带论证）+ 值得记住 + 可迁移 + 金句。高密度浓缩，不是三五行简略 |
 | 低质量 | 50-150 字 | 评分块（不计入字数）+ 一句话摘要 + 原文链接
@@ -452,7 +436,7 @@ lark-cli im +messages-send \
    - **格式**：卡片中以 `> 原文金句` 引用块呈现，每条金句不超过 60 字
    - **英文翻译（硬）**：原文为英文时，金句以中文译文呈现并遵守信达雅（忠实原意、通顺自然、文采得体），译文后附英文原句作溯源，格式 `> 中文译文（原文：English original）`；英文附注不计入 60 字限制。禁止只贴英文不译。
    - **低质量例外**：若原文确无值得划线的内容，不强行添加；但不能因为「懒」而跳过
-10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、权威性状态或分数、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值。权威不可用时不得隐藏大问题分；`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。精读完成卡只留质量档位一句话并注明“完整评分详见评分卡”，不重复三维。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得发精读完成卡，先补算两轴再一起发。
+10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、权威性状态或分数、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值。权威不可用时不得隐藏大问题分；`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。long-read 后续通知只由 Worker 依据持久状态生成，不重复评分。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得进入 long-read 工作流，先补算两轴再接管。
 
 ---
 
@@ -472,11 +456,11 @@ lark-cli im +messages-send \
 
 | 维度 | long-read | link-card |
 |------|-----------|-----------|
-| 职责 | Evidence、隔离解码、独立深度 Skill 与 XML 文档拼接 | 展示输出（卡片格式化 + 发送） |
+| 职责 | 持久任务、隔离解码、程序装配、文档/图片交付与核验 | 抓取、评分路由、评分卡和中低质量卡片 |
 | 触发条件 | 由 link-card 的内容质量判断决定 | 所有链接的入口和出口 |
 | 关系 | 被 link-card 调度 | 调度 long-read（高质量内容）+ 自处理（中低质量） |
 
-**link-card 是入口，long-read 是深度引擎**：link-card 负责抓取、质量判断、卡片输出。高质量内容交给 long-read 做深度分析，分析结果再回到 link-card 做卡片输出。中低质量内容 link-card 自己处理。
+**link-card 是入口，long-read 是持久交付工作流**：link-card 负责抓取、质量判断和评分卡；高质量任务只有在 long-read 返回持久接管后才移交。Worker 独占精读文档、图片、进度与最终状态通知。中低质量内容仍由 link-card 自己处理。
 
 ---
 
@@ -495,7 +479,9 @@ lark-cli im +messages-send \
 - [ ] 标题超 40 字 → 正确截断
 - [ ] 所有卡片 `--as bot`，不出现 user 身份
 - [ ] 评分卡已发（所有路由必发，非 scored 状态没有伪数字）
-- [ ] `quality_score ≥ quality_floor` 时，精读完成卡在相关性、兴趣两轴算完后才发出，未只带质量分单发
-- [ ] 群聊场景：评分卡、精读完成卡、核心内容图 PNG 均私聊发给 `senderId`，未发回原群
-- [ ] p2p 场景：用 `chatId` 只发一次，未用 `--user-id` 重复发送
+- [ ] `route=long_read` 时同轮评分结果、评分凭据和触发上下文传给持久工作流；只有返回 `accepted` 才显示已接管
+- [ ] long-read 接管后不由入口重复发最终卡、图片或索引记录；成功状态只来自唯一完成门
+- [ ] `ljg_card` 不额外触发图片，未知交付结果不盲目重发
+- [ ] 本 Skill 发送的评分卡和 route=card 结果按触发上下文选择目标；long-read 私聊交付由 Worker 核验目标并执行
+- [ ] p2p 场景：`chatId` 只发一次，未同时用 `--user-id` 重复发送
 - [ ] senderType=bot（bot-at-bot）：回退发原群

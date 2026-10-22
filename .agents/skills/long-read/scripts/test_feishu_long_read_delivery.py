@@ -10,6 +10,7 @@ import unittest
 from feishu_long_read_delivery import (
     DeliveryError,
     FeishuLongReadDelivery,
+    RetryableDeliveryError,
     UnknownRemoteResult,
     match_image_messages,
     match_report_messages,
@@ -21,6 +22,22 @@ def response(payload: dict, code: int = 0):
 
 
 class FeishuDeliveryTests(unittest.TestCase):
+    def test_auth_status_uses_its_documented_identity_flags_without_as_or_profile(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return response({"identity": "user", "verified": True, "identities": {
+                "user": {"openId": "ou_self", "tokenStatus": "valid"},
+            }})
+
+        client = FeishuLongReadDelivery(identity="user", profile="read-x", runner=runner)
+        result = client.auth_status()
+        self.assertEqual(result["identities"]["user"]["openId"], "ou_self")
+        self.assertEqual(calls[0][0], [client.binary, "auth", "status", "--json", "--verify"])
+        self.assertEqual(calls[0][1]["env"]["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"], "1")
+        self.assertEqual(calls[0][1]["env"]["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"], "1")
+
     def test_create_image_block_uses_explicit_position_and_client_token(self):
         calls = []
 
@@ -92,6 +109,17 @@ class FeishuDeliveryTests(unittest.TestCase):
             image.write_bytes(b"\x89PNG\r\n\x1a\nrest")
             with self.assertRaises(DeliveryError):
                 client.upload_document_image(document_id="doc_1", image_block_id="blk_1", png_path=image)
+
+    def test_documented_feishu_rate_limit_is_distinguished_as_retryable(self):
+        client = FeishuLongReadDelivery(
+            identity="bot", profile="read-x",
+            runner=lambda *a, **k: response({"code": 99991400, "msg": "request trigger frequency limit"}),
+        )
+        with self.assertRaises(RetryableDeliveryError):
+            client.create_image_block(
+                document_id="doc_1", parent_block_id="doc_1", index=0,
+                client_token="c4e8af13-e0bb-469e-a1a6-a1f5fc98d520",
+            )
 
     def test_upload_uses_docx_image_parent_and_returns_file_token(self):
         calls = []
@@ -221,6 +249,41 @@ class FeishuDeliveryTests(unittest.TestCase):
             runner=lambda *a, **k: response({"code": 0, "data": {"items": [message]}}),
         )
         self.assertEqual(client.get_message("om_123"), message)
+
+    def test_chat_history_requests_original_card_json_for_exact_readback(self):
+        calls = []
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return response({"code": 0, "data": {"items": [], "has_more": False}})
+
+        client = FeishuLongReadDelivery(identity="bot", profile="read-x", runner=runner)
+        self.assertEqual(client.list_chat_messages(
+            chat_id="oc_self", start_time=1000, end_time=1060,
+        ), [])
+        params = json.loads(calls[0][calls[0].index("--params") + 1])
+        self.assertEqual(params["card_msg_content_type"], "user_card_content")
+
+    def test_chat_history_requires_explicit_boolean_pagination_completion(self):
+        for invalid_marker in ("missing", None, "false", 0):
+            with self.subTest(has_more=invalid_marker):
+                data = {"items": []}
+                if invalid_marker != "missing":
+                    data["has_more"] = invalid_marker
+                client = FeishuLongReadDelivery(
+                    identity="bot", profile="read-x",
+                    runner=lambda *a, _data=data, **k: response({"code": 0, "data": _data}),
+                )
+                with self.assertRaises(DeliveryError):
+                    client.list_chat_messages(chat_id="oc_self", start_time=1000, end_time=1060)
+
+    def test_chat_history_requires_next_page_token_when_more_is_true(self):
+        client = FeishuLongReadDelivery(
+            identity="bot", profile="read-x",
+            runner=lambda *a, **k: response({"code": 0, "data": {"items": [], "has_more": True}}),
+        )
+        with self.assertRaises(DeliveryError):
+            client.list_chat_messages(chat_id="oc_self", start_time=1000, end_time=1060)
 
     def test_report_card_and_markdown_file_calls_keep_one_explicit_target(self):
         calls = []
