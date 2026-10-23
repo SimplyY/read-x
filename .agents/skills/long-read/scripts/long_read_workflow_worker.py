@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -31,10 +32,24 @@ import long_read_workflow_notifications as workflow_notifications
 
 CALLER = "read-x:long-read-text"
 MAX_BRANCHES = 3
+LONG_EXTERNAL_WAIT_LEASE_SECONDS = 900
+DOCUMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 SAFE_PRE_SUBMIT_FAILURES = {
     "bridge-busy", "local-rate-limit-cooldown", "recovery-capability-unavailable",
     "invalid-bridge-transport", "invalid-mode", "invalid-request-id",
 }
+
+
+def _renew_for_external_wait(store: WorkflowStore, lease: Lease,
+                             lock: threading.RLock | None = None) -> None:
+    """Keep the job fenced while one bounded external wait is in flight."""
+    remaining = max(0.0, lease.expires_at - float(store.clock()))
+    ttl_seconds = max(float(LONG_EXTERNAL_WAIT_LEASE_SECONDS), remaining)
+    if lock is None:
+        store.renew_lease(lease, ttl_seconds)
+    else:
+        with lock:
+            store.renew_lease(lease, ttl_seconds)
 
 
 def _safe(path: Path) -> None:
@@ -294,12 +309,14 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
                 _mark_artifact(store, lease, artifact_key, "confirmed")
             return {"artifact": artifact_key, "status": "confirmed", "reused": True,
                     "request_id": effect["request_id"], "output_sha256": receipt["output_sha256"]}
+        _renew_for_external_wait(store, lease, lock)
         bridge_result = observe_fn(
             original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
             caller_label=CALLER, max_wait_seconds=720,
         )
         recovered = True
     elif effect and effect["status"] in {"attempting", "uncertain"}:
+        _renew_for_external_wait(store, lease, lock)
         bridge_result = observe_fn(
             original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
             caller_label=CALLER, max_wait_seconds=720,
@@ -322,6 +339,7 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
         if prompt_assets is None:
             return {"artifact": artifact_key, "status": "needs_review", "reason": "request-metadata-unavailable",
                     "request_id": effect["request_id"]}
+        _renew_for_external_wait(store, lease, lock)
         with lock:
             attempt = store.begin_effect(lease, effect["op_key"])
         if not attempt["execute"]:
@@ -385,7 +403,8 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
             with lock:
                 _mark_artifact(store, lease, artifact_key, "failed", "output-validation", failure_stage="output-validation")
         return {"artifact": artifact_key, "status": "failed", "reason": reason,
-                "request_id": effect["request_id"]}
+                "request_id": effect["request_id"], "failure_stage": "output-validation",
+                "business_validation_status": "failed"}
     if recovered:
         recovered_assets = _load_or_store_request_metadata(
             output, request_id=effect["request_id"], prompt_sha=prompt_sha,
@@ -413,17 +432,67 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
                                 metadata=success_metadata)
         _mark_artifact(store, lease, artifact_key, "confirmed")
     return {"artifact": artifact_key, "status": "confirmed", "request_id": effect["request_id"],
-            "output_sha256": record["output_sha256"], "recovered": recovered}
+            "output_sha256": record["output_sha256"], "recovered": recovered,
+            "business_validation_status": "succeeded"}
+
+
+def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int) -> None:
+    request_id = result.get("request_id")
+    if outcome_recorder is None or not request_id:
+        return
+    branch_status = result.get("status")
+    outcome_status = "succeeded" if branch_status == "confirmed" else "failed" if branch_status == "failed" else "needs_review"
+    validation_status = result.get("business_validation_status")
+    if validation_status not in {"succeeded", "failed", "unknown"}:
+        if branch_status == "confirmed":
+            validation_status = "succeeded"
+        elif result.get("failure_stage") == "output-validation":
+            validation_status = "failed"
+        else:
+            validation_status = "unknown"
+    try:
+        outcome_recorder({
+            "source": "read-x", "caller": CALLER,
+            "attemptId": request_id, "runId": request_id, "clientRequestId": request_id,
+            "status": outcome_status, "deliveryStatus": outcome_status,
+            "businessValidationStatus": validation_status,
+            "readbackStatus": result.get("readback_status", "unknown"),
+            "durationMs": max(0, duration_ms),
+        })
+    except Exception:
+        # Outcome persistence is diagnostic-only and cannot change the durable worker result.
+        diagnostic = {
+            "event": "bridge-business-outcome-diagnostic-failed",
+            "reason": "read-x-outcome-recorder-raised",
+            "errorCode": "diagnostic-write-failed",
+            "source": "read-x",
+            "caller": CALLER,
+        }
+        try:
+            uuid.UUID(request_id)
+        except (ValueError, TypeError, AttributeError):
+            pass
+        else:
+            diagnostic.update({"attemptId": request_id, "runId": request_id,
+                               "clientRequestId": request_id})
+        try:
+            print(json.dumps(diagnostic, separators=(",", ":")), file=sys.stderr)
+        except Exception:
+            pass
 
 
 def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
                            root: Path, candidate: dict, state_dir: Path,
-                           adapter: DocumentCompilerAdapter) -> dict:
+                           adapter: DocumentCompilerAdapter,
+                           manual_document_id: str | None = None) -> dict:
     job_id = lease.job_id
     trigger = payload.get("trigger") or {}
+    # Document Compiler consumes the Bridge-managed Feishu profile directory.
+    # larkCliProfile is only for direct lark-cli calls in Read-X adapters.
     profile = trigger.get("feishuProfile")
     identity = trigger.get("identity", "bot")
     try:
+        _renew_for_external_wait(store, lease)
         plan, env = adapter.prepare_plan(
             job_id=job_id, document_dir=root / "document",
             candidate_xml=Path(candidate["xml_path"]), profile=profile, identity=identity,
@@ -432,6 +501,17 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
         return {"status": "needs_review", "reason": f"{type(exc).__name__}: {exc}"}
 
     effect = store.find_effect(job_id, "main-document", "document-publish")
+    if manual_document_id is not None:
+        if not DOCUMENT_ID_RE.fullmatch(manual_document_id):
+            return {"status": "needs_review", "reason": "manual_document_id_invalid"}
+        if effect is None:
+            return {"status": "needs_review", "reason": "manual_document_id_has_no_uncertain_publish"}
+        if effect["status"] == "confirmed":
+            if effect.get("remote_id") == manual_document_id:
+                return {"status": "confirmed", "document_id": manual_document_id, "reused": True}
+            return {"status": "needs_review", "reason": "manual_document_id_conflicts_with_confirmed_publish"}
+        if effect["status"] not in {"attempting", "uncertain"}:
+            return {"status": "needs_review", "reason": "manual_document_id_requires_uncertain_publish"}
     try:
         if effect is None:
             effect = store.prepare_effect(
@@ -448,7 +528,12 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
         return {"status": "failed", "reason": "previous_known_document_publish_failure"}
 
     def reconcile_readback() -> dict:
-        recovery = adapter.recover(plan=plan, state_dir=state_dir / "document-compiler-state", env=env)
+        _renew_for_external_wait(store, lease)
+        if manual_document_id is None:
+            recovery = adapter.recover(plan=plan, state_dir=state_dir / "document-compiler-state", env=env)
+        else:
+            recovery = adapter.recover(plan=plan, state_dir=state_dir / "document-compiler-state",
+                                       env=env, document_id=manual_document_id)
         if recovery.get("status") == "confirmed":
             store.reconcile_effect(
                 lease, effect["op_key"], "confirmed",
@@ -477,6 +562,7 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
 
     effect = store.begin_effect(lease, effect["op_key"])
     try:
+        _renew_for_external_wait(store, lease)
         outcome = adapter.publish(
             plan=plan, state_dir=state_dir / "document-compiler-state", env=env,
         )
@@ -530,6 +616,7 @@ def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
 
 def _notify(*, store: WorkflowStore, lease: Lease, payload: dict, root: Path,
             event: str, notification_fn=None, **kwargs) -> dict:
+    _renew_for_external_wait(store, lease)
     if event == "document_review":
         artifact_key = "document-publish-review-notification"
         artifact = next((item for item in store.artifacts(lease.job_id)
@@ -576,6 +663,7 @@ def _deliver_image(*, store: WorkflowStore, lease: Lease, payload: dict, root: P
                    image_key: str, image_name: str, source_path: Path,
                    document_id: str, image_index: int, image_delivery_fn=None,
                    clock=time.time) -> dict:
+    _renew_for_external_wait(store, lease)
     if image_delivery_fn is not None:
         return image_delivery_fn(
             store=store, lease=lease, payload=payload, root=root,
@@ -592,7 +680,8 @@ def _deliver_image(*, store: WorkflowStore, lease: Lease, payload: dict, root: P
 
 def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *, bridge_fn, observe_fn,
                          prompt_fetcher, document_compiler=None, image_delivery_fn=None,
-                         notification_fn=None, clock=time.time) -> dict:
+                         notification_fn=None, clock=time.time,
+                         manual_document_id: str | None = None, outcome_recorder=None) -> dict:
     job_id = lease.job_id
     root = _artifact_root(state_dir, job_id)
     lock = threading.RLock()
@@ -650,7 +739,8 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                                   "outputSha256": hashlib.sha256(bridge_text.encode("utf-8")).hexdigest()})
             _mark_artifact(store, lease, "analysis:munger-analysis", "confirmed")
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
-                             "reuse": True, "output": munger_output, "status": "confirmed"})
+                             "reuse": True, "output": munger_output, "status": "confirmed",
+                             "request_id": munger_effect["request_id"]})
         else:
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
                              "output": munger_output,
@@ -669,15 +759,19 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
     def invoke(branch):
         if branch.get("terminal"):
             return branch
+        started = time.monotonic()
         if branch.get("reuse"):
-            return branch
-        result = _run_text_branch(
-            store=store, lease=lease, lock=lock, artifact_key=branch["artifact_key"],
-            output=branch["output"], source_sha=source_sha, prompt=branch["prompt"],
-            validate=branch["validate"], prompt_assets=branch.get("prompt_assets"),
-            prompt_sha=branch.get("prompt_sha"),
-            bridge_fn=bridge_fn, observe_fn=observe_fn,
-        )
+            result = branch
+        else:
+            result = _run_text_branch(
+                store=store, lease=lease, lock=lock, artifact_key=branch["artifact_key"],
+                output=branch["output"], source_sha=source_sha, prompt=branch["prompt"],
+                validate=branch["validate"], prompt_assets=branch.get("prompt_assets"),
+                prompt_sha=branch.get("prompt_sha"),
+                bridge_fn=bridge_fn, observe_fn=observe_fn,
+            )
+        _record_read_x_text_outcome(outcome_recorder, result,
+                                    round((time.monotonic() - started) * 1000))
         return {"name": branch["name"], **result}
 
     with ThreadPoolExecutor(max_workers=min(MAX_BRANCHES, max(1, len(branches)))) as pool:
@@ -733,6 +827,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         supplement_output = root / "analysis" / "document-supplement.md"
         if supplement_effect and supplement_effect["status"] != "prepared":
             supplement_prompt = None
+        supplement_started = time.monotonic()
         supplement_outcome = _run_text_branch(
             store=store, lease=lease, lock=lock,
             artifact_key="analysis:document-supplement", output=supplement_output,
@@ -741,6 +836,8 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             validate=document_supplement.validate_supplement,
             bridge_fn=bridge_fn, observe_fn=observe_fn,
         )
+        _record_read_x_text_outcome(outcome_recorder, supplement_outcome,
+                                    round((time.monotonic() - supplement_started) * 1000))
         outcomes.append({"name": "document-supplement", **supplement_outcome})
     else:
         article_status = current_artifacts.get("analysis:article-decode", {}).get("status")
@@ -858,6 +955,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         document_delivery = _publish_main_document(
             store=store, lease=lease, payload=payload, root=root, candidate=candidate_result,
             state_dir=state_dir, adapter=document_compiler or DocumentCompilerAdapter(),
+            manual_document_id=manual_document_id,
         )
         if document_delivery["status"] in {"needs_review", "uncertain"}:
             unresolved = True
@@ -1227,8 +1325,11 @@ def _advance_delivery(*, store: WorkflowStore, lease: Lease, payload: dict, root
 def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", lease_seconds: float = 900,
                 bridge_fn=run_bridge, observe_fn=observe_bridge, prompt_fetcher=None,
                 document_compiler=None, image_delivery_fn=None, notification_fn=None,
-                clock=time.time) -> dict:
+                clock=time.time, manual_document_id: str | None = None, outcome_recorder=None) -> dict:
     state_dir = Path(state_dir).absolute()
+    if manual_document_id is not None and not DOCUMENT_ID_RE.fullmatch(manual_document_id):
+        return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
+                "reason_code": "invalid-document-id"}
     lock = threading.RLock()
     with WorkflowStore(state_dir) as store:
         job = store.get_job(job_id)
@@ -1248,7 +1349,9 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
                                           observe_fn=observe_fn, prompt_fetcher=prompt_fetcher,
                                           document_compiler=document_compiler,
                                           image_delivery_fn=image_delivery_fn,
-                                          notification_fn=notification_fn, clock=clock)
+                                          notification_fn=notification_fn, clock=clock,
+                                          manual_document_id=manual_document_id,
+                                          outcome_recorder=outcome_recorder)
         except Exception as exc:
             with lock:
                 try:
@@ -1266,10 +1369,15 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
         return result
 
 
-def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x-worker") -> dict:
+def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x-worker",
+             manual_document_id: str | None = None, outcome_recorder=None) -> dict:
     state_dir = Path(state_dir).absolute()
     if job_id:
-        return process_job(state_dir, job_id, owner=owner)
+        return process_job(state_dir, job_id, owner=owner, manual_document_id=manual_document_id,
+                           outcome_recorder=outcome_recorder)
+    if manual_document_id is not None:
+        return {"status": "blocked", "delivery_complete": False,
+                "reason_code": "manual-document-id-requires-job-id"}
     db = state_dir / "workflow.sqlite3"
     if not db.is_file() or db.is_symlink():
         return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
@@ -1279,7 +1387,7 @@ def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x
         selected = next((job["job_id"] for job in jobs if _job_is_due(store, job, now)), None)
     if selected is None:
         return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
-    return process_job(state_dir, selected, owner=owner)
+    return process_job(state_dir, selected, owner=owner, outcome_recorder=outcome_recorder)
 
 
 def _job_is_due(store: WorkflowStore, job: dict, now: float) -> bool:

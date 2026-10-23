@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,10 +16,33 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 
 def add_job(state: Path, *, status: str, created_at: float, source_id: str,
-            synthetic: bool = False, test_task: bool = False, retries: int = 0):
+            synthetic: bool = False, test_task: bool = False,
+            unverified_test_task: bool = False, retries: int = 0):
     timeline = {"now": created_at}
     with WorkflowStore(state, clock=lambda: timeline["now"]) as store:
-        job = store.submit({"route": "long_read", "synthetic": synthetic, "test_task": test_task}, app_id="app", source_message_id=source_id,
+        payload = {
+            "route": "long_read", "synthetic": synthetic, "test_task": test_task,
+            "trigger": {
+                "feishuProfile": "bridge-profile", "larkCliProfile": "app", "appId": "app", "identity": "bot",
+                "chatType": "group", "chatId": "oc_canary", "senderId": "ou_self",
+                "senderType": "user", "sourceMessageId": source_id,
+                **({"readxCanary": True} if test_task else {}),
+            },
+        }
+        if test_task and not unverified_test_task:
+            url = "https://example.com/canary"
+            payload["canary_source_proof"] = {
+                "schema": "readx-canary-source-proof/v1",
+                "method": "lark-cli.im.messages-mget",
+                "source_created_at": "2026-10-22 15:49",
+                "app_id": "app", "profile": "app", "message_id": source_id,
+                "chat_id": "oc_canary", "sender_id": "ou_self",
+                "source_url_sha256": hashlib.sha256(url.encode()).hexdigest(),
+                "source_content_sha256": hashlib.sha256(
+                    f"【CANARY｜Read-X long_read 端到端验收】\n{url}".encode()
+                ).hexdigest(),
+            }
+        job = store.submit(payload, app_id="app", source_message_id=source_id,
                            artifacts=[{"key": "delivery", "kind": "document", "required": True}])
         lease = store.acquire_lease(job["job_id"], "test", 60)
         if status == "succeeded":
@@ -254,6 +278,13 @@ class ReportSnapshotTests(unittest.TestCase):
         result = create_report_snapshot(self.state, "weekly", now=self.now)
         self.assertEqual(result["status"], "suppressed_weekly")
         self.assertEqual(result["snapshot"]["counts"]["N"], 0)
+
+    def test_unverified_test_marker_stays_in_the_production_denominator(self):
+        add_job(self.state, status="failed", created_at=self.start_epoch + 100,
+                source_id="unverified-test-marker", test_task=True, unverified_test_task=True)
+        result = create_report_snapshot(self.state, "weekly", now=self.now)
+        self.assertEqual(result["snapshot"]["counts"]["N"], 1)
+        self.assertEqual(result["snapshot"]["counts"]["F"], 1)
 
     def test_report_outbox_uncertain_upload_cannot_be_reused_or_pseudo_confirmed(self):
         report = create_report_snapshot(self.state, "monthly", now=datetime(2026, 10, 21, 12, tzinfo=TZ))

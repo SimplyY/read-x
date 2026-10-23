@@ -84,7 +84,7 @@ class AnalysisTask:
 
 
 class OutputValidationError(RuntimeError):
-    """Deterministic output rejection (too short, missing form, artifacts, oversized prompt).
+    """Deterministic output rejection (empty output, missing form, artifacts, oversized prompt).
 
     Retrying cannot change the outcome, so the caller must not spend the
     remaining budget on it.

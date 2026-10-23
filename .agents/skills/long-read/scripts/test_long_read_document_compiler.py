@@ -148,6 +148,27 @@ class DocumentCompilerAdapterTests(unittest.TestCase):
         self.assertEqual(uncertain["status"], "uncertain")
         self.assertEqual(sum(call[0][3] == "recover" for call in self.runner.calls), 2)
 
+    def test_manual_document_id_is_passed_only_to_read_only_recovery(self):
+        plan, env = self.plan()
+        self.adapter.recover(plan=plan, state_dir=self.state_dir, env=env,
+                             document_id="doc_test_123")
+        command = self.runner.calls[-1][0]
+        self.assertIn("recover", command)
+        self.assertIn("--document-id", command)
+        self.assertEqual(command[command.index("--document-id") + 1], "doc_test_123")
+        self.assertNotIn("publish", command)
+
+    def test_manual_document_id_requires_exact_remote_id_match(self):
+        plan, env = self.plan()
+        result = self.adapter.recover(
+            plan=plan, state_dir=self.state_dir, env=env,
+            document_id="doc_operator_456",
+        )
+        self.assertEqual(result["status"], "uncertain")
+        self.assertNotIn("remote_id", result)
+        self.assertEqual(sum(call[0][3] == "publish" for call in self.runner.calls), 0)
+        self.assertEqual(sum(call[0][3] == "recover" for call in self.runner.calls), 1)
+
     def test_changed_plan_receipt_fails_closed_and_never_republishes(self):
         plan, _ = self.plan()
         plan["xml"].write_text("<title>changed</title>", encoding="utf-8")

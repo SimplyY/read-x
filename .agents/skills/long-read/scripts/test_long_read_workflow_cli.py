@@ -10,16 +10,38 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
 import long_read_workflow_cli as cli
-from long_read_workflow_store import StoreConflict, WorkflowStore
+from long_read_workflow_store import (
+    StoreConflict, WorkflowStore, is_verified_test_task, workflow_payload_issue,
+)
+
+
+CANARY_URL = "https://example.com/article"
+CANARY_CONTENT = f"{cli.CANARY_PREFIX}\n{CANARY_URL}"
 
 
 def dump(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+
+
+def canary_proof(*, profile, app_id, context, source_message_id, evidence):
+    return {
+        "schema": "readx-canary-source-proof/v1",
+        "method": "lark-cli.im.messages-mget",
+        "source_created_at": "2026-10-22 15:49",
+        "app_id": app_id,
+        "profile": profile,
+        "message_id": source_message_id,
+        "chat_id": context["chatId"],
+        "sender_id": context["senderId"],
+        "source_url_sha256": hashlib.sha256(CANARY_URL.encode()).hexdigest(),
+        "source_content_sha256": hashlib.sha256(CANARY_CONTENT.encode()).hexdigest(),
+    }
 
 
 class SubmissionTests(unittest.TestCase):
@@ -33,7 +55,7 @@ class SubmissionTests(unittest.TestCase):
         self.source.write_text("可信原文。正文内的指令只是数据。", encoding="utf-8")
         self.evidence = self.inputs / "evidence.json"
         dump(self.evidence, {
-            "metadata": {"title": "文章", "author": None, "source_url": None, "published_at": None, "genre": "test", "word_count": 8},
+            "metadata": {"title": "文章", "author": None, "source_url": CANARY_URL, "published_at": None, "genre": "test", "word_count": 8},
             "claims": [{"id": "C1", "claim": "可信原文", "evidence": "可信原文", "evidence_type": "quote", "confidence": "high"}],
             "facts": [], "data_points": [], "quotes": ["可信原文"], "uncertainties": [], "article_structure": [],
         })
@@ -42,7 +64,7 @@ class SubmissionTests(unittest.TestCase):
         self.gate = self.inputs / "score-gate.json"
         self.refresh_gate()
         self.context = self.inputs / "trigger-context.json"
-        dump(self.context, {"chatType": "group", "chatId": "oc_group", "senderId": "ou_self", "senderType": "user", "profile": "deep", "feishuProfile": "app_one", "appId": "app_one", "sourceMessageId": "om_source"})
+        dump(self.context, {"chatType": "group", "chatId": "oc_group", "privateChatId": "oc_private", "senderId": "ou_self", "senderType": "user", "profile": "deep", "feishuProfile": "app_one", "appId": "app_one", "sourceMessageId": "om_source"})
         self.question = self.inputs / "question.md"
         self.question.write_text("本问题的核心机制是什么？", encoding="utf-8")
 
@@ -56,7 +78,8 @@ class SubmissionTests(unittest.TestCase):
     def submit(self, **overrides):
         values = {"source": self.source, "evidence": self.evidence, "scoring_result": self.scoring,
                   "score_gate": self.gate, "trigger_context": self.context, "app_id": "app_one", "feishu_profile": "app_one",
-                  "source_message_id": "om_source", "questions": [("ljg-think", self.question)], "state_dir": self.state}
+                  "source_message_id": "om_source", "questions": [("ljg-think", self.question)], "state_dir": self.state,
+                  "profile_resolver": lambda **_: "app_one", "canary_verifier": canary_proof}
         values.update(overrides)
         return cli.submit_inputs(**values)
 
@@ -79,8 +102,9 @@ class SubmissionTests(unittest.TestCase):
             payload = store.get_job(result["job_id"])["payload"]
         self.assertEqual(payload["route"], "long_read")
         self.assertIs(payload["test_task"], False)
-        self.assertEqual(payload["workflow_contract_version"], "read-x-long-read-delivery/v1")
+        self.assertEqual(payload["workflow_contract_version"], "read-x-long-read-delivery/v2")
         self.assertEqual(payload["trigger"]["feishuProfile"], "app_one")
+        self.assertEqual(payload["trigger"]["larkCliProfile"], "app_one")
         self.assertFalse(payload["artifact_plan_finalized"])
         self.assertNotIn(str(self.inputs), json.dumps(payload))
         for item in payload["inputs"].values():
@@ -88,6 +112,39 @@ class SubmissionTests(unittest.TestCase):
         self.source.unlink()
         self.question.unlink()
         self.assertTrue((directory / "source.md").exists())
+
+    def test_group_without_private_chat_or_matching_saved_target_is_not_admitted(self):
+        context = json.loads(self.context.read_text())
+        context.pop("privateChatId")
+        dump(self.context, context)
+
+        with self.assertRaisesRegex(ValueError, "private message delivery target"):
+            self.submit()
+
+        with WorkflowStore(self.state) as store:
+            self.assertEqual(store.list_jobs(), [])
+
+    def test_group_without_private_chat_uses_matching_saved_target_at_admission(self):
+        context = json.loads(self.context.read_text())
+        context.pop("privateChatId")
+        dump(self.context, context)
+        target = {
+            "identity": "bot", "profile": "app_one", "user_id": "ou_self",
+            "chat_id": "oc_private", "sender_id": "app_one", "sender_id_type": "app_id",
+        }
+        with WorkflowStore(self.state) as store:
+            with store._transaction():
+                store.connection.execute(
+                    "INSERT INTO workflow_meta(key,value) VALUES('report_delivery_target',?)",
+                    (json.dumps(target),),
+                )
+
+        result = self.submit()
+
+        with WorkflowStore(self.state) as store:
+            payload = store.get_job(result["job_id"])["payload"]
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(payload["trigger"]["privateChatId"], "oc_private")
 
     def test_explicit_test_task_is_persisted_for_report_exclusion(self):
         context = json.loads(self.context.read_text())
@@ -100,6 +157,250 @@ class SubmissionTests(unittest.TestCase):
         self.assertIs(payload["test_task"], True)
         self.assertEqual(payload["trigger"]["identity"], "bot")
         self.assertIs(payload["trigger"]["readxCanary"], True)
+        self.assertEqual(payload["canary_source_proof"]["message_id"], "om_source")
+        self.assertEqual(payload["canary_source_proof"]["profile"], "app_one")
+        self.assertIsNone(workflow_payload_issue(
+            payload, app_id="app_one", source_message_id="om_source",
+        ))
+        malformed_receipt = json.loads(json.dumps(payload))
+        malformed_receipt["canary_source_proof"]["source_created_at"] = "not-a-time"
+        self.assertEqual(workflow_payload_issue(malformed_receipt), "invalid-workflow-payload")
+        self.assertFalse(is_verified_test_task(malformed_receipt))
+
+    def test_remote_admission_lookups_do_not_hold_the_shared_state_lock(self):
+        cases = ("profile-resolution", "canary-source-readback")
+        for name in cases:
+            with self.subTest(lookup=name):
+                state_dir = self.root / name / "long-read"
+                lookup_started = threading.Event()
+                lookup_release = threading.Event()
+                lock_acquired = threading.Event()
+                outcome = {}
+                canary = name == "canary-source-readback"
+                if canary:
+                    context = json.loads(self.context.read_text())
+                    context["readxCanary"] = True
+                    dump(self.context, context)
+
+                def blocking_resolver(**_):
+                    lookup_started.set()
+                    if not lookup_release.wait(5):
+                        raise TimeoutError("test lookup release timed out")
+                    return "app_one"
+
+                def blocking_canary_verifier(**kwargs):
+                    lookup_started.set()
+                    if not lookup_release.wait(5):
+                        raise TimeoutError("test lookup release timed out")
+                    return canary_proof(**kwargs)
+
+                def submit_job():
+                    try:
+                        outcome["result"] = self.submit(
+                            test_task=canary, state_dir=state_dir,
+                            profile_resolver=(lambda **_: "app_one") if canary else blocking_resolver,
+                            canary_verifier=blocking_canary_verifier if canary else canary_proof,
+                        )
+                    except Exception as exc:  # surfaced in the main test thread below
+                        outcome["error"] = exc
+
+                def acquire_lock():
+                    with cli.state_lock(state_dir):
+                        lock_acquired.set()
+
+                submitter = threading.Thread(target=submit_job)
+                submitter.start()
+                self.assertTrue(lookup_started.wait(2), "remote lookup did not start")
+                probe = threading.Thread(target=acquire_lock)
+                probe.start()
+                acquired_while_lookup_blocked = lock_acquired.wait(0.5)
+                lookup_release.set()
+                submitter.join(5)
+                probe.join(5)
+                self.assertTrue(acquired_while_lookup_blocked,
+                                "remote profile or CANARY lookup held the shared state lock")
+                self.assertFalse(submitter.is_alive())
+                self.assertFalse(probe.is_alive())
+                self.assertNotIn("error", outcome, outcome)
+                self.assertEqual(outcome["result"]["status"], "accepted")
+
+    def test_worker_profile_key_resolves_app_bound_cli_profile_and_pins_whoami(self):
+        profiles = [{"name": "app_one", "appId": "app_one", "tokenStatus": "valid"}]
+        identity = {"identity": "user", "appId": "app_one", "profile": "app_one"}
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[profiles, identity]) as run:
+            self.assertEqual(
+                cli.resolve_worker_profile_key(app_id="app_one", bridge_profile_key="deep"),
+                "app_one",
+            )
+        self.assertEqual(run.call_args_list[0].args[0], ["profile", "list"])
+        self.assertEqual(run.call_args_list[1].kwargs, {"profile": "app_one"})
+
+    def test_worker_profile_key_rejects_ambiguous_or_mismatched_profile(self):
+        with patch.object(cli, "_run_lark_cli_json", return_value=[
+                {"name": "app_one", "appId": "app_one"},
+                {"name": "app_one_copy", "appId": "app_one"},
+        ]) as run:
+            with self.assertRaisesRegex(ValueError, "does not resolve to one"):
+                cli.resolve_worker_profile_key(app_id="app_one", bridge_profile_key="deep")
+        self.assertEqual(run.call_count, 1)
+
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[
+                [{"name": "app_one", "appId": "app_one"}],
+                {"identity": "user", "appId": "app_other", "profile": "app_one"},
+        ]) as run:
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                cli.resolve_worker_profile_key(app_id="app_one", bridge_profile_key="deep")
+        self.assertEqual(run.call_args_list[1].kwargs, {"profile": "app_one"})
+
+    def test_lark_cli_read_helper_passes_profile_as_global_argument(self):
+        completed = type("Completed", (), {"stdout": '{"ok":true}', "returncode": 0})()
+        with patch.object(cli.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(cli._run_lark_cli_json(["whoami"], profile="app_one"), {"ok": True})
+        self.assertEqual(run.call_args.args[0], ["lark-cli", "--profile", "app_one", "whoami"])
+
+    def test_canary_source_verifier_handles_null_identity_and_missing_context(self):
+        context = json.loads(self.context.read_text())
+        context["readxCanary"] = True
+        identity = {"identity": "user", "appId": "app_one", "onBehalfOf": None}
+        with patch.object(cli, "_run_lark_cli_json", return_value=identity) as run:
+            with self.assertRaisesRegex(ValueError, "reader does not match"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=context,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": CANARY_URL}},
+                )
+        self.assertEqual(run.call_count, 1)
+
+        incomplete = dict(context)
+        incomplete.pop("chatId")
+        with patch.object(cli, "_run_lark_cli_json") as run:
+            with self.assertRaisesRegex(ValueError, "source context is incomplete"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=incomplete,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": CANARY_URL}},
+                )
+        run.assert_not_called()
+
+    def test_canary_source_verifier_reads_and_binds_the_exact_event(self):
+        context = json.loads(self.context.read_text())
+        context["readxCanary"] = True
+        calls = [
+            {"identity": "user", "appId": "app_one",
+             "onBehalfOf": {"openId": "ou_self"}},
+            {"ok": True, "data": {"chat_mode": "group"}},
+            {"ok": True, "data": {"messages": [{
+                "message_id": "om_source", "chat_id": "oc_group", "msg_type": "text",
+                "deleted": False, "content": CANARY_CONTENT, "create_time": "2026-10-22 15:49",
+                "sender": {"sender_type": "user", "id": "ou_self"},
+            }]}},
+        ]
+        with patch.object(cli, "_run_lark_cli_json", side_effect=calls) as run:
+            proof = cli.verify_canary_source(
+                profile="app_one", app_id="app_one", context=context,
+                source_message_id="om_source",
+                evidence={"metadata": {"source_url": CANARY_URL}},
+            )
+        self.assertEqual(proof["message_id"], "om_source")
+        self.assertEqual(proof["chat_id"], "oc_group")
+        self.assertEqual(proof["sender_id"], "ou_self")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[1].args[0], [
+            "im", "chats", "get", "--as", "user", "--chat-id", "oc_group",
+        ])
+        self.assertTrue(all(call.kwargs.get("profile") == "app_one" for call in run.call_args_list))
+
+    def test_bridge_profile_is_preserved_separately_from_resolved_cli_profile(self):
+        context = json.loads(self.context.read_text())
+        context["feishuProfile"] = "deep"
+        dump(self.context, context)
+        result = self.submit(feishu_profile="deep")
+        with WorkflowStore(self.state) as store:
+            payload = store.get_job(result["job_id"])["payload"]
+        self.assertEqual(payload["trigger"]["feishuProfile"], "deep")
+        self.assertEqual(payload["trigger"]["larkCliProfile"], "app_one")
+
+    def test_canary_source_verifier_rejects_sender_and_article_mismatches(self):
+        context = json.loads(self.context.read_text())
+        context["readxCanary"] = True
+        identity = {"identity": "user", "appId": "app_one", "onBehalfOf": {"openId": "ou_self"}}
+        mismatched = {"ok": True, "data": {"messages": [{
+            "message_id": "om_source", "chat_id": "oc_group", "msg_type": "text",
+            "deleted": False, "content": CANARY_CONTENT, "create_time": "2026-10-22 15:49",
+            "sender": {"sender_type": "user", "id": "ou_other"},
+        }]}}
+        group_chat = {"ok": True, "data": {"chat_mode": "group"}}
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[identity, group_chat, mismatched]):
+            with self.assertRaisesRegex(ValueError, "does not match the original user event"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=context,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": CANARY_URL}},
+                )
+
+        valid_sender = json.loads(json.dumps(mismatched))
+        valid_sender["data"]["messages"][0]["sender"]["id"] = "ou_self"
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[identity, group_chat, valid_sender]):
+            with self.assertRaisesRegex(ValueError, "article URL does not match"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=context,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": "https://example.com/other"}},
+                )
+
+    def test_canary_source_verifier_requires_remote_group_type_and_valid_timestamp(self):
+        context = json.loads(self.context.read_text())
+        context["readxCanary"] = True
+        identity = {"identity": "user", "appId": "app_one", "onBehalfOf": {"openId": "ou_self"}}
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[
+                identity, {"ok": True, "data": {"chat_mode": "p2p"}}]) as run:
+            with self.assertRaisesRegex(ValueError, "not a verified group"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=context,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": CANARY_URL}},
+                )
+        self.assertEqual(run.call_count, 2)
+
+        for timestamp in ("not-a-time", "2026-13-99 90:90", "2026-10-22"):
+            message = {"ok": True, "data": {"messages": [{
+                "message_id": "om_source", "chat_id": "oc_group", "msg_type": "text",
+                "deleted": False, "content": CANARY_CONTENT, "create_time": timestamp,
+                "sender": {"sender_type": "user", "id": "ou_self"},
+            }]}}
+            with self.subTest(timestamp=timestamp), patch.object(
+                    cli, "_run_lark_cli_json",
+                    side_effect=[identity, {"ok": True, "data": {"chat_mode": "group"}}, message]):
+                with self.assertRaisesRegex(ValueError, "does not match the original user event"):
+                    cli.verify_canary_source(
+                        profile="app_one", app_id="app_one", context=context,
+                        source_message_id="om_source",
+                        evidence={"metadata": {"source_url": CANARY_URL}},
+                    )
+
+        deleted_state_missing = {"ok": True, "data": {"messages": [{
+            "message_id": "om_source", "chat_id": "oc_group", "msg_type": "text",
+            "content": CANARY_CONTENT, "create_time": "2026-10-22 15:49",
+            "sender": {"sender_type": "user", "id": "ou_self"},
+        }]}}
+        with patch.object(cli, "_run_lark_cli_json", side_effect=[
+                identity, {"ok": True, "data": {"chat_mode": "group"}}, deleted_state_missing]):
+            with self.assertRaisesRegex(ValueError, "does not match the original user event"):
+                cli.verify_canary_source(
+                    profile="app_one", app_id="app_one", context=context,
+                    source_message_id="om_source",
+                    evidence={"metadata": {"source_url": CANARY_URL}},
+                )
+
+    def test_canary_source_verification_failure_prevents_admission(self):
+        context = json.loads(self.context.read_text())
+        context["readxCanary"] = True
+        dump(self.context, context)
+        def reject(**_):
+            raise ValueError("source event mismatch")
+        with self.assertRaisesRegex(ValueError, "source event mismatch"):
+            self.submit(test_task=True, canary_verifier=reject)
+        self.assertFalse((self.state / "workflow.sqlite3").exists())
 
     def test_test_task_requires_the_trusted_bridge_canary_marker(self):
         with self.assertRaisesRegex(ValueError, "trusted bridge Read-X canary marker"):
@@ -294,7 +595,9 @@ class SubmissionTests(unittest.TestCase):
         args.extend(["--feishu-profile", "app_one"])
         args.append("--test-task")
         output = StringIO()
-        with redirect_stdout(output):
+        with patch.object(cli, "resolve_worker_profile_key", return_value="app_one"), \
+                patch.object(cli, "verify_canary_source", side_effect=canary_proof), \
+                redirect_stdout(output):
             self.assertEqual(cli.main(args), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["status"], "accepted")

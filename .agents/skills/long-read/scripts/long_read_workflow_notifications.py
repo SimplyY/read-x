@@ -35,15 +35,39 @@ def _sha(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _target(trigger: dict) -> tuple[dict, str] | None:
+def _target(trigger: dict, report_target: dict | None = None) -> tuple[dict, str] | None:
     """Require a known private chat for both rate preflight and loss recovery."""
     if trigger.get("chatType") == "p2p" and trigger.get("chatId"):
         chat_id = trigger["chatId"]
         return {"chat_id": chat_id}, chat_id
-    if (trigger.get("chatType") == "group" and trigger.get("senderType") != "bot"
-            and trigger.get("senderId") and trigger.get("privateChatId")):
-        return {"user_id": trigger["senderId"]}, trigger["privateChatId"]
+    if trigger.get("chatType") == "group" and trigger.get("senderType") == "user" and trigger.get("senderId"):
+        if trigger.get("privateChatId"):
+            return {"user_id": trigger["senderId"]}, trigger["privateChatId"]
+        if (isinstance(report_target, dict)
+                and report_target.get("identity") == "bot"
+                and report_target.get("profile") == trigger.get("larkCliProfile")
+                and report_target.get("user_id") == trigger.get("senderId")
+                and report_target.get("sender_id") == trigger.get("appId")
+                and report_target.get("sender_id_type") == "app_id"
+                and isinstance(report_target.get("chat_id"), str)
+                and report_target["chat_id"]):
+            chat_id = report_target["chat_id"]
+            return {"chat_id": chat_id}, chat_id
     return None
+
+
+def resolve_delivery_target(trigger: dict, store: WorkflowStore | None = None) -> tuple[dict, str] | None:
+    """Resolve a private recipient, using only an identity-matched saved P2P target."""
+    target = _target(trigger)
+    if target is not None or store is None:
+        return target
+    if trigger.get("chatType") != "group" or trigger.get("senderType") != "user":
+        return None
+    try:
+        from long_read_workflow_report_delivery import report_target_from_store
+        return _target(trigger, report_target_from_store(store))
+    except ValueError:
+        return None
 
 
 def _correlate_card(card: dict, request_id: str) -> dict:
@@ -121,15 +145,17 @@ def send_status_card(*, store: WorkflowStore, lease, payload: dict, root: Path,
                      artifact_key: str, action: str, card: dict,
                      client=None, clock=time.time) -> dict:
     trigger = payload.get("trigger") or {}
-    profile = trigger.get("feishuProfile")
+    profile = trigger.get("larkCliProfile")
     sender_id = trigger.get("appId")
     if not isinstance(profile, str) or not profile or not isinstance(sender_id, str) or not sender_id:
         return {"status": "needs_review", "reason_code": "notification-identity-missing"}
-    target = _target(trigger)
+    target = resolve_delivery_target(trigger, store)
     if target is None:
         return {"status": "needs_review", "reason_code": "private-chat-readback-target-missing"}
     command_target, history_chat_id = target
-    client = client or FeishuLongReadDelivery(identity="bot", profile=profile)
+    client = client or FeishuLongReadDelivery(
+        identity="bot", profile=profile, expected_app_id=sender_id,
+    )
     now = float(clock())
     effect = store.find_effect(lease.job_id, artifact_key, action)
     request_id = effect["request_id"] if effect else str(uuid.uuid4())
@@ -146,6 +172,11 @@ def send_status_card(*, store: WorkflowStore, lease, payload: dict, root: Path,
     retry_failed = False
     if effect["status"] == "confirmed":
         return {"status": "confirmed", "message_id": effect.get("remote_id"), "reused": True}
+    try:
+        if client.verify_app_identity(sender_id) is not True:
+            raise DeliveryError("Read-X bot identity is not verified")
+    except DeliveryError:
+        return {"status": "needs_review", "reason_code": "notification-identity-unverified"}
     if effect["status"] == "failed":
         age = max(0.0, now - float(effect["created_at"]))
         effect_metadata = effect.get("metadata", {})
@@ -231,7 +262,7 @@ def send_status_card(*, store: WorkflowStore, lease, payload: dict, root: Path,
             message_id = _readback(
                 client, effect.get("remote_id"), chat_id=history_chat_id,
                 sender_id=sender_id, card=correlated_card,
-                start_time=max(0, int(float(effect["updated_at"]) - 60)),
+                start_time=max(0, int(float(effect["created_at"]) - 60)),
                 end_time=int(now + 60),
             )
         except DeliveryError:

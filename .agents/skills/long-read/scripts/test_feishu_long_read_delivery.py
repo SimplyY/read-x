@@ -38,6 +38,49 @@ class FeishuDeliveryTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["env"]["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"], "1")
         self.assertEqual(calls[0][1]["env"]["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"], "1")
 
+    def test_bot_write_rechecks_the_pinned_profile_and_app_before_sending(self):
+        calls = []
+        outputs = [
+            response([{"name": "app_bot", "appId": "app_bot"}]),
+            response({"identity": "user", "appId": "app_bot", "profile": "app_bot"}),
+            response({"code": 0, "data": {"message_id": "om_sent"}}),
+        ]
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return outputs.pop(0)
+
+        client = FeishuLongReadDelivery(
+            identity="bot", profile="app_bot", runner=runner, expected_app_id="app_bot",
+        )
+
+        self.assertEqual(client.send_image_message(
+            image_key="img_asset", idempotency_key="request_1", chat_id="oc_private",
+        ), "om_sent")
+        self.assertEqual(calls[0], [client.binary, "profile", "list"])
+        self.assertEqual(calls[1], [client.binary, "--profile", "app_bot", "whoami"])
+        self.assertEqual(calls[2][1:3], ["im", "+messages-send"])
+
+    def test_bot_write_stops_when_the_pinned_profile_resolves_to_another_app(self):
+        calls = []
+        outputs = [
+            response([{"name": "wrong_profile", "appId": "app_other"}]),
+        ]
+
+        def runner(args, **kwargs):
+            calls.append(args)
+            return outputs.pop(0)
+
+        client = FeishuLongReadDelivery(
+            identity="bot", profile="app_bot", runner=runner, expected_app_id="app_bot",
+        )
+        with self.assertRaises(DeliveryError):
+            client.send_image_message(
+                image_key="img_asset", idempotency_key="request_1", chat_id="oc_private",
+            )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1:], ["profile", "list"])
+
     def test_create_image_block_uses_explicit_position_and_client_token(self):
         calls = []
 
@@ -276,6 +319,26 @@ class FeishuDeliveryTests(unittest.TestCase):
                 )
                 with self.assertRaises(DeliveryError):
                     client.list_chat_messages(chat_id="oc_self", start_time=1000, end_time=1060)
+
+    def test_document_block_list_requires_explicit_boolean_pagination_completion(self):
+        for invalid_marker in ("missing", None, "false", 0):
+            with self.subTest(has_more=invalid_marker):
+                data = {"items": []}
+                if invalid_marker != "missing":
+                    data["has_more"] = invalid_marker
+                client = FeishuLongReadDelivery(
+                    identity="bot", profile="read-x",
+                    runner=lambda *a, _data=data, **k: response({"code": 0, "data": _data}),
+                )
+                with self.assertRaises(DeliveryError):
+                    client.list_document_blocks("doc_1")
+
+        client = FeishuLongReadDelivery(
+            identity="bot", profile="read-x",
+            runner=lambda *a, **k: response({"code": 0, "data": {"items": [], "has_more": True}}),
+        )
+        with self.assertRaises(DeliveryError):
+            client.list_document_blocks("doc_1")
 
     def test_chat_history_requires_next_page_token_when_more_is_true(self):
         client = FeishuLongReadDelivery(

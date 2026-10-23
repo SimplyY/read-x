@@ -31,6 +31,12 @@ class FakeMessages:
         self.sends = 0
         self.history_reads = 0
         self.fail_history = False
+        self.identity_ok = True
+
+    def verify_app_identity(self, expected_app_id):
+        if not self.identity_ok or expected_app_id != "app_bot":
+            raise DeliveryError("simulated bot profile mismatch")
+        return True
 
     def list_chat_messages(self, *, chat_id, start_time, end_time):
         self.history_reads += 1
@@ -66,7 +72,7 @@ class NotificationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.state = Path(self.temporary.name) / "state"
         self.trigger = {
-            "appId": "app_bot", "feishuProfile": "read-x", "identity": "bot",
+            "appId": "app_bot", "feishuProfile": "bridge-read-x", "larkCliProfile": "app_bot", "identity": "bot",
             "chatType": "p2p", "chatId": "oc_private", "privateChatId": "oc_private",
             "senderId": "ou_user", "senderType": "user",
         }
@@ -76,7 +82,8 @@ class NotificationTests(unittest.TestCase):
             "trigger": self.trigger,
             "inputs": {"evidence.json": {"path": str(evidence_path)}},
         }
-        self.store = WorkflowStore(self.state, clock=lambda: 1000.0)
+        self.clock_value = [1000.0]
+        self.store = WorkflowStore(self.state, clock=lambda: self.clock_value[0])
         job = self.store.submit(self.payload, app_id="app_bot", artifacts=[
             {"key": "document-notification", "kind": "message"},
             {"key": "content-review-notification", "kind": "message", "required": False},
@@ -89,7 +96,8 @@ class NotificationTests(unittest.TestCase):
         self.store.close()
         self.temporary.cleanup()
 
-    def send(self, client, *, now=lambda: 1000.0):
+    def send(self, client, *, now=None):
+        now = now or (lambda: self.clock_value[0])
         return send_status_card(
             store=self.store, lease=self.lease, payload=self.payload, root=self.state,
             artifact_key="document-notification", action="message-send", card=self.card,
@@ -103,6 +111,43 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_review")
         self.assertEqual(client.sends, 0)
         self.assertIsNone(_target(self.payload["trigger"]))
+
+    def test_group_notification_uses_matching_verified_report_target(self):
+        self.payload["trigger"] = {**self.trigger, "chatType": "group", "privateChatId": None}
+        target = {
+            "identity": "bot", "profile": "app_bot", "user_id": "ou_user",
+            "chat_id": "oc_private", "sender_id": "app_bot", "sender_id_type": "app_id",
+        }
+        with self.store._transaction():
+            self.store.connection.execute(
+                "INSERT INTO workflow_meta(key,value) VALUES('report_delivery_target',?)",
+                (json.dumps(target),),
+            )
+        client = FakeMessages()
+
+        result = self.send(client)
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(client.sends, 1)
+        self.assertEqual(client.history[0]["chat_id"], "oc_private")
+
+    def test_group_notification_rejects_report_target_for_another_user_or_app(self):
+        self.payload["trigger"] = {**self.trigger, "chatType": "group", "privateChatId": None}
+        target = {
+            "identity": "bot", "profile": "other_profile", "user_id": "ou_other",
+            "chat_id": "oc_other", "sender_id": "other_app", "sender_id_type": "app_id",
+        }
+        with self.store._transaction():
+            self.store.connection.execute(
+                "INSERT INTO workflow_meta(key,value) VALUES('report_delivery_target',?)",
+                (json.dumps(target),),
+            )
+        client = FakeMessages()
+
+        result = self.send(client)
+
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(client.sends, 0)
 
     def test_four_recent_sends_defer_before_a_fifth_send(self):
         history = [{
@@ -123,6 +168,16 @@ class NotificationTests(unittest.TestCase):
         }])
         result = self.send(client)
         self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(client.sends, 0)
+
+    def test_unverified_bot_profile_stops_before_status_card_send(self):
+        client = FakeMessages()
+        client.identity_ok = False
+
+        result = self.send(client)
+
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["reason_code"], "notification-identity-unverified")
         self.assertEqual(client.sends, 0)
 
     def test_millisecond_create_time_counts_in_the_seconds_window(self):
@@ -149,6 +204,23 @@ class NotificationTests(unittest.TestCase):
         artifact = next(item for item in self.store.artifacts(self.job_id)
                         if item["artifact_key"] == "document-notification")
         self.assertEqual(artifact["status"], "confirmed")
+
+    def test_interrupted_accepted_card_uses_original_intent_time_for_readback(self):
+        class AcceptedThenInterrupted(FakeMessages):
+            def send_interactive_card(self, **kwargs):
+                super().send_interactive_card(**kwargs)
+                raise KeyboardInterrupt("worker stopped after remote acceptance")
+
+        client = AcceptedThenInterrupted()
+        with self.assertRaises(KeyboardInterrupt):
+            self.send(client)
+
+        self.clock_value[0] += 120
+        result = self.send(client)
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertTrue(result["recovered"])
+        self.assertEqual(client.sends, 1)
 
     def test_rejected_after_write_is_confirmed_by_immediate_readback(self):
         class RejectedAfterWrite(FakeMessages):

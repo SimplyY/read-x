@@ -109,14 +109,13 @@ def configure_report_target(*, state_dir: Path, profile: str, user_id: str,
             "identity": "bot", "profile": profile}
 
 
-def load_report_target(state_dir: Path) -> dict:
-    with WorkflowStore(Path(state_dir)) as store:
-        row = store.connection.execute(
-            "SELECT value FROM workflow_meta WHERE key='report_delivery_target'"
-        ).fetchone()
-        if not row:
-            raise ValueError("report delivery target is not configured")
-        target = json.loads(row["value"])
+def report_target_from_store(store: WorkflowStore) -> dict:
+    row = store.connection.execute(
+        "SELECT value FROM workflow_meta WHERE key='report_delivery_target'"
+    ).fetchone()
+    if not row:
+        raise ValueError("report delivery target is not configured")
+    target = json.loads(row["value"])
     required = {"identity", "profile", "user_id", "chat_id", "sender_id", "sender_id_type"}
     if (not isinstance(target, dict) or set(target) != required or target.get("identity") != "bot"
             or target.get("sender_id_type") != "app_id"
@@ -124,6 +123,11 @@ def load_report_target(state_dir: Path) -> dict:
                    for key in ("profile", "user_id", "chat_id", "sender_id"))):
         raise ValueError("persisted report delivery target is invalid")
     return target
+
+
+def load_report_target(state_dir: Path) -> dict:
+    with WorkflowStore(Path(state_dir)) as store:
+        return report_target_from_store(store)
 
 
 def _safe_state_file(state_dir: Path, filename: str) -> Path:

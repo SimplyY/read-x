@@ -24,11 +24,14 @@ import time
 import uuid
 
 
-WORKFLOW_CONTRACT_VERSION = "read-x-long-read-delivery/v1"
+WORKFLOW_CONTRACT_VERSION = "read-x-long-read-delivery/v2"
 REQUIRED_SUBMISSION_INPUTS = {
     "source.md", "evidence.json", "scoring-result.json", "score-gate.json", "trigger-context.json",
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_SOURCE_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?\Z"
+)
 _QUESTION_SKILL = re.compile(r"ljg-[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 _REPORT_WINDOW = re.compile(r"(?:\d{4}-\d{2}|\d{4}-\d{2}-\d{2}(?:\.\.\d{4}-\d{2}-\d{2})?)\Z")
 RELIABILITY_EVENT_TYPES = {
@@ -51,6 +54,51 @@ class UncertainEffect(StoreConflict):
 
 class RetryExhausted(StoreConflict):
     pass
+
+
+def _canary_source_proof_is_valid(payload: object) -> bool:
+    if not isinstance(payload, dict) or payload.get("test_task") is not True:
+        return False
+    proof = payload.get("canary_source_proof")
+    trigger = payload.get("trigger")
+    if not isinstance(proof, dict) or not isinstance(trigger, dict):
+        return False
+    if (proof.get("schema") != "readx-canary-source-proof/v1"
+            or proof.get("method") != "lark-cli.im.messages-mget"
+            or proof.get("app_id") != trigger.get("appId")
+            or proof.get("profile") != trigger.get("larkCliProfile")
+            or proof.get("message_id") != trigger.get("sourceMessageId")
+            or proof.get("chat_id") != trigger.get("chatId")
+            or proof.get("sender_id") != trigger.get("senderId")
+            or trigger.get("chatType") != "group"
+            or trigger.get("senderType") != "user"
+            or trigger.get("readxCanary") is not True
+            or not isinstance(proof.get("source_content_sha256"), str)
+            or not _SHA256.fullmatch(proof["source_content_sha256"])
+            or not isinstance(proof.get("source_url_sha256"), str)
+            or not _SHA256.fullmatch(proof["source_url_sha256"])
+            or not is_valid_source_created_at(proof.get("source_created_at"))):
+        return False
+    return True
+
+
+def is_valid_source_created_at(value: object) -> bool:
+    """Validate the ISO-like timestamp format returned by the Feishu CLI."""
+    if not isinstance(value, str) or not _SOURCE_TIMESTAMP.fullmatch(value.strip()):
+        return False
+    try:
+        datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def is_verified_test_task(payload: object) -> bool:
+    """Only source-readback-verified canaries are excluded from production metrics/retention."""
+    if (isinstance(payload, dict)
+            and payload.get("schema") == "retained-long-read-statistics/v1"):
+        return payload.get("verified_test_task") is True
+    return _canary_source_proof_is_valid(payload)
 
 
 def workflow_payload_issue(payload: object, *, app_id: str | None = None,
@@ -97,6 +145,8 @@ def workflow_payload_issue(payload: object, *, app_id: str | None = None,
     trigger = payload.get("trigger")
     if (not isinstance(trigger, dict)
             or not isinstance(trigger.get("feishuProfile"), str) or not trigger["feishuProfile"].strip()
+            or not isinstance(trigger.get("larkCliProfile"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", trigger["larkCliProfile"])
             or trigger.get("identity", "bot") != "bot"
             or not isinstance(trigger.get("appId"), str) or not trigger["appId"].strip()
             or not isinstance(trigger.get("chatType"), str) or trigger["chatType"] not in {"group", "p2p"}
@@ -106,10 +156,13 @@ def workflow_payload_issue(payload: object, *, app_id: str | None = None,
             or not isinstance(trigger.get("sourceMessageId"), str)
             or not trigger["sourceMessageId"].startswith("om_")):
         return "invalid-workflow-payload"
-    if (test_task and trigger.get("readxCanary") is not True) or (
+    if (test_task and (trigger.get("readxCanary") is not True
+                       or not _canary_source_proof_is_valid(payload))) or (
             "readxCanary" in trigger
             and (not isinstance(trigger["readxCanary"], bool)
                  or trigger["readxCanary"] is not test_task)):
+        return "invalid-workflow-payload"
+    if not test_task and "canary_source_proof" in payload:
         return "invalid-workflow-payload"
     if app_id is not None and trigger.get("appId") != app_id:
         return "invalid-workflow-payload"

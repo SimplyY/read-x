@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -16,6 +17,12 @@ from urllib.parse import urlparse
 BRIDGE_PROCESS_GRACE_SECONDS = 30
 BUSY_RETRY_MAX_WAIT_SECONDS = 600
 WORKFLOW_NEW_CHAT_URL = "https://chatgpt.com/"
+READ_X_OUTCOME_CALLERS = {"read-x:long-read-text"}
+OUTCOME_STATES = {"succeeded", "failed", "needs_review", "unknown"}
+OUTCOME_FIELDS = {
+    "source", "caller", "attemptId", "runId", "clientRequestId", "status",
+    "deliveryStatus", "businessValidationStatus", "readbackStatus", "durationMs",
+}
 
 
 def _bridge_candidates() -> list[Path]:
@@ -171,6 +178,64 @@ def observe_bridge(
         return {"status": "needs_review", "reason": "bridge-observe-run-id-mismatch", "runId": original_run_id}
     if completed.returncode != 0 and result.get("status") == "succeeded":
         return {"status": "needs_review", "reason": "bridge-observe-exit-status-mismatch", "runId": original_run_id}
+    return result
+
+
+def record_business_outcome(event: dict, *, bridge: Path | None = None, timeout_seconds: int = 30) -> dict:
+    """Persist a content-free Read-X terminal outcome through the shared Bridge journal."""
+    if not isinstance(event, dict) or set(event) - OUTCOME_FIELDS:
+        raise ValueError("business outcome contains unsupported fields")
+    if event.get("source") != "read-x" or event.get("caller") not in READ_X_OUTCOME_CALLERS:
+        raise ValueError("business outcome source or caller is invalid")
+    for key in ("attemptId", "runId", "clientRequestId"):
+        value = event.get(key)
+        if value is not None:
+            try:
+                uuid.UUID(value)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ValueError(f"business outcome {key} must be a UUID") from exc
+    if not event.get("attemptId") or not (event.get("runId") or event.get("clientRequestId")):
+        raise ValueError("business outcome identity is incomplete")
+    for key in ("status", "deliveryStatus", "businessValidationStatus", "readbackStatus"):
+        if event.get(key) not in OUTCOME_STATES:
+            raise ValueError(f"business outcome {key} is invalid")
+    duration_ms = event.get("durationMs")
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+        raise ValueError("business outcome duration is invalid")
+
+    safe_event = {key: event[key] for key in OUTCOME_FIELDS if key in event}
+
+    def failed_result():
+        print(json.dumps({
+            "event": "bridge-business-outcome-diagnostic-failed",
+            "reason": "read-x-outcome-recorder-unavailable",
+            "errorCode": "diagnostic-write-failed",
+            "source": "read-x",
+            "caller": safe_event["caller"],
+            "attemptId": safe_event["attemptId"],
+            **({"runId": safe_event["runId"]} if safe_event.get("runId") else {}),
+            **({"clientRequestId": safe_event["clientRequestId"]} if safe_event.get("clientRequestId") else {}),
+        }, separators=(",", ":")), file=sys.stderr)
+        return {"status": "failed", "persistenceTarget": "unavailable", "errorCode": "diagnostic-write-failed"}
+
+    try:
+        bridge_uri = (bridge or resolve_bridge()).resolve().as_uri()
+        module = (
+            f"import {{ recordBridgeBusinessOutcome }} from {json.dumps(bridge_uri)};"
+            "let input = ''; for await (const chunk of process.stdin) input += chunk;"
+            "const result = await recordBridgeBusinessOutcome(JSON.parse(input));"
+            "process.stdout.write(JSON.stringify(result) + '\\n');"
+        )
+        completed = subprocess.run(
+            ["node", "--input-type=module", "-e", module],
+            input=json.dumps(safe_event, separators=(",", ":")),
+            text=True, capture_output=True, check=False, timeout=timeout_seconds,
+        )
+        result = _parse_stdout(completed.stdout)
+    except Exception:
+        return failed_result()
+    if completed.returncode != 0 or result.get("status") != "recorded":
+        return failed_result()
     return result
 
 

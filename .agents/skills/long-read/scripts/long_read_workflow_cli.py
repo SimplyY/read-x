@@ -11,21 +11,27 @@ from pathlib import Path
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import time
+import re
 from datetime import datetime
+from urllib.parse import urlsplit, urlunsplit
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from chatgpt_bridge import record_business_outcome
 from render_long_read_delivery_card import _load_score_evidence
 from long_read_workflow_store import (
-    StoreConflict, WORKFLOW_CONTRACT_VERSION, WorkflowStore, state_lock,
-    workflow_payload_issue,
+    StoreConflict, WORKFLOW_CONTRACT_VERSION, WorkflowStore, is_valid_source_created_at,
+    state_lock, workflow_payload_issue,
 )
 from run_isolated_analyses import ALLOWED_LJG, validate_evidence
 
 DEFAULT_STATE_DIR = REPO_ROOT / "state" / "long-read"
+CANARY_PREFIX = "【CANARY｜Read-X long_read 端到端验收】"
+CANARY_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 
 
 def _canonical(value) -> bytes:
@@ -138,6 +144,141 @@ def _validate_test_task_marker(context: dict, test_task: bool) -> bool:
     return readx_canary
 
 
+def _run_lark_cli_json(arguments: list[str], *, profile: str | None = None) -> object:
+    """Run a bounded, read-only lark-cli call without surfacing its output on failure."""
+    command = ["lark-cli"]
+    if profile is not None:
+        if not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", profile):
+            raise ValueError("Feishu profile is invalid")
+        command.extend(["--profile", profile])
+    command.extend(arguments)
+    env = os.environ.copy()
+    env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+    env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            timeout=20, check=False, env=env,
+        )
+        value = json.loads(result.stdout) if result.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("Feishu identity or source readback is unavailable") from None
+    if result.returncode != 0 or (
+            isinstance(value, dict) and value.get("ok") is False):
+        raise ValueError("Feishu identity or source readback is unavailable")
+    return value
+
+
+def resolve_worker_profile_key(*, app_id: str, bridge_profile_key: str) -> str:
+    """Resolve a local lark-cli profile by the Bridge-bound app and verify it explicitly."""
+    if not isinstance(app_id, str) or not app_id or not isinstance(bridge_profile_key, str) or not bridge_profile_key.strip():
+        raise ValueError("Bridge app/profile identity is missing or inconsistent")
+    profiles = _run_lark_cli_json(["profile", "list"])
+    matches = [item for item in profiles if isinstance(item, dict)
+               and item.get("appId") == app_id
+               and isinstance(item.get("name"), str)
+               and item["name"].strip()] if isinstance(profiles, list) else []
+    if len(matches) != 1:
+        raise ValueError("Bridge-bound Feishu app does not resolve to one local lark-cli profile")
+    worker_profile = matches[0]["name"]
+    identity = _run_lark_cli_json(["whoami"], profile=worker_profile)
+    if (not isinstance(identity, dict) or identity.get("identity") != "user"
+            or identity.get("appId") != app_id or identity.get("profile") != worker_profile):
+        raise ValueError("Bridge-bound Feishu identity does not match the configured app")
+    return worker_profile
+
+
+def _canonical_http_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().rstrip(".,;:!?，。；：！？）》】")
+    try:
+        parsed = urlsplit(candidate)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        netloc = parsed.netloc.lower()
+        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
+    except ValueError:
+        return None
+
+
+def verify_canary_source(*, profile: str, app_id: str, context: dict,
+                         source_message_id: str, evidence: dict) -> dict:
+    """Read back the exact Feishu source event before excluding it from production metrics."""
+    if (not isinstance(context, dict)
+            or any(not isinstance(context.get(key), str) or not context[key].strip()
+                   for key in ("chatId", "senderId"))
+            or context.get("readxCanary") is not True or context.get("chatType") != "group"
+            or context.get("senderType") != "user"
+            or context.get("sourceMessageId") != source_message_id):
+        raise ValueError("Read-X canary source context is incomplete")
+
+    identity = _run_lark_cli_json(["whoami"], profile=profile)
+    on_behalf_of = identity.get("onBehalfOf") if isinstance(identity, dict) else None
+    current_user = on_behalf_of.get("openId") if isinstance(on_behalf_of, dict) else None
+    if (not isinstance(identity, dict) or identity.get("identity") != "user"
+            or identity.get("appId") != app_id or current_user != context.get("senderId")):
+        raise ValueError("Feishu source reader does not match the Bridge app and sender")
+
+    chat_response = _run_lark_cli_json([
+        "im", "chats", "get", "--as", "user", "--chat-id", context["chatId"],
+    ], profile=profile)
+    chat_data = chat_response.get("data") if isinstance(chat_response, dict) else None
+    if (not isinstance(chat_response, dict) or chat_response.get("ok") is not True
+            or not isinstance(chat_data, dict) or chat_data.get("chat_mode") != "group"):
+        raise ValueError("Read-X canary source chat is not a verified group")
+
+    response = _run_lark_cli_json([
+        "im", "+messages-mget", "--as", "user",
+        "--message-ids", source_message_id, "--no-reactions",
+    ], profile=profile)
+    data = response.get("data") if isinstance(response, dict) else None
+    messages = data.get("messages") if isinstance(data, dict) else None
+    if (not isinstance(response, dict) or response.get("ok") is not True
+            or not isinstance(messages, list) or len(messages) != 1):
+        raise ValueError("Read-X canary source message could not be uniquely verified")
+    message = messages[0]
+    sender = message.get("sender") if isinstance(message, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if (not isinstance(sender, dict) or not isinstance(content, str)
+            or not is_valid_source_created_at(message.get("create_time"))
+            or message.get("message_id") != source_message_id
+            or message.get("chat_id") != context.get("chatId")
+            or message.get("msg_type") != "text"
+            or message.get("deleted") is not False
+            or sender.get("sender_type") != "user"
+            or sender.get("id") != context.get("senderId")
+            or not content.startswith(CANARY_PREFIX)):
+        raise ValueError("Read-X canary source does not match the original user event")
+
+    source_urls = {
+        normalized
+        for match in CANARY_URL_PATTERN.findall(content)
+        if (normalized := _canonical_http_url(match)) is not None
+    }
+    evidence_metadata = evidence.get("metadata") if isinstance(evidence, dict) else None
+    source_url = _canonical_http_url(
+        evidence_metadata.get("source_url") if isinstance(evidence_metadata, dict) else None
+    )
+    if len(source_urls) != 1 or source_url is None or source_url not in source_urls:
+        raise ValueError("Read-X canary article URL does not match the Feishu source event")
+
+    url_bytes = source_url.encode("utf-8")
+    content_bytes = content.encode("utf-8")
+    return {
+        "schema": "readx-canary-source-proof/v1",
+        "method": "lark-cli.im.messages-mget",
+        "source_created_at": message["create_time"],
+        "app_id": app_id,
+        "profile": profile,
+        "message_id": source_message_id,
+        "chat_id": context["chatId"],
+        "sender_id": context["senderId"],
+        "source_url_sha256": _hash(url_bytes),
+        "source_content_sha256": _hash(content_bytes),
+    }
+
+
 def _validate_target(context: dict, gate: dict, app_id: str, source_message_id: str):
     if context.get("appId") != app_id:
         raise ValueError("trigger app identity does not match app-id")
@@ -162,6 +303,8 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
                   source_message_id: str,
                   questions: list[tuple[str, Path]] | None = None,
                   test_task: bool = False,
+                  profile_resolver=resolve_worker_profile_key,
+                  canary_verifier=verify_canary_source,
                   state_dir: Path = DEFAULT_STATE_DIR) -> dict:
     """Copy immutable inputs first; only then commit admission to SQLite."""
     questions = questions or []
@@ -198,6 +341,17 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
     _private_directory(state_dir)
     artifacts_dir = state_dir / "artifacts"
     _private_directory(artifacts_dir)
+    # Identity resolution and optional CANARY source readback call lark-cli.
+    # Keep those bounded remote reads outside the shared filesystem/DB lock;
+    # only snapshot admission and the SQLite commit need serialization.
+    cli_profile = profile_resolver(app_id=app_id, bridge_profile_key=feishu_profile)
+    canary_source_proof = None
+    if readx_canary:
+        canary_source_proof = canary_verifier(
+            profile=cli_profile, app_id=app_id, context=context,
+            source_message_id=source_message_id,
+            evidence=_object(files["evidence.json"], "evidence"),
+        )
     snapshot_lock = state_lock(state_dir)
     snapshot_lock.__enter__()
     temporary = None
@@ -211,6 +365,16 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
         # validation never races a caller changing its original scoring file.
         gate = _load_score_evidence(temporary / "score-gate.json", temporary / "scoring-result.json")
         _validate_target(context, gate, app_id, source_message_id)
+        from long_read_workflow_notifications import resolve_delivery_target
+        trigger = {**context, "appId": app_id, "larkCliProfile": cli_profile}
+        with WorkflowStore(state_dir) as target_store:
+            delivery_target = resolve_delivery_target(trigger, target_store)
+        if delivery_target is None:
+            raise ValueError("submission requires a verified private message delivery target")
+        if context.get("chatType") == "group":
+            # Pin the exact verified P2P chat in the durable task so later
+            # report-target changes cannot redirect an already accepted task.
+            context = {**context, "privateChatId": delivery_target[1]}
         manifest = _canonical({name: {"sha256": _hash(value), "bytes": len(value)} for name, value in sorted(files.items())})
         digest = _hash(manifest)
         snapshot = artifacts_dir / digest
@@ -236,10 +400,12 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
             "bridge_new_chat_url": "https://chatgpt.com/",
             "trigger": {
                 **{key: context[key] for key in ("profile", "feishuProfile", "appId", "chatType", "chatId", "privateChatId", "senderId", "senderType", "sourceMessageId") if key in context},
+                "larkCliProfile": cli_profile,
                 "identity": "bot",
                 "readxCanary": readx_canary,
             },
             "test_task": test_task,
+            **({"canary_source_proof": canary_source_proof} if canary_source_proof else {}),
             "artifact_plan_finalized": False,
         }
         payload_issue = workflow_payload_issue(
@@ -373,7 +539,7 @@ def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict) -> 
                 f"unadmitted legacy jobs require read-only review before worker service: {job_ids}"
             )
     reports = run_due_reports(Path(state_dir), delivery_target=report_target)
-    job = run_once(Path(state_dir), owner=owner)
+    job = run_once(Path(state_dir), owner=owner, outcome_recorder=record_business_outcome)
     return {"status": "tick", "reports": reports, "worker": job}
 
 
@@ -385,7 +551,7 @@ def main(argv=None) -> int:
     for name in ("source", "evidence", "scoring-result", "score-gate", "trigger-context"):
         submit.add_argument("--" + name, type=Path, required=True)
     submit.add_argument("--app-id", required=True)
-    submit.add_argument("--feishu-profile", required=True, help="trusted lark-cli profile captured at ingress")
+    submit.add_argument("--feishu-profile", required=True, help="Bridge-provided Feishu profile value; preserved as source context")
     submit.add_argument("--source-message-id", required=True, help="trusted source Feishu message id for event deduplication")
     submit.add_argument("--test-task", action="store_true",
                         help="仅对显式 CANARY/验收任务启用；从正式成功率统计中排除")
@@ -393,7 +559,7 @@ def main(argv=None) -> int:
     status = commands.add_parser("status")
     status.add_argument("--chat-id", help="只读查询该会话的持久工作流终态")
     status.add_argument("--report-key", help="只读查看可靠性报告和附件/卡片投递收据")
-    resume = commands.add_parser("resume", help="恢复指定任务的已持久阶段")
+    resume = commands.add_parser("resume", help="恢复指定任务的已持久阶段；--document-id 仅用于主文档丢响应后的只读核验")
     worker = commands.add_parser("run-worker", help="推进长文任务；--serve 启动含报告调度的常驻 Worker")
     report = commands.add_parser("report", help="生成或复用固定周期的可靠性报告快照")
     report.add_argument("--period", required=True, choices=("weekly", "monthly"))
@@ -429,6 +595,7 @@ def main(argv=None) -> int:
         if command is status:
             command.add_argument("--job-id")
     resume.add_argument("--job-id", required=True)
+    resume.add_argument("--document-id", help="人工提供首次创建时返回丢失的飞书文档 ID；只读比对本地期望结构")
     worker.add_argument("--job-id")
     worker.add_argument("--owner", default="read-x-worker")
     worker.add_argument("--serve", action="store_true", help="常驻轮询任务并检查周/月报告")
@@ -445,6 +612,8 @@ def main(argv=None) -> int:
                                    feishu_profile=args.feishu_profile,
                                    source_message_id=args.source_message_id, questions=[(name, Path(path)) for name, path in args.question],
                                    test_task=args.test_task,
+                                   profile_resolver=resolve_worker_profile_key,
+                                   canary_verifier=verify_canary_source,
                                    state_dir=args.state_dir)
         elif args.command == "status":
             result = inspect_jobs(args.state_dir, job_id=args.job_id, chat_id=args.chat_id,
@@ -503,7 +672,9 @@ def main(argv=None) -> int:
         else:
             from long_read_workflow_worker import run_once
             result = run_once(args.state_dir, job_id=args.job_id if args.command == "resume" else args.job_id,
-                              owner=args.owner if args.command == "run-worker" else "read-x-resume")
+                              owner=args.owner if args.command == "run-worker" else "read-x-resume",
+                              manual_document_id=args.document_id if args.command == "resume" else None,
+                              outcome_recorder=record_business_outcome)
     except (ValueError, OSError, StoreConflict, sqlite3.Error) as exc:
         print(json.dumps({"status": "blocked", "reason_code": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
         return 2

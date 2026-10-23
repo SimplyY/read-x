@@ -85,6 +85,12 @@ class FakeFeishu:
         self.messages = {}
         self.uploads = 0
         self.patches = 0
+        self.identity_ok = True
+
+    def verify_app_identity(self, expected_app_id):
+        if not self.identity_ok or expected_app_id != "app_bot":
+            raise DeliveryError("simulated bot profile mismatch")
+        return True
 
     def list_document_blocks(self, document_id):
         if self.unreadable_create and self.created_blocks:
@@ -156,7 +162,8 @@ class FakeFeishu:
         return self.messages[message_id]
 
     def list_chat_messages(self, *, chat_id, start_time, end_time):
-        return [item for item in self.messages.values() if item["chat_id"] == chat_id]
+        return [item for item in self.messages.values()
+                if item["chat_id"] == chat_id and start_time <= item["create_time"] <= end_time]
 
 
 class ImageWorkflowTests(unittest.TestCase):
@@ -170,7 +177,7 @@ class ImageWorkflowTests(unittest.TestCase):
         self.source = self.root / "document" / "main-doc.md"
         self.source.write_text("# Article\n\nEvidence and argument.\n", encoding="utf-8")
         self.payload = {"trigger": {
-            "feishuProfile": "read-x", "appId": "app_bot", "identity": "bot",
+            "feishuProfile": "bridge-read-x", "larkCliProfile": "app_bot", "appId": "app_bot", "identity": "bot",
             "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_user",
             "senderType": "user",
         }}
@@ -262,6 +269,24 @@ class ImageWorkflowTests(unittest.TestCase):
         self.assertEqual(self.client.message_sends, 1)
         self.assertEqual(len(self.client.messages), 1)
 
+    def test_interrupted_accepted_image_send_uses_original_intent_time_for_readback(self):
+        class AcceptedThenInterrupted(FakeFeishu):
+            def send_image_message(self, **kwargs):
+                super().send_image_message(**kwargs)
+                raise KeyboardInterrupt("worker stopped after remote acceptance")
+
+        client = AcceptedThenInterrupted()
+        self.client = client
+        with self.assertRaises(KeyboardInterrupt):
+            self.deliver()
+
+        self.clock_value[0] += 120
+        result = self.deliver()
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(client.message_sends, 1)
+        self.assertEqual(len(client.messages), 1)
+
     def test_lost_generation_response_is_observed_without_second_submission(self):
         self.image_runner.raise_after_submit = True
         self.image_runner.pending_recoveries = 1
@@ -329,13 +354,69 @@ class ImageWorkflowTests(unittest.TestCase):
 
     def test_group_trigger_without_verified_private_history_target_stops_before_generation(self):
         self.payload["trigger"] = {
-            "feishuProfile": "read-x", "appId": "app_bot", "identity": "bot",
+            "feishuProfile": "bridge-read-x", "larkCliProfile": "app_bot", "appId": "app_bot", "identity": "bot",
             "chatType": "group", "senderId": "ou_user", "senderType": "user",
         }
         result = self.deliver()
         self.assertEqual(result["status"], "needs_review")
         self.assertEqual(result["reason_code"], "private-chat-readback-target-missing")
         self.assertEqual(self.image_runner.calls, 0)
+
+    def test_group_trigger_uses_matching_saved_private_target_for_image_delivery(self):
+        self.payload["trigger"] = {
+            "feishuProfile": "bridge-read-x", "larkCliProfile": "app_bot", "appId": "app_bot", "identity": "bot",
+            "chatType": "group", "chatId": "oc_group", "senderId": "ou_user", "senderType": "user",
+        }
+        target = {
+            "identity": "bot", "profile": "app_bot", "user_id": "ou_user",
+            "chat_id": "oc_private", "sender_id": "app_bot", "sender_id_type": "app_id",
+        }
+        with self.store._transaction():
+            self.store.connection.execute(
+                "INSERT INTO workflow_meta(key,value) VALUES('report_delivery_target',?)",
+                (json.dumps(target),),
+            )
+
+        result = self.deliver()
+
+        self.assertEqual(result["status"], "confirmed")
+        self.assertEqual(self.client.message_sends, 1)
+        self.assertEqual(next(iter(self.client.messages.values()))["chat_id"], "oc_private")
+        send_effect = self.store.latest_effect_for_action(self.job_id, "core-image-send", "message-send")
+        self.assertEqual(send_effect["status"], "confirmed")
+
+    def test_group_image_delivery_rejects_saved_target_for_another_user_or_bot(self):
+        self.payload["trigger"] = {
+            "feishuProfile": "bridge-read-x", "larkCliProfile": "app_bot", "appId": "app_bot", "identity": "bot",
+            "chatType": "group", "chatId": "oc_group", "senderId": "ou_user", "senderType": "user",
+        }
+        target = {
+            "identity": "bot", "profile": "other-profile", "user_id": "ou_other",
+            "chat_id": "oc_other", "sender_id": "other-app", "sender_id_type": "app_id",
+        }
+        with self.store._transaction():
+            self.store.connection.execute(
+                "INSERT INTO workflow_meta(key,value) VALUES('report_delivery_target',?)",
+                (json.dumps(target),),
+            )
+
+        result = self.deliver()
+
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["reason_code"], "private-chat-readback-target-missing")
+        self.assertEqual(self.image_runner.calls, 0)
+        self.assertEqual(self.client.message_sends, 0)
+
+    def test_unverified_bot_profile_stops_before_image_or_feishu_writes(self):
+        self.client.identity_ok = False
+
+        result = self.deliver()
+
+        self.assertEqual(result["status"], "needs_review")
+        self.assertEqual(result["reason_code"], "image-delivery-identity-unverified")
+        self.assertEqual(self.image_runner.calls, 0)
+        self.assertEqual(self.client.created_blocks, 0)
+        self.assertEqual(self.client.message_sends, 0)
         self.assertEqual(self.client.created_blocks, 0)
         self.assertEqual(self.client.message_sends, 0)
 

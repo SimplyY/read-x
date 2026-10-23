@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import Counter
 
-from long_read_workflow_store import WorkflowStore, state_lock
+from long_read_workflow_store import WorkflowStore, is_verified_test_task, state_lock
 
 
 CONTENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -34,19 +34,20 @@ _REASON_CODES = frozenset({
     "feishu-profile-missing", "image-block-confirmation-lost", "image-block-create-plan-invalid",
     "image-block-create-preflight-failed", "image-block-create-rejected",
     "image-block-create-result-unconfirmed", "image-message-confirmation-lost",
+    "image-delivery-identity-unverified", "image-insert-identity-unverified",
     "image-message-history-ambiguous", "image-message-history-unavailable",
     "image-message-readback-unmatched", "image-message-request-changed",
     "image-patch-confirmation-lost", "image-patch-rejected", "image-patch-request-changed",
     "image-patch-result-unconfirmed", "image-prompt-or-request-invalid",
     "image-request-receipt-invalid", "image-retry-budget-exhausted", "image-runner-exception",
-    "image-send-rejected", "image-stage-recovery-pending", "image-upload-rejected",
+    "image-send-identity-unverified", "image-send-rejected", "image-stage-recovery-pending", "image-upload-rejected",
     "image-upload-request-changed", "image-upload-result-unconfirmed", "image-delivery-failed",
-    "invalid-publish-outcome", "lease-expired", "main-document-publish-failed",
+    "invalid-document-id", "invalid-publish-outcome", "lease-expired", "main-document-publish-failed",
     "main-document-result-unconfirmed", "main-document-unavailable", "message-image-upload-rejected",
     "message-image-upload-request-changed", "message-image-upload-result-unconfirmed",
     "message-rate-limit", "message-rate-preflight-unavailable",
-    "message-readback-unconfirmed", "message-readback-unmatched", "missing-private-message-target",
-    "notification-history-incomplete", "notification-identity-missing",
+    "manual-document-id-requires-job-id", "message-readback-unconfirmed", "message-readback-unmatched", "missing-private-message-target",
+    "notification-history-incomplete", "notification-identity-missing", "notification-identity-unverified",
     "notification-payload-changed", "notification-readback-ambiguous",
     "notification-readback-unconfirmed", "notification-retry-backoff", "notification-retry-exhausted",
     "notification-send-rejected", "notification-send-result-unconfirmed", "output-validation",
@@ -280,7 +281,8 @@ def apply_retention(state_dir: Path, *, now: float | None = None) -> dict:
                     "schema": "retained-long-read-statistics/v1",
                     "route": "long_read",
                     "synthetic": payload.get("synthetic") is True,
-                    "test_task": payload.get("test_task") is True,
+                    "test_task": is_verified_test_task(payload),
+                    "verified_test_task": is_verified_test_task(payload),
                     "content_scrubbed_at": now,
                     "snapshot_sha256": payload.get("snapshot_sha256"),
                 }
@@ -355,7 +357,7 @@ def apply_retention(state_dir: Path, *, now: float | None = None) -> dict:
             for row in old_jobs:
                 job_id = row["job_id"]
                 payload = json.loads(row["payload_json"])
-                if payload.get("synthetic") is not True and payload.get("test_task") is not True:
+                if payload.get("synthetic") is not True and not is_verified_test_task(payload):
                     archived["N"] += 1
                     archived["S" if row["status"] == "succeeded" else "F"] += 1
                 store.connection.execute("DELETE FROM events WHERE job_id=?", (job_id,))

@@ -79,6 +79,25 @@ class RetentionTests(unittest.TestCase):
                  "snapshot_sha256": hashlib.sha256(source_id.encode()).hexdigest(), "article": "private text"}
         if payload:
             value.update(payload)
+        if value.get("test_task") is True:
+            trigger = {
+                "feishuProfile": "bridge-private", "larkCliProfile": "app-private", "appId": "app-private", "identity": "bot",
+                "chatType": "group", "chatId": "oc_canary", "senderId": "ou_self",
+                "senderType": "user", "sourceMessageId": source_id, "readxCanary": True,
+            }
+            url = "https://example.com/canary"
+            value["trigger"] = trigger
+            value["canary_source_proof"] = {
+                "schema": "readx-canary-source-proof/v1",
+                "method": "lark-cli.im.messages-mget",
+                "source_created_at": "2026-10-22 15:49",
+                "app_id": "app-private", "profile": "app-private",
+                "message_id": source_id, "chat_id": "oc_canary", "sender_id": "ou_self",
+                "source_url_sha256": hashlib.sha256(url.encode()).hexdigest(),
+                "source_content_sha256": hashlib.sha256(
+                    f"【CANARY｜Read-X long_read 端到端验收】\n{url}".encode()
+                ).hexdigest(),
+            }
         job = self.store.submit(value, app_id="app-private", source_message_id=source_id,
                                 artifacts=[{"key": "main-document", "kind": "document"}])
         lease = self.store.acquire_lease(job["job_id"], "retention-test")

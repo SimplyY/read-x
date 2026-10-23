@@ -80,15 +80,19 @@ python3 .agents/skills/long-read/scripts/long_read_workflow_cli.py submit \
   --scoring-result <run_dir>/scoring-result.json \
   --score-gate <run_dir>/score-gate.json \
   --trigger-context <run_dir>/trigger-context.json \
-  --app-id <trusted-app-id> \
-  --feishu-profile <trusted-profile> \
+  --app-id <bridge_context.appId> \
+  --feishu-profile <bridge_context.feishuProfile> \
   --source-message-id <bridge_context.sourceMessageId> \
   --question ljg-think <run_dir>/question-01.md
 ```
 
 按实际分支重复 `--question` 0–3 次。返回 `accepted` 后，Worker 持久推进分析、程序装配、Document Compiler 发布、图片交付和通知。`status` 只读查看；`run-worker` 推进一个任务；部署后的 `run-worker --serve` 在同一 Worker 中检查报告周期；`resume --job-id <id>` 先核验不确定的远端动作，再从可确认检查点接续。不要运行旧 `run_long_read_pipeline.py`、直接写飞书或手工重发。
 
-仅当 `bridge_context.readxCanary` 为 `true` 时，在 `trigger-context.json` 原样保留该字段并在 `submit` 命令中附加 `--test-task`；bridge 只会在单条群内用户原始消息以 `【CANARY｜Read-X long_read 端到端验收】` 开头时设置该可信标记。标记与 CLI 参数不一致时提交必须失败关闭。该标记只将任务排除在正式成功率统计之外，不改变评分、交付或恢复规则。其他任务不得附加此参数。
+`appId` 与 `feishuProfile` 由 Bridge 从当前运行配置注入，提交负载原样保留。准入端按 `appId` 从本地 `lark-cli profile list` 唯一解析 CLI profile，并以 `lark-cli --profile <name> whoami` 核验；工作流另存为 `larkCliProfile`。直接调用 `lark-cli` 的通知和图片适配器显式使用 `larkCliProfile`；Document Compiler 继续使用 Bridge 注入的 `feishuProfile`，因为它绑定的是 Bridge 管理的配置目录。解析不唯一、身份不匹配或无法读取时失败关闭，不修改全局默认 profile。
+
+群消息触发的任务必须在入队前确定可验证的本人 P2P 私聊目标。优先使用可信触发上下文中的 `privateChatId`；缺失时仅可回退到持久化且与当前 CLI profile、发送者 open_id、Read-X bot app_id 精确匹配的已验证报告目标，并将解析出的会话固定到任务。没有匹配目标时拒绝接管；图片发送和读回必须使用同一目标。旧任务缺少 `privateChatId` 时，只允许按相同身份绑定的已保存目标恢复，否则停在待核实。
+
+仅当 `bridge_context.readxCanary` 为 `true` 时，在 `trigger-context.json` 原样保留该字段并在 `submit` 命令中附加 `--test-task`。提交端还会通过 `lark-cli` 只读核验当前用户身份，并按 `sourceMessageId` 读取唯一原始消息，核对发送者、群、消息类型、精确 CANARY 前缀及其唯一文章 URL 与 Evidence 来源 URL 一致。核验失败或无法读取时不登记任务。成功凭据只保存身份、来源时间和内容 / URL 哈希，不保存额外消息正文；Worker、周月报告和留存只把带有效来源凭据的验收任务视为测试任务。既有布尔标记缺少凭据时不得恢复，也不得从正式成功率统计中排除。该校验不改变评分、交付或恢复规则。其他任务不得附加此参数。
 
 ## 5. 成品结构
 

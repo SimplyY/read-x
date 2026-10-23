@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
+import tempfile
 
 import chatgpt_bridge as bridge
 
@@ -245,6 +248,134 @@ def test_conversation_url_is_passed_to_bridge_once():
     finally:
         bridge._run_bridge_once = original_once
     assert seen == ["https://chatgpt.test/c/1"]
+
+
+def test_business_outcome_uses_shared_bridge_with_only_allowlisted_metadata():
+    event = {
+        "source": "read-x", "caller": "read-x:long-read-text",
+        "attemptId": "12345678-1234-5678-1234-567812345678",
+        "runId": "12345678-1234-5678-1234-567812345678",
+        "clientRequestId": "12345678-1234-5678-1234-567812345678",
+        "status": "succeeded", "deliveryStatus": "succeeded",
+        "businessValidationStatus": "succeeded", "readbackStatus": "unknown", "durationMs": 42,
+    }
+    original = bridge.subprocess.run
+
+    def fake(command, **kwargs):
+        assert "recordBridgeBusinessOutcome" in command[-1]
+        assert json.loads(kwargs["input"]) == event
+        assert not any(secret in kwargs["input"] for secret in ("prompt", "response", "conversationUrl"))
+        return bridge.subprocess.CompletedProcess(command, 0, '{"status":"recorded","persistenceTarget":"primary"}\n', "")
+
+    bridge.subprocess.run = fake
+    try:
+        result = bridge.record_business_outcome(event, bridge=Path("/tmp/bridge.mjs"))
+    finally:
+        bridge.subprocess.run = original
+    assert result == {"status": "recorded", "persistenceTarget": "primary"}
+
+
+def test_business_outcome_writes_to_an_isolated_shared_journal():
+    event = {
+        "source": "read-x", "caller": "read-x:long-read-text",
+        "attemptId": "12345678-1234-5678-1234-567812345678",
+        "runId": "12345678-1234-5678-1234-567812345678",
+        "clientRequestId": "12345678-1234-5678-1234-567812345678",
+        "status": "succeeded", "deliveryStatus": "succeeded",
+        "businessValidationStatus": "succeeded", "readbackStatus": "unknown", "durationMs": 42,
+    }
+    bridge_module = (Path(__file__).resolve().parents[1].parent / "browser-runtime-governance"
+                     / "skills/chatgpt-web-bridge/scripts/bridge.mjs")
+    original = {key: os.environ.get(key) for key in ("EGO_RUNTIME_DIR", "CHATGPT_WEB_BRIDGE_CLIENT_RUNTIME_DIR")}
+    with tempfile.TemporaryDirectory(prefix="readx-bridge-outcome-") as directory:
+        runtime_dir = Path(directory) / "runtime"
+        client_dir = Path(directory) / "client"
+        os.environ["EGO_RUNTIME_DIR"] = str(runtime_dir)
+        os.environ["CHATGPT_WEB_BRIDGE_CLIENT_RUNTIME_DIR"] = str(client_dir)
+        try:
+            result = bridge.record_business_outcome(event, bridge=bridge_module)
+            assert result == {"status": "recorded", "persistenceTarget": "primary"}
+            shards = list((runtime_dir / "journal").glob("*.jsonl"))
+            assert len(shards) == 1
+            persisted = json.loads(shards[0].read_text(encoding="utf-8").splitlines()[0])
+            assert persisted["source"] == "read-x"
+            assert persisted["attemptId"] == event["attemptId"]
+            assert persisted["deliveryStatus"] == "succeeded"
+            assert not ({"prompt", "response", "conversationUrl"} & set(persisted))
+        finally:
+            for key, value in original.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def test_business_outcome_failure_is_visible_without_raw_exception_details():
+    event = {
+        "source": "read-x", "caller": "read-x:long-read-text",
+        "attemptId": "12345678-1234-5678-1234-567812345678",
+        "runId": "12345678-1234-5678-1234-567812345678",
+        "status": "needs_review", "deliveryStatus": "needs_review",
+        "businessValidationStatus": "unknown", "readbackStatus": "unknown", "durationMs": 7,
+    }
+    original_run, original_stderr = bridge.subprocess.run, bridge.sys.stderr
+    captured = io.StringIO()
+    bridge.subprocess.run = lambda command, **kwargs: bridge.subprocess.CompletedProcess(
+        command, 1, '{"status":"failed","errorCode":"diagnostic-write-failed"}\n', "PRIVATE PATH SENTINEL",
+    )
+    bridge.sys.stderr = captured
+    try:
+        result = bridge.record_business_outcome(event, bridge=Path("/tmp/bridge.mjs"))
+    finally:
+        bridge.subprocess.run, bridge.sys.stderr = original_run, original_stderr
+    assert result["status"] == "failed"
+    assert "bridge-business-outcome-diagnostic-failed" in captured.getvalue()
+    assert "diagnostic-write-failed" in captured.getvalue()
+    assert "PRIVATE PATH SENTINEL" not in captured.getvalue()
+
+
+def test_business_outcome_bridge_resolution_failure_is_visible_without_path_details():
+    event = {
+        "source": "read-x", "caller": "read-x:long-read-text",
+        "attemptId": "12345678-1234-5678-1234-567812345678",
+        "runId": "12345678-1234-5678-1234-567812345678",
+        "status": "needs_review", "deliveryStatus": "needs_review",
+        "businessValidationStatus": "unknown", "readbackStatus": "unknown", "durationMs": 7,
+    }
+    original_resolve, original_stderr = bridge.resolve_bridge, bridge.sys.stderr
+    captured = io.StringIO()
+    bridge.resolve_bridge = lambda: (_ for _ in ()).throw(OSError("PRIVATE PATH SENTINEL"))
+    bridge.sys.stderr = captured
+    try:
+        result = bridge.record_business_outcome(event)
+    finally:
+        bridge.resolve_bridge, bridge.sys.stderr = original_resolve, original_stderr
+    assert result["status"] == "failed"
+    assert "bridge-business-outcome-diagnostic-failed" in captured.getvalue()
+    assert "diagnostic-write-failed" in captured.getvalue()
+    assert "PRIVATE PATH SENTINEL" not in captured.getvalue()
+
+
+def test_business_outcome_rejects_content_fields_before_running_node():
+    event = {
+        "source": "read-x", "caller": "read-x:long-read-text",
+        "attemptId": "12345678-1234-5678-1234-567812345678",
+        "runId": "12345678-1234-5678-1234-567812345678",
+        "status": "succeeded", "deliveryStatus": "succeeded",
+        "businessValidationStatus": "succeeded", "readbackStatus": "unknown", "durationMs": 1,
+        "prompt": "PRIVATE PROMPT SENTINEL",
+    }
+    original = bridge.subprocess.run
+    bridge.subprocess.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must reject before Node"))
+    try:
+        try:
+            bridge.record_business_outcome(event, bridge=Path("/tmp/bridge.mjs"))
+        except ValueError as exc:
+            assert "unsupported fields" in str(exc)
+        else:
+            raise AssertionError("content-bearing event must be rejected")
+    finally:
+        bridge.subprocess.run = original
 
 
 def main():

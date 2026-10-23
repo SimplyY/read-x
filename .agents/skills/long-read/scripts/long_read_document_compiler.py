@@ -269,8 +269,15 @@ class DocumentCompilerAdapter:
                     "plan": plan["receipt"]}
         raise DocumentCompilerUnknown("Document Compiler publish response does not confirm a safe terminal outcome")
 
-    def recover(self, *, plan: dict, state_dir: Path, env: dict) -> dict:
-        cmd = ["recover", "--packet", str(plan["packet"]), "--state-dir", str(Path(state_dir).absolute()), "--json"]
+    def recover(self, *, plan: dict, state_dir: Path, env: dict,
+                document_id: str | None = None) -> dict:
+        cmd = ["recover", "--packet", str(plan["packet"]), "--state-dir", str(Path(state_dir).absolute())]
+        if document_id is not None:
+            if not isinstance(document_id, str) or not _DOC_ID_RE.fullmatch(document_id):
+                return {"status": "uncertain", "reason_code": "document-compiler-recovery-unconfirmed",
+                        "plan": plan["receipt"]}
+            cmd.extend(["--document-id", document_id])
+        cmd.append("--json")
         try:
             result = self._run(cmd, env=env, remote_write=False)
             payload = self._json_result(result, label="recover")
@@ -280,7 +287,8 @@ class DocumentCompilerAdapter:
         doc = payload.get("doc")
         if (payload.get("status") == "published" and payload.get("matched") is True
                 and payload.get("read_only") is True and isinstance(doc, str)
-                and _DOC_ID_RE.fullmatch(doc)):
+                and _DOC_ID_RE.fullmatch(doc)
+                and (document_id is None or doc == document_id)):
             return {"status": "confirmed", "remote_id": doc,
                     "metadata": {"verification": "document-compiler-readonly-recovery-matched",
                                  "content_sha256": plan["receipt"]["xml_sha256"]},

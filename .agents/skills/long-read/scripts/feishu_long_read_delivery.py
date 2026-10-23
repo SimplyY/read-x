@@ -96,7 +96,8 @@ def sent_message_id(payload: dict) -> str:
 
 class FeishuLongReadDelivery:
     def __init__(self, *, identity: str, profile: str, binary: str | None = None,
-                 runner: Callable[..., Any] = subprocess.run, timeout: float = 45):
+                 runner: Callable[..., Any] = subprocess.run, timeout: float = 45,
+                 expected_app_id: str | None = None):
         if identity not in {"bot", "user"}:
             raise ValueError("Feishu identity must be explicit: bot or user")
         if not isinstance(profile, str) or not profile.strip():
@@ -106,6 +107,47 @@ class FeishuLongReadDelivery:
         self.binary = binary or shutil.which("lark-cli") or "lark-cli"
         self.runner = runner
         self.timeout = timeout
+        self.expected_app_id = expected_app_id
+
+    def _run_readonly_cli_json(self, arguments: list[str], *, profile: str | None = None):
+        command = [self.binary]
+        if profile is not None:
+            command.extend(["--profile", profile])
+        command.extend(arguments)
+        env = dict(os.environ)
+        env["LARKSUITE_CLI_NO_UPDATE_NOTIFIER"] = "1"
+        env["LARKSUITE_CLI_NO_SKILLS_NOTIFIER"] = "1"
+        try:
+            result = self.runner(command, capture_output=True, text=True,
+                                 timeout=self.timeout, check=False, env=env)
+        except (subprocess.TimeoutExpired, TimeoutError, OSError) as exc:
+            raise DeliveryError("Feishu bound app identity could not be verified") from exc
+        if getattr(result, "returncode", 1) != 0:
+            raise DeliveryError("Feishu bound app identity could not be verified")
+        try:
+            payload = json.loads(getattr(result, "stdout", "") or "")
+        except (ValueError, TypeError) as exc:
+            raise DeliveryError("Feishu bound app identity returned malformed output") from exc
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            raise DeliveryError("Feishu bound app identity was rejected")
+        return payload
+
+    def verify_app_identity(self, expected_app_id: str) -> bool:
+        """Fail closed unless this exact local profile still resolves to the admitted app."""
+        if (self.identity != "bot" or not isinstance(expected_app_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", expected_app_id)):
+            raise DeliveryError("Read-X bot identity is invalid")
+        profiles = self._run_readonly_cli_json(["profile", "list"])
+        matches = [item for item in profiles if isinstance(item, dict)
+                   and item.get("appId") == expected_app_id] if isinstance(profiles, list) else []
+        if len(matches) != 1 or matches[0].get("name") != self.profile:
+            raise DeliveryError("Read-X bot profile no longer resolves uniquely to the admitted app")
+        identity = self._run_readonly_cli_json(["whoami"], profile=self.profile)
+        if (not isinstance(identity, dict) or identity.get("identity") != "user"
+                or identity.get("appId") != expected_app_id
+                or identity.get("profile") != self.profile):
+            raise DeliveryError("Read-X bot profile identity changed")
+        return True
 
     def auth_status(self) -> dict:
         """Read and verify the current CLI identity using auth status's own flags."""
@@ -130,6 +172,8 @@ class FeishuLongReadDelivery:
         return payload
 
     def _run(self, args: list[str], *, write: bool) -> dict:
+        if write and self.expected_app_id is not None:
+            self.verify_app_identity(self.expected_app_id)
         command = [self.binary, *args, "--as", self.identity, "--profile", self.profile, "--format", "json"]
         try:
             result = self.runner(command, capture_output=True, text=True, timeout=self.timeout, check=False)
@@ -209,8 +253,11 @@ class FeishuLongReadDelivery:
                     raise DeliveryError("document block list contains a missing or duplicate block_id")
                 seen_ids.add(block_id)
                 found.append(item)
-            if data.get("has_more") is not True:
+            has_more = data.get("has_more")
+            if has_more is False:
                 return found
+            if has_more is not True:
+                raise DeliveryError("document block list is missing a valid has_more flag")
             next_token = data.get("page_token")
             if not isinstance(next_token, str) or not next_token or next_token in seen_tokens:
                 raise DeliveryError("document block pagination is incomplete")

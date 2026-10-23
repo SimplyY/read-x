@@ -16,6 +16,7 @@ from feishu_long_read_delivery import (
     match_image_messages, verify_image_message, message_rate_slot,
 )
 from long_read_workflow_store import WorkflowStore
+from long_read_workflow_notifications import resolve_delivery_target
 
 
 RETRY_DELAY_SECONDS = 240
@@ -412,7 +413,12 @@ def _existing_effect(store: WorkflowStore, job_id: str, artifact_key: str,
 
 def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                      document_id: str, png_path: Path, image_index: int, root: Path,
-                     client, round_number: int, clock) -> dict:
+                     client, sender_app_id: str, round_number: int, clock) -> dict:
+    try:
+        if client.verify_app_identity(sender_app_id) is not True:
+            raise DeliveryError("Read-X bot identity is not verified")
+    except DeliveryError:
+        return {"status": "needs_review", "reason_code": "image-insert-identity-unverified"}
     insert_key = f"{image_key}-insert"
     block_effect, block_action = _select_effect(
         store, lease.job_id, insert_key, "image-block-create", round_number,
@@ -510,7 +516,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
             return _document_insert(
                 store=store, lease=lease, image_key=image_key, image_name=image_name,
                 document_id=document_id, png_path=png_path, image_index=image_index,
-                root=root, client=client, round_number=round_number, clock=clock,
+                root=root, client=client, sender_app_id=sender_app_id,
+                round_number=round_number, clock=clock,
             )
         except DeliveryError as exc:
             retryable = isinstance(exc, RetryableDeliveryError)
@@ -577,7 +584,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
             return _document_insert(
                 store=store, lease=lease, image_key=image_key, image_name=image_name,
                 document_id=document_id, png_path=png_path, image_index=image_index,
-                root=root, client=client, round_number=round_number, clock=clock,
+                root=root, client=client, sender_app_id=sender_app_id,
+                round_number=round_number, clock=clock,
             )
         except DeliveryError as exc:
             retryable = isinstance(exc, RetryableDeliveryError)
@@ -656,7 +664,8 @@ def _document_insert(*, store: WorkflowStore, lease, image_key: str, image_name:
             return _document_insert(
                 store=store, lease=lease, image_key=image_key, image_name=image_name,
                 document_id=document_id, png_path=png_path, image_index=image_index,
-                root=root, client=client, round_number=round_number, clock=clock,
+                root=root, client=client, sender_app_id=sender_app_id,
+                round_number=round_number, clock=clock,
             )
         except DeliveryError as exc:
             retryable = isinstance(exc, RetryableDeliveryError)
@@ -697,21 +706,19 @@ def _verify_message(client, message_id: str, image_key: str, *, sender_id: str,
 
 
 def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
-                png_path: Path, trigger: dict, sender_app_id: str, client,
-                round_number: int, clock) -> dict:
+                png_path: Path, sender_app_id: str, client,
+                delivery_target: tuple[dict, str], round_number: int, clock) -> dict:
+    try:
+        if client.verify_app_identity(sender_app_id) is not True:
+            raise DeliveryError("Read-X bot identity is not verified")
+    except DeliveryError:
+        return {"status": "needs_review", "failure_stage": "image-send",
+                "reason_code": "image-send-identity-unverified"}
     message_artifact = f"{image_key}-send"
-    if trigger.get("chatType") == "p2p":
-        target = {"chat_id": trigger.get("chatId")}
-        history_chat_id = trigger.get("chatId")
-    elif trigger.get("chatType") == "group":
-        if not trigger.get("privateChatId"):
-            return {"status": "needs_review", "failure_stage": "image-send",
-                    "reason_code": "private-chat-readback-target-missing"}
-        target = {"user_id": trigger.get("senderId")}
-        history_chat_id = trigger.get("privateChatId")
-    else:
+    if not delivery_target:
         return {"status": "failed", "failure_stage": "image-send",
                 "reason_code": "unsupported-private-message-target", "retryable": False}
+    target, history_chat_id = delivery_target
     if not next(iter(target.values()), None):
         return {"status": "failed", "failure_stage": "image-send",
                 "reason_code": "missing-private-message-target", "retryable": False}
@@ -793,7 +800,10 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                           "content_sha256": image_sha},
             )
         elif expected_chat_id:
-            start = max(0, int(float(send_effect["updated_at"]) - 60))
+            # `updated_at` can move forward when an interrupted attempt is
+            # recorded as uncertain. Anchor readback to the original durable
+            # intent so a delayed recovery still covers an accepted message.
+            start = max(0, int(float(send_effect["created_at"]) - 60))
             end = max(start, int(clock() + 60))
             try:
                 messages = client.list_chat_messages(
@@ -845,8 +855,9 @@ def _send_image(*, store: WorkflowStore, lease, image_key: str, image_name: str,
             if expected_chat_id:
                 return _send_image(
                     store=store, lease=lease, image_key=image_key, image_name=image_name,
-                    png_path=png_path, trigger=trigger, sender_app_id=sender_app_id,
-                    client=client, round_number=round_number, clock=clock,
+                    png_path=png_path, sender_app_id=sender_app_id,
+                    client=client, delivery_target=delivery_target,
+                    round_number=round_number, clock=clock,
                 )
             return {"status": "uncertain", "failure_stage": "image-send",
                     "reason_code": "bot-cannot-read-target-p2p-history"}
@@ -888,15 +899,23 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
                   client=None, prompt_fetcher=None, clock=time.time) -> dict:
     image_runner = image_runner or core_image
     trigger = payload.get("trigger") or {}
-    profile = trigger.get("feishuProfile")
+    profile = trigger.get("larkCliProfile")
     sender_app_id = str(trigger.get("appId") or "")
     if not profile or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", str(profile)):
         return {"status": "needs_review", "reason_code": "feishu-profile-missing"}
     if not sender_app_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", sender_app_id):
         return {"status": "needs_review", "reason_code": "bot-app-identity-missing"}
-    if trigger.get("chatType") == "group" and not trigger.get("privateChatId"):
+    delivery_target = resolve_delivery_target(trigger, store)
+    if delivery_target is None:
         return {"status": "needs_review", "reason_code": "private-chat-readback-target-missing"}
-    client = client or FeishuLongReadDelivery(identity="bot", profile=profile)
+    client = client or FeishuLongReadDelivery(
+        identity="bot", profile=profile, expected_app_id=sender_app_id,
+    )
+    try:
+        if client.verify_app_identity(sender_app_id) is not True:
+            raise DeliveryError("Read-X bot identity is not verified")
+    except DeliveryError:
+        return {"status": "needs_review", "reason_code": "image-delivery-identity-unverified"}
     image_artifact = _artifact(store, lease.job_id, image_key)
     round_number = image_artifact["retry_count"]
     if image_artifact["status"] == "failed":
@@ -963,7 +982,8 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
     inserted = _document_insert(
         store=store, lease=lease, image_key=image_key, image_name=image_name,
         document_id=document_id, png_path=png_path, image_index=image_index,
-        root=root, client=client, round_number=round_number, clock=clock,
+        root=root, client=client, sender_app_id=sender_app_id,
+        round_number=round_number, clock=clock,
     )
     insert_failure = None
     if inserted["status"] == "failed":
@@ -978,8 +998,9 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
 
     sent = _send_image(
         store=store, lease=lease, image_key=image_key, image_name=image_name,
-        png_path=png_path, trigger=trigger, sender_app_id=sender_app_id,
-        client=client, round_number=round_number, clock=clock,
+        png_path=png_path, sender_app_id=sender_app_id,
+        client=client, delivery_target=delivery_target,
+        round_number=round_number, clock=clock,
     )
     if sent["status"] == "deferred":
         store.set_artifact(lease, f"{image_key}-send", "pending", metadata={

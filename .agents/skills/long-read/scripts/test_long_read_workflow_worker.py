@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -15,11 +16,36 @@ from unittest.mock import patch
 
 import long_read_workflow_worker as worker
 import long_read_document_supplement as document_supplement
-from long_read_workflow_store import WORKFLOW_CONTRACT_VERSION, WorkflowStore, workflow_payload_issue
+from long_read_workflow_store import (
+    LeaseConflict, WORKFLOW_CONTRACT_VERSION, WorkflowStore, workflow_payload_issue,
+)
 
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def verified_canary(payload: dict) -> dict:
+    trigger = payload["trigger"]
+    trigger["chatType"] = "group"
+    trigger["chatId"] = "oc_canary"
+    trigger["senderType"] = "user"
+    trigger["readxCanary"] = True
+    payload["test_task"] = True
+    url = "https://example.com/canary"
+    payload["canary_source_proof"] = {
+        "schema": "readx-canary-source-proof/v1",
+        "method": "lark-cli.im.messages-mget",
+        "source_created_at": "2026-10-22 15:49",
+        "app_id": trigger["appId"],
+        "profile": trigger["larkCliProfile"],
+        "message_id": trigger["sourceMessageId"],
+        "chat_id": trigger["chatId"],
+        "sender_id": trigger["senderId"],
+        "source_url_sha256": digest(url.encode()),
+        "source_content_sha256": digest((f"【CANARY｜Read-X long_read 端到端验收】\n{url}").encode()),
+    }
+    return payload
 
 
 def admission_payload(*, app_id="app-test", source_message_id="om_test") -> dict:
@@ -34,7 +60,7 @@ def admission_payload(*, app_id="app-test", source_message_id="om_test") -> dict
         "route": "long_read", "score_status": "scored",
         "questions": [],
         "trigger": {
-            "feishuProfile": "deep", "identity": "bot", "appId": app_id,
+            "feishuProfile": "deep", "larkCliProfile": app_id, "identity": "bot", "appId": app_id,
             "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_test",
             "senderType": "user", "sourceMessageId": source_message_id,
         },
@@ -82,7 +108,7 @@ def fixture(root: Path) -> tuple[Path, str]:
         "questions": [{"skill": "ljg-think", "file": "question-01-ljg-think.md"}],
         "route": "long_read", "score_status": "scored", "artifact_plan_finalized": False,
         "trigger": {
-            "feishuProfile": "deep", "identity": "bot", "appId": "app-test",
+            "feishuProfile": "deep", "larkCliProfile": "app-test", "identity": "bot", "appId": "app-test",
             "chatType": "p2p", "chatId": "oc_private", "senderId": "ou_test",
             "senderType": "user", "sourceMessageId": "om_test",
         },
@@ -261,6 +287,7 @@ class FakeDocumentCompiler:
         self.recovery_status = recovery_status
         self.publish_calls = 0
         self.recover_calls = 0
+        self.recover_document_ids = []
 
     def prepare_plan(self, *, job_id, document_dir, candidate_xml, profile, identity):
         self.assertion_profile = profile
@@ -277,10 +304,11 @@ class FakeDocumentCompiler:
                                  "content_sha256": plan["receipt"]["xml_sha256"]}}
         return {"status": self.publish_status, "reason_code": "publish-result-unknown"}
 
-    def recover(self, *, plan, state_dir, env):
+    def recover(self, *, plan, state_dir, env, document_id=None):
         self.recover_calls += 1
+        self.recover_document_ids.append(document_id)
         if self.recovery_status == "confirmed":
-            return {"status": "confirmed", "remote_id": "doc_test_123",
+            return {"status": "confirmed", "remote_id": document_id or "doc_test_123",
                     "metadata": {"verification": "document-compiler-readonly-recovery-matched",
                                  "content_sha256": plan["receipt"]["xml_sha256"]}}
         return {"status": "uncertain", "reason_code": "document-compiler-recovery-unconfirmed"}
@@ -293,6 +321,45 @@ class WorkerTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_output_validation_failure_remains_distinct_in_shared_business_outcome(self):
+        bridge = FakeBridge()
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "validation-outcome")
+            job = store.get_job(self.job_id)
+            source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+            result = worker._run_text_branch(
+                store=store, lease=lease, lock=threading.RLock(),
+                artifact_key="analysis:article-decode",
+                output=self.state / "jobs" / self.job_id / "analysis" / "article-decode.md",
+                source_sha=digest(source_path.read_bytes()), prompt="isolated validation test",
+                validate=lambda _value: (_ for _ in ()).throw(ValueError("private validation details")),
+                prompt_assets=[], bridge_fn=bridge.run,
+            )
+            store.release_lease(lease)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "ValueError")
+        self.assertEqual(result["failure_stage"], "output-validation")
+        outcomes = []
+        worker._record_read_x_text_outcome(outcomes.append, result, 12)
+        self.assertEqual(outcomes[0]["status"], "failed")
+        self.assertEqual(outcomes[0]["businessValidationStatus"], "failed")
+
+    def test_unexpected_outcome_recorder_exception_is_logged_without_exception_details(self):
+        stderr = io.StringIO()
+        result = {
+            "request_id": "12345678-1234-5678-1234-567812345678",
+            "status": "needs_review", "reason": "response-text-unstable",
+        }
+        def fail_recorder(_event):
+            raise OSError("PRIVATE PATH SENTINEL")
+        with patch.object(worker.sys, "stderr", stderr):
+            worker._record_read_x_text_outcome(fail_recorder, result, 23)
+        report = stderr.getvalue()
+        self.assertIn("bridge-business-outcome-diagnostic-failed", report)
+        self.assertIn("diagnostic-write-failed", report)
+        self.assertIn(result["request_id"], report)
+        self.assertNotIn("PRIVATE PATH SENTINEL", report)
 
     def test_deferred_notification_outbox_is_scheduled_while_job_needs_review(self):
         with WorkflowStore(self.state) as store:
@@ -503,10 +570,8 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(len(store.events(job["job_id"])), before_events)
 
     def test_legacy_admitted_canary_without_explicit_identity_remains_recoverable(self):
-        payload = admission_payload()
-        payload["test_task"] = True
+        payload = verified_canary(admission_payload())
         payload["trigger"].pop("identity")
-        payload["trigger"]["readxCanary"] = True
         self.assertIsNone(workflow_payload_issue(
             payload, app_id="app-test", source_message_id="om_test",
         ))
@@ -521,10 +586,23 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(workflow_payload_issue(
             payload, app_id="app-test", source_message_id="om_test",
         ), "invalid-workflow-payload")
-        payload["trigger"]["readxCanary"] = True
+        verified_canary(payload)
         self.assertIsNone(workflow_payload_issue(
             payload, app_id="app-test", source_message_id="om_test",
         ))
+
+    def test_canary_source_proof_is_required_and_bound_to_the_source(self):
+        payload = verified_canary(admission_payload())
+        payload.pop("canary_source_proof")
+        self.assertEqual(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ), "invalid-workflow-payload")
+
+        payload = verified_canary(admission_payload())
+        payload["canary_source_proof"]["message_id"] = "om_other"
+        self.assertEqual(workflow_payload_issue(
+            payload, app_id="app-test", source_message_id="om_test",
+        ), "invalid-workflow-payload")
 
     def test_test_task_without_canary_marker_is_rejected_before_lease(self):
         state = Path(self.temporary.name) / "unmarked-canary-state"
@@ -611,16 +689,30 @@ class WorkerTests(unittest.TestCase):
 
     def test_worker_confirms_the_full_required_delivery_contract(self):
         bridge = FakeBridge()
+        compiler = FakeDocumentCompiler()
+        business_outcomes = []
         result = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
-            prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+            prompt_fetcher=asset_fetcher, document_compiler=compiler,
             image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
+            outcome_recorder=business_outcomes.append,
         )
         self.assertEqual(result["status"], "succeeded", result)
         self.assertTrue(result["delivery_complete"])
+        self.assertEqual(compiler.assertion_profile, "deep")
+        self.assertEqual(compiler.assertion_identity, "bot")
         self.assertEqual(len(bridge.submissions), 4)
         self.assertTrue(all(item[1] == "read-x:long-read-text" for item in bridge.submissions))
         self.assertTrue(all(item[2] == "https://chatgpt.com/" for item in bridge.submissions))
+        self.assertEqual(len(business_outcomes), 4)
+        self.assertTrue(all(item["source"] == "read-x" for item in business_outcomes))
+        self.assertTrue(all(item["caller"] == "read-x:long-read-text" for item in business_outcomes))
+        self.assertTrue(all(item["status"] == item["deliveryStatus"] == "succeeded" for item in business_outcomes))
+        self.assertTrue(all(item["readbackStatus"] == "unknown" for item in business_outcomes))
+        self.assertEqual({item["attemptId"] for item in business_outcomes},
+                         {item["runId"] for item in business_outcomes})
+        self.assertTrue(all(not ({"prompt", "response", "conversationUrl"} & set(item))
+                            for item in business_outcomes))
         with WorkflowStore(self.state) as store:
             job = store.get_job(self.job_id)
             self.assertEqual(job["status"], "succeeded")
@@ -645,6 +737,43 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["document_delivery"]["document_id"], "doc_test_123")
         for path in (self.state / "jobs" / self.job_id / "analysis").iterdir():
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_sequential_bridge_waits_renew_lease_before_a_competing_worker_can_take_over(self):
+        now = [1000.0]
+        bridge = FakeBridge()
+        with patch.object(worker, "LONG_EXTERNAL_WAIT_LEASE_SECONDS", 0.02), \
+                WorkflowStore(self.state, clock=lambda: now[0]) as store:
+            lease = store.acquire_lease(self.job_id, "long-bridge-call", 0.02)
+            job = store.get_job(self.job_id)
+            source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+            source_sha = digest(source_path.read_bytes())
+
+            def slow_bridge(prompt, **kwargs):
+                now[0] += 0.015
+                if "ljg-think" in prompt:
+                    with WorkflowStore(self.state, clock=lambda: now[0]) as contender:
+                        with self.assertRaises(LeaseConflict):
+                            contender.acquire_lease(self.job_id, "competing-worker", 30)
+                return bridge.run(prompt, **kwargs)
+
+            first = worker._run_text_branch(
+                store=store, lease=lease, lock=threading.RLock(),
+                artifact_key="analysis:article-decode",
+                output=self.state / "jobs" / self.job_id / "analysis" / "article-decode.md",
+                source_sha=source_sha, prompt="bounded bridge operation one",
+                validate=lambda value: value, prompt_assets=[], bridge_fn=slow_bridge,
+            )
+            second = worker._run_text_branch(
+                store=store, lease=lease, lock=threading.RLock(),
+                artifact_key="analysis:ljg-think",
+                output=self.state / "jobs" / self.job_id / "analysis" / "ljg-think.md",
+                source_sha=source_sha, prompt="bounded bridge operation two ljg-think",
+                validate=lambda value: value, prompt_assets=[], bridge_fn=slow_bridge,
+            )
+
+            self.assertEqual(first["status"], "confirmed", first)
+            self.assertEqual(second["status"], "confirmed", second)
+            self.assertGreater(store.get_job(self.job_id)["lease_expires_at"], now[0])
 
     def test_unconfirmed_required_image_never_sends_final_success(self):
         bridge = FakeBridge()
@@ -688,7 +817,9 @@ import hashlib, json, os, sys, threading
 from pathlib import Path
 sys.path.insert(0, sys.argv[4])
 from long_read_workflow_store import WorkflowStore
-from long_read_workflow_worker import _run_text_branch
+import long_read_workflow_worker as worker
+worker.LONG_EXTERNAL_WAIT_LEASE_SECONDS = 0.05
+_run_text_branch = worker._run_text_branch
 state, job_id, marker, scripts = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4]
 prompt = "durable subprocess request"
 prompt_sha = hashlib.sha256(prompt.encode()).hexdigest()
@@ -983,6 +1114,40 @@ with WorkflowStore(state) as store:
             )]
             self.assertEqual(len(effects), 1)
             self.assertEqual(effects[0]["status"], "uncertain")
+
+    def test_manual_document_id_only_recovers_an_uncertain_publish_and_continues(self):
+        bridge = FakeBridge()
+        compiler = FakeDocumentCompiler(publish_status="uncertain", recovery_status="uncertain")
+        first = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            notification_fn=fake_notifications,
+        )
+        self.assertEqual(first["status"], "needs_review")
+        self.assertEqual(first["document_delivery"]["status"], "uncertain")
+        self.assertEqual(compiler.publish_calls, 1)
+
+        compiler.recovery_status = "confirmed"
+        second = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=compiler,
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
+            manual_document_id="doc_test_123",
+        )
+        self.assertEqual(compiler.recover_document_ids, [None, "doc_test_123"])
+        self.assertEqual(compiler.recover_document_ids[-1], "doc_test_123")
+        self.assertEqual(compiler.publish_calls, 1)
+        self.assertEqual(second["document_delivery"]["status"], "confirmed")
+
+    def test_manual_document_id_is_rejected_before_workflow_advancement_when_invalid(self):
+        bridge = FakeBridge()
+        result = worker.process_job(
+            self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+            manual_document_id="../other",
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason_code"], "invalid-document-id")
+        self.assertEqual(bridge.submissions, [])
 
     def test_unconfirmed_document_review_notice_is_reconciled_before_final_success(self):
         bridge = FakeBridge()
