@@ -11,6 +11,7 @@ import time
 import uuid
 
 import run_chatgpt_core_image as core_image
+from chatgpt_bridge import verify_result_evidence
 from feishu_long_read_delivery import (
     DeliveryError, FeishuLongReadDelivery, RetryableDeliveryError, UnknownRemoteResult,
     match_image_messages, verify_image_message, message_rate_slot,
@@ -284,7 +285,8 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
         store.reconcile_effect(
             lease, effect["op_key"], "confirmed", remote_id=effect["request_id"],
             metadata={"verification": "bridge-observe-image-recovered",
-                      "content_sha256": recovered["result"]["image_sha256"]},
+                      "content_sha256": recovered["result"]["image_sha256"],
+                      "human_confirmed": recovered["result"].get("humanConfirmed") is True},
         )
         store.set_artifact(lease, image_key, "confirmed", metadata={
             "verification": "bridge-observe-image-recovered",
@@ -325,7 +327,8 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
         store.reconcile_effect(
             lease, effect["op_key"], "confirmed", remote_id=effect["request_id"],
             metadata={"verification": "bridge-observe-image-recovered",
-                      "content_sha256": recovered["result"]["image_sha256"]},
+                      "content_sha256": recovered["result"]["image_sha256"],
+                      "human_confirmed": recovered["result"].get("humanConfirmed") is True},
         )
         store.set_artifact(lease, image_key, "confirmed", metadata={
             "verification": "bridge-observe-image-recovered",
@@ -362,13 +365,14 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
 
     if (result.get("runId") != effect["request_id"] or not output.is_file()
             or result.get("submissionConfirmed") is not True
-            or result.get("verification") != "live-dom+snapshot"):
+            or result.get("verification") not in {"live-dom+snapshot", "bridge-evidence/v2"}):
         store.finish_effect(
             lease, effect["op_key"], "uncertain",
             metadata={"failure_stage": "image-generate", "reason_code": "bridge-image-receipt-mismatch"},
         )
         return {"status": "uncertain", "reason_code": "bridge-image-receipt-mismatch"}
     try:
+        verify_result_evidence(result)
         checked = image_runner._reuse_image(
             output, _read_json(summary), request["source_sha256"], effect["request_id"],
             request["conversation_url_requested"],
@@ -381,11 +385,11 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
         return {"status": "uncertain", "reason_code": "bridge-image-local-readback-failed"}
     store.finish_effect(
         lease, effect["op_key"], "confirmed", remote_id=effect["request_id"],
-        metadata={"verification": "bridge-live-dom-snapshot",
-                  "content_sha256": checked["image_sha256"]},
+        metadata={"verification": result["verification"],
+                  "content_sha256": checked["image_sha256"], "human_confirmed": result.get("humanConfirmed") is True},
     )
     store.set_artifact(lease, image_key, "confirmed", metadata={
-        "verification": "bridge-live-dom-snapshot", "content_sha256": checked["image_sha256"],
+        "verification": result["verification"], "content_sha256": checked["image_sha256"],
     })
     canonical = root / "images" / f"{image_name}.png"
     if output != canonical:

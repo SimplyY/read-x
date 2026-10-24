@@ -60,7 +60,7 @@ class SubmissionTests(unittest.TestCase):
             "facts": [], "data_points": [], "quotes": ["可信原文"], "uncertainties": [], "article_structure": [],
         })
         self.scoring = self.inputs / "scoring-result.json"
-        dump(self.scoring, {"score_status": "scored", "route": "long_read", "ljg_range": [0, 3]})
+        dump(self.scoring, self.valid_scoring())
         self.gate = self.inputs / "score-gate.json"
         self.refresh_gate()
         self.context = self.inputs / "trigger-context.json"
@@ -74,6 +74,15 @@ class SubmissionTests(unittest.TestCase):
     def refresh_gate(self):
         dump(self.gate, {"schema_version": "1", "message_id": "om_score", "sent_at_command": True,
                          "scoring_result_sha256": hashlib.sha256(self.scoring.read_bytes()).hexdigest(), "user_id": "ou_self", "chat_id": None})
+
+    @staticmethod
+    def valid_scoring():
+        return {
+            "score_status": "scored", "route": "long_read", "ljg_range": [0, 3],
+            "quality_score": 8.4, "quality_label": "完整深读",
+            "relevance_score": 0.6, "priority_label": "相关",
+            "interest_score": 0.6, "interest_label": "高兴趣",
+        }
 
     def submit(self, **overrides):
         values = {"source": self.source, "evidence": self.evidence, "scoring_result": self.scoring,
@@ -460,7 +469,7 @@ class SubmissionTests(unittest.TestCase):
             self.refresh_gate()
             with self.assertRaises(ValueError):
                 self.submit()
-        dump(self.scoring, {"score_status": "scored", "route": "long_read"})
+        dump(self.scoring, self.valid_scoring())
         self.refresh_gate()
         value = json.loads(self.evidence.read_text())
         value["quotes"] = ["编造引文"]
@@ -468,6 +477,17 @@ class SubmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.submit()
         self.assertFalse(self.state.exists())
+
+    def test_incomplete_scoring_is_rejected_before_persistent_admission(self):
+        for missing in ("quality_score", "quality_label", "relevance_score", "priority_label",
+                        "interest_score", "interest_label"):
+            scoring = self.valid_scoring()
+            scoring.pop(missing)
+            dump(self.scoring, scoring)
+            self.refresh_gate()
+            with self.subTest(missing=missing), self.assertRaises(ValueError):
+                self.submit()
+            self.assertFalse(self.state.exists())
 
     def test_gate_target_and_trigger_identity_are_checked(self):
         context = json.loads(self.context.read_text())
@@ -715,7 +735,9 @@ class SubmissionTests(unittest.TestCase):
         calls = []
         target = {"identity": "bot", "profile": "read-x", "user_id": "ou_self",
                   "chat_id": "oc_private", "sender_id": "app_one"}
-        with patch.object(long_read_workflow_scheduler, "run_due_reports",
+        with patch.dict(os.environ, {"VOICE_X_PATROL": "0"}), \
+             patch.object(cli.subprocess, "run") as patrol_run, \
+             patch.object(long_read_workflow_scheduler, "run_due_reports",
                           side_effect=lambda *args, **kwargs: calls.append(("reports", kwargs["delivery_target"])) or {"status": "checked"}), \
              patch.object(long_read_workflow_worker, "run_once",
                           side_effect=lambda *args, **kwargs: calls.append(("worker", kwargs["owner"])) or {"status": "idle"}):
@@ -724,6 +746,88 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(calls[0][1], target)
         self.assertEqual(calls[1][1], "worker-a")
         self.assertEqual(result, {"status": "tick", "reports": {"status": "checked"}, "worker": {"status": "idle"}})
+        patrol_run.assert_not_called()
+
+    def test_worker_service_tick_runs_voice_x_patrol_only_when_exactly_enabled(self):
+        import long_read_workflow_scheduler
+        import long_read_workflow_worker
+
+        calls = []
+        target = {"identity": "bot", "profile": "read-x", "user_id": "ou_self",
+                  "chat_id": "oc_private", "sender_id": "app_one"}
+        with patch.dict(os.environ, {"VOICE_X_PATROL": "1"}), \
+             patch.object(long_read_workflow_scheduler, "run_due_reports", side_effect=lambda *args, **kwargs: calls.append("reports") or {"status": "checked"}), \
+             patch.object(long_read_workflow_worker, "run_once", side_effect=lambda *args, **kwargs: calls.append("worker") or {"status": "idle"}), \
+             patch.object(cli.subprocess, "run", side_effect=lambda *args, **kwargs: calls.append("patrol") or cli.subprocess.CompletedProcess(
+                 ["node"], 0, '{"status":"spawned","runId":"run-1","recordId":"rec1","generation":1}', "")) as patrol_run:
+            result = cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
+        self.assertEqual(calls, ["reports", "worker", "patrol"])
+        self.assertEqual(result["status"], "tick")
+        self.assertEqual(result["voice_x_patrol"], {"status": "spawned", "runId": "run-1", "recordId": "rec1", "generation": 1})
+        args, kwargs = patrol_run.call_args
+        self.assertEqual([Path(args[0][1]).name, args[0][2]], ["voice-x.mjs", "supervise"])
+        self.assertEqual(kwargs["timeout"], 10)
+        self.assertTrue(kwargs["capture_output"])
+
+    def test_voice_x_patrol_scheduler_runs_while_read_x_report_work_is_blocked(self):
+        import long_read_workflow_scheduler
+        import long_read_workflow_worker
+
+        target = {"identity": "bot", "profile": "read-x", "user_id": "ou_self",
+                  "chat_id": "oc_private", "sender_id": "app_one"}
+        report_started = threading.Event()
+        release_report = threading.Event()
+        patrol_seen = threading.Event()
+        worker_done = threading.Event()
+        errors = []
+
+        def blocked_report(*args, **kwargs):
+            report_started.set()
+            if not release_report.wait(3):
+                raise TimeoutError("test did not release report work")
+            return {"status": "checked"}
+
+        with patch.dict(os.environ, {"VOICE_X_PATROL": "1"}), \
+             patch.object(long_read_workflow_scheduler, "run_due_reports", side_effect=blocked_report), \
+             patch.object(long_read_workflow_worker, "run_once", return_value={"status": "idle"}), \
+             patch.object(cli, "_voice_x_patrol_tick", side_effect=lambda: patrol_seen.set() or {"status": "idle"}):
+            def run_blocked_worker():
+                try:
+                    cli.worker_service_tick(self.state, owner="worker-a", report_target=target, include_patrol=False)
+                except Exception as exc:  # surfaced below on the test thread
+                    errors.append(exc)
+                finally:
+                    worker_done.set()
+
+            worker = threading.Thread(target=run_blocked_worker)
+            worker.start()
+            self.assertTrue(report_started.wait(2))
+            scheduler = cli._start_voice_x_patrol_scheduler(60)
+            try:
+                self.assertTrue(patrol_seen.wait(2), "Voice-X patrol must run before the blocking report returns")
+                self.assertFalse(worker_done.is_set(), "the Read-X report should still be in flight")
+            finally:
+                scheduler[0].set()
+                scheduler[1].join(timeout=2)
+                release_report.set()
+                worker.join(timeout=2)
+        self.assertEqual(errors, [])
+        self.assertTrue(worker_done.is_set())
+
+    def test_voice_x_patrol_failure_does_not_interrupt_read_x_tick(self):
+        import long_read_workflow_scheduler
+        import long_read_workflow_worker
+
+        target = {"identity": "bot", "profile": "read-x", "user_id": "ou_self",
+                  "chat_id": "oc_private", "sender_id": "app_one"}
+        with patch.dict(os.environ, {"VOICE_X_PATROL": "1"}), \
+             patch.object(long_read_workflow_scheduler, "run_due_reports", return_value={"status": "checked"}), \
+             patch.object(long_read_workflow_worker, "run_once", return_value={"status": "idle"}), \
+             patch.object(cli.subprocess, "run", side_effect=cli.subprocess.TimeoutExpired(["node"], 10)):
+            result = cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
+        self.assertEqual(result["status"], "tick")
+        self.assertEqual(result["worker"], {"status": "idle"})
+        self.assertEqual(result["voice_x_patrol"], {"status": "timeout", "reason": "supervisor-timeout"})
 
     def test_worker_service_blocks_legacy_nonterminal_jobs_before_any_delivery(self):
         import long_read_workflow_scheduler

@@ -252,7 +252,8 @@ def _metadata(value: dict | None) -> str:
     """Only machine codes and measurements belong in receipts, never raw text."""
     allowed = {"reason_code", "notification_reason_code", "failure_stage", "duration_ms", "retryable",
                "retry_allowed", "code", "verification", "content_sha256", "next_retry_at", "next_reconcile_at",
-               "round", "image_sha256"}
+               "round", "image_sha256", "business_outcome_value", "business_outcome_persistence",
+               "business_outcome_error_code", "human_confirmed"}
     value = {} if value is None else value
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("metadata must contain only approved receipt fields")
@@ -263,6 +264,14 @@ def _metadata(value: dict | None) -> str:
             continue
         elif not isinstance(item, (int, float)) or not math.isfinite(item):
             raise ValueError("metadata values must be machine codes or finite measurements")
+    if value.get("business_outcome_value") not in {None, "succeeded", "failed", "needs_review", "unknown"}:
+        raise ValueError("business outcome value is invalid")
+    if value.get("business_outcome_persistence") not in {None, "attempting", "recorded", "uncertain"}:
+        raise ValueError("business outcome persistence state is invalid")
+    if value.get("business_outcome_error_code") not in {None, "diagnostic-write-failed", "outcome-write-interrupted"}:
+        raise ValueError("business outcome error code is invalid")
+    if value.get("human_confirmed") is not None and type(value["human_confirmed"]) is not bool:
+        raise ValueError("human confirmation receipt must be boolean")
     return _json(value)
 
 
@@ -825,6 +834,110 @@ class WorkflowStore:
             "SELECT * FROM effects WHERE job_id=? AND artifact_key=? AND action=?",
             (job_id, artifact_key, action),
         ).fetchone())
+
+    def update_bridge_outcome_state(self, lease: Lease, op_key: str, *, outcome_value: str,
+                                    persistence: str, error_code: str | None = None) -> dict:
+        """Persist the shared Bridge outcome-journal state without changing the Bridge effect."""
+        if outcome_value not in {"succeeded", "failed", "needs_review", "unknown"}:
+            raise ValueError("bridge outcome value is invalid")
+        if persistence not in {"attempting", "recorded", "uncertain"}:
+            raise ValueError("bridge outcome persistence state is invalid")
+        if error_code not in {None, "diagnostic-write-failed", "outcome-write-interrupted"}:
+            raise ValueError("bridge outcome error code is invalid")
+        with self._change(lease):
+            row = self.connection.execute(
+                "SELECT * FROM effects WHERE job_id=? AND op_key=?", (lease.job_id, op_key),
+            ).fetchone()
+            if not row or row["action"] != "bridge-submit":
+                raise StoreConflict("bridge outcome requires its persisted submit effect")
+            metadata = json.loads(row["metadata_json"])
+            old_value = metadata.get("business_outcome_value")
+            old_persistence = metadata.get("business_outcome_persistence")
+            if persistence == "attempting":
+                if old_value == outcome_value and old_persistence in {"attempting", "recorded", "uncertain"}:
+                    raise StoreConflict("bridge outcome state already exists for this status")
+            elif old_value != outcome_value or old_persistence != "attempting":
+                raise StoreConflict("bridge outcome persistence transition is not current")
+            metadata["business_outcome_value"] = outcome_value
+            metadata["business_outcome_persistence"] = persistence
+            metadata.pop("business_outcome_error_code", None)
+            if error_code:
+                metadata["business_outcome_error_code"] = error_code
+            self.connection.execute(
+                "UPDATE effects SET metadata_json=?,updated_at=? WHERE op_key=?",
+                (_metadata(metadata), self.clock(), op_key),
+            )
+            self._event(lease.job_id, "bridge_business_outcome_state", {
+                "request_id": row["request_id"], "outcome_value": outcome_value,
+                "persistence": persistence, **({"error_code": error_code} if error_code else {}),
+            })
+        return self.get_effect(op_key)
+
+    def claim_business_outcome(self, lease: Lease, event: dict) -> bool:
+        """Claim one diagnostic append in the existing event stream; never replay an uncertain claim."""
+        allowed = {"source", "caller", "callerTaskId", "attemptId", "runId", "clientRequestId", "status",
+                   "outcomeKind", "artifactKind", "businessValidationStatus", "deliveryStatus", "readbackStatus", "durationMs", "humanConfirmed"}
+        if not isinstance(event, dict) or set(event) - allowed or event.get("source") != "read-x":
+            raise ValueError("business outcome contains unsupported fields")
+        if (event.get("caller") not in {"read-x:long-read-image", "read-x:long-read-task"}
+                or event.get("outcomeKind") not in {"stage", "task"} or event.get("artifactKind") not in {"image", "task"}
+                or type(event.get("durationMs")) is not int or event["durationMs"] < 0
+                or event.get("humanConfirmed") is not None and type(event["humanConfirmed"]) is not bool):
+            raise ValueError("business outcome metadata is invalid")
+        uuid.UUID(event.get("attemptId"))
+        if not _SHA256.fullmatch(event.get("callerTaskId", "")):
+            raise ValueError("business outcome task identity must be a digest")
+        for field in ("status", "businessValidationStatus", "deliveryStatus", "readbackStatus"):
+            if event.get(field) not in {"succeeded", "failed", "needs_review", "unknown"}:
+                raise ValueError("business outcome state is invalid")
+        with self._change(lease):
+            rows = self.connection.execute("SELECT details_json FROM events WHERE job_id=? AND event_type='business_outcome_intent'", (lease.job_id,)).fetchall()
+            if any(json.loads(row[0]).get("attemptId") == event["attemptId"] for row in rows):
+                return False
+            self._event(lease.job_id, "business_outcome_intent", event)
+        return True
+
+    def finish_business_outcome(self, lease: Lease, attempt_id: str, *, recorded: bool):
+        uuid.UUID(attempt_id)
+        with self._change(lease):
+            self._event(lease.job_id, "business_outcome_persistence", {
+                "attemptId": attempt_id, "status": "recorded" if recorded else "uncertain",
+            })
+
+    def record_bridge_outcome_diagnostic(self, lease: Lease, *, request_id: str,
+                                         artifact_key: str | None, reason_code: str,
+                                         durable_request_id: str | None = None) -> dict:
+        """Record a safe, idempotent diagnostic when Bridge outcome lacks its durable intent."""
+        request_id = _name(request_id)
+        if artifact_key is not None:
+            artifact_key = _name(artifact_key)
+        if durable_request_id is not None:
+            durable_request_id = _name(durable_request_id)
+        if reason_code not in {"outcome-artifact-missing", "outcome-effect-missing",
+                               "outcome-effect-mismatch"}:
+            raise ValueError("bridge outcome diagnostic reason is invalid")
+        details = {"request_id": request_id, "reason_code": reason_code}
+        if artifact_key is not None:
+            details["artifact_key"] = artifact_key
+        if durable_request_id is not None:
+            details["durable_request_id"] = durable_request_id
+        encoded = _json(details)
+        with self._change(lease):
+            prior = self.connection.execute(
+                "SELECT seq,at FROM events WHERE job_id=? AND event_type='bridge_business_outcome_diagnostic' "
+                "AND details_json=? ORDER BY seq LIMIT 1",
+                (lease.job_id, encoded),
+            ).fetchone()
+            if prior:
+                return {"status": "recorded", "seq": prior["seq"], "at": prior["at"],
+                        "details": details, "reused": True}
+            at = self.clock()
+            cursor = self.connection.execute(
+                "INSERT INTO events(job_id,at,event_type,details_json) VALUES(?,?,'bridge_business_outcome_diagnostic',?)",
+                (lease.job_id, at, encoded),
+            )
+        return {"status": "recorded", "seq": cursor.lastrowid, "at": at,
+                "details": details, "reused": False}
 
     def effects_for(self, job_id: str, artifact_key: str) -> list[dict]:
         return [self._decode(row) for row in self.connection.execute(

@@ -340,7 +340,7 @@ def test_legacy_history_flag_is_not_a_success_contract():
     try:
         runner._validate_text(legacy)
     except RuntimeError as exc:
-        assert "live DOM and snapshot" in str(exc)
+        assert "supported evidence contract" in str(exc)
     else:
         raise AssertionError("legacy historyVerified must not satisfy the current bridge contract")
 

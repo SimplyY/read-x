@@ -47,6 +47,7 @@ _REASON_CODES = frozenset({
     "message-image-upload-request-changed", "message-image-upload-result-unconfirmed",
     "message-rate-limit", "message-rate-preflight-unavailable",
     "manual-document-id-requires-job-id", "message-readback-unconfirmed", "message-readback-unmatched", "missing-private-message-target",
+    "outcome-artifact-missing", "outcome-effect-mismatch", "outcome-effect-missing",
     "notification-history-incomplete", "notification-identity-missing", "notification-identity-unverified",
     "notification-payload-changed", "notification-readback-ambiguous",
     "notification-readback-unconfirmed", "notification-retry-backoff", "notification-retry-exhausted",

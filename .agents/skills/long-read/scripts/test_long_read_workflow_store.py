@@ -266,6 +266,69 @@ class StoreTests(unittest.TestCase):
         persisted = self.store.get_effect(effect["op_key"])
         self.assertEqual(persisted["metadata"]["duration_ms"], 125)
 
+    def test_bridge_outcome_persistence_state_is_durable_and_status_scoped(self):
+        job = self.submit(source_message_id="om_bridge_outcome")
+        lease = self.store.acquire_lease(job["job_id"], "bridge-outcome-worker")
+        effect = self.store.prepare_effect(lease, "main", "bridge-submit", DIGEST)
+        effect = self.store.begin_effect(lease, effect["op_key"])
+        self.store.finish_effect(lease, effect["op_key"], "confirmed", remote_id=effect["request_id"],
+                                 metadata={"verification": "live-dom+snapshot", "duration_ms": 45})
+
+        self.store.update_bridge_outcome_state(
+            lease, effect["op_key"], outcome_value="needs_review", persistence="attempting",
+        )
+        uncertain = self.store.update_bridge_outcome_state(
+            lease, effect["op_key"], outcome_value="needs_review", persistence="uncertain",
+            error_code="diagnostic-write-failed",
+        )
+        self.assertEqual(uncertain["metadata"]["business_outcome_persistence"], "uncertain")
+        self.assertEqual(uncertain["metadata"]["business_outcome_error_code"], "diagnostic-write-failed")
+        with self.assertRaises(StoreConflict):
+            self.store.update_bridge_outcome_state(
+                lease, effect["op_key"], outcome_value="needs_review", persistence="attempting",
+            )
+
+        self.store.update_bridge_outcome_state(
+            lease, effect["op_key"], outcome_value="succeeded", persistence="attempting",
+        )
+        recorded = self.store.update_bridge_outcome_state(
+            lease, effect["op_key"], outcome_value="succeeded", persistence="recorded",
+        )
+        self.assertEqual(recorded["metadata"]["verification"], "live-dom+snapshot")
+        self.assertEqual(recorded["metadata"]["duration_ms"], 45)
+        self.assertEqual(recorded["metadata"]["business_outcome_persistence"], "recorded")
+
+    def test_concurrent_bridge_outcome_intents_on_independent_connections_have_one_winner(self):
+        job = self.submit(source_message_id="om_bridge_outcome_concurrent")
+        lease = self.store.acquire_lease(job["job_id"], "bridge-outcome-concurrent")
+        effect = self.store.prepare_effect(lease, "main", "bridge-submit", DIGEST)
+        effect = self.store.begin_effect(lease, effect["op_key"])
+        self.store.finish_effect(lease, effect["op_key"], "confirmed", remote_id=effect["request_id"])
+        leases = [replace(lease), replace(lease)]
+        barrier = threading.Barrier(2)
+
+        def record(index):
+            with WorkflowStore(self.root, clock=self.clock) as connection:
+                barrier.wait(timeout=10)
+                try:
+                    connection.update_bridge_outcome_state(
+                        leases[index], effect["op_key"], outcome_value="succeeded",
+                        persistence="attempting",
+                    )
+                    return "recorded"
+                except (LeaseConflict, StoreConflict):
+                    return "fenced"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(record, range(2)))
+        self.assertCountEqual(results, ["recorded", "fenced"])
+        persisted = self.store.get_effect(effect["op_key"])
+        self.assertEqual(persisted["metadata"]["business_outcome_value"], "succeeded")
+        self.assertEqual(persisted["metadata"]["business_outcome_persistence"], "attempting")
+        events = [item for item in self.store.events(job["job_id"])
+                  if item["event_type"] == "bridge_business_outcome_state"]
+        self.assertEqual(len(events), 1)
+
     def test_preallocated_request_id_is_reused_and_retry_state_is_round_ordered(self):
         lease = self.store.acquire_lease(self.submit()["job_id"], "worker")
         request_id = "c4e8af13-e0bb-469e-a1a6-a1f5fc98d520"

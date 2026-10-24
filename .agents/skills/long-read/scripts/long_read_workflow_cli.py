@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import re
 from datetime import datetime
@@ -22,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from chatgpt_bridge import record_business_outcome
+from long_read_document_assembler import validate_scoring_fields
 from render_long_read_delivery_card import _load_score_evidence
 from long_read_workflow_store import (
     StoreConflict, WORKFLOW_CONTRACT_VERSION, WorkflowStore, is_valid_source_created_at,
@@ -328,6 +330,7 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
     scoring = _object(files["scoring-result.json"], "scoring result")
     if scoring.get("score_status") != "scored" or scoring.get("route") != "long_read":
         raise ValueError("submission requires score_status=scored and route=long_read")
+    validate_scoring_fields(scoring)
     context = _object(files["trigger-context.json"], "trigger context")
     if not isinstance(feishu_profile, str) or not feishu_profile.strip():
         raise ValueError("submission requires an explicit Feishu profile")
@@ -524,7 +527,7 @@ def inspect_jobs(state_dir: Path = DEFAULT_STATE_DIR, *, job_id: str | None = No
         connection.close()
 
 
-def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict) -> dict:
+def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict, include_patrol: bool = True) -> dict:
     """Run scheduled report delivery and advance one job in the same worker."""
     from long_read_workflow_scheduler import run_due_reports
     from long_read_workflow_worker import run_once
@@ -540,7 +543,68 @@ def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict) -> 
             )
     reports = run_due_reports(Path(state_dir), delivery_target=report_target)
     job = run_once(Path(state_dir), owner=owner, outcome_recorder=record_business_outcome)
-    return {"status": "tick", "reports": reports, "worker": job}
+    result = {"status": "tick", "reports": reports, "worker": job}
+    patrol = _voice_x_patrol_tick() if include_patrol else None
+    if patrol is not None:
+        result["voice_x_patrol"] = patrol
+    return result
+
+
+def _voice_x_patrol_tick() -> dict | None:
+    """Kick one short Voice-X supervisor tick only behind an explicit opt-in."""
+    if os.environ.get("VOICE_X_PATROL") != "1":
+        return None
+    voice_x_root = REPO_ROOT.parent / "voice-x"
+    script = voice_x_root / ".agents" / "skills" / "voice-x" / "scripts" / "voice-x.mjs"
+    try:
+        completed = subprocess.run(
+            ["node", str(script), "supervise"], cwd=voice_x_root,
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "reason": "supervisor-timeout"}
+    except OSError:
+        return {"status": "blocked", "reason": "supervisor-launch-failed"}
+    except Exception:
+        return {"status": "failed", "reason": "supervisor-error"}
+
+    payload = None
+    for line in reversed(completed.stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("status"), str):
+            payload = candidate
+            break
+    if payload is None:
+        return {"status": "failed", "reason": "supervisor-result-unavailable"}
+    result = {"status": payload["status"]}
+    for key in ("reason", "runId", "recordId", "generation"):
+        if key in payload and isinstance(payload[key], (str, int)):
+            result[key] = payload[key]
+    if completed.returncode != 0 and result["status"] not in {"blocked", "idle"}:
+        return {"status": "failed", "reason": "supervisor-nonzero-exit"}
+    return result
+
+
+def _start_voice_x_patrol_scheduler(interval_seconds: int):
+    """Run patrol independently of synchronous Read-X/report work in serve mode."""
+    if os.environ.get("VOICE_X_PATROL") != "1":
+        return None
+    stop_event = threading.Event()
+
+    def patrol_loop() -> None:
+        while not stop_event.is_set():
+            result = _voice_x_patrol_tick()
+            if result is not None:
+                print(json.dumps({"voice_x_patrol": result}, ensure_ascii=False), flush=True)
+            if stop_event.wait(interval_seconds):
+                break
+
+    thread = threading.Thread(target=patrol_loop, name="voice-x-patrol", daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 def main(argv=None) -> int:
@@ -662,13 +726,22 @@ def main(argv=None) -> int:
                 value = getattr(args, "report_" + key)
                 if value is not None and value != target[key]:
                     raise ValueError(f"--report-{key.replace('_', '-')} does not match persisted report target")
+            patrol_scheduler = _start_voice_x_patrol_scheduler(args.poll_seconds)
             try:
                 while True:
-                    result = worker_service_tick(args.state_dir, owner=args.owner, report_target=target)
+                    result = worker_service_tick(
+                        args.state_dir, owner=args.owner, report_target=target,
+                        include_patrol=patrol_scheduler is None,
+                    )
                     print(json.dumps(result, ensure_ascii=False), flush=True)
                     time.sleep(args.poll_seconds)
             except KeyboardInterrupt:
                 return 0
+            finally:
+                if patrol_scheduler is not None:
+                    stop_event, patrol_thread = patrol_scheduler
+                    stop_event.set()
+                    patrol_thread.join(timeout=2)
         else:
             from long_read_workflow_worker import run_once
             result = run_once(args.state_dir, job_id=args.job_id if args.command == "resume" else args.job_id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_text
+from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_text, verify_result_evidence
 from long_read_workflow_store import (
     Lease, WorkflowStore, workflow_payload_issue,
 )
@@ -146,13 +147,17 @@ def _read_local_receipt(output: Path, receipt_path: Path, request_id: str, promp
     except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    if (record.get("status") != "succeeded" or record.get("request_id") != request_id
+    if (not body.strip() or record.get("status") != "succeeded" or record.get("request_id") != request_id
             or record.get("caller_label") != CALLER
             or record.get("conversation_url_requested") != WORKFLOW_NEW_CHAT_URL
             or _conversation_id(record.get("conversation_url")) is None
             or record.get("prompt_sha256") != prompt_sha or record.get("source_sha256") != source_sha
-            or record.get("output_sha256") != digest or record.get("submissionConfirmed") is not True
-            or record.get("verification") != "live-dom+snapshot"):
+            or record.get("output_sha256") != digest or record.get("submissionConfirmed") is not True):
+        return None
+    try:
+        verify_result_evidence({**record, "runId": request_id, "outputSha256": record.get("bridge_output_sha256"),
+                                "conversationUrl": record.get("conversation_url")})
+    except RuntimeError:
         return None
     return body, record
 
@@ -205,6 +210,7 @@ def _store_receipt(output: Path, receipt_path: Path, body: str, *, request_id: s
         "conversation_url": bridge_result.get("conversationUrl"),
         "submissionConfirmed": bridge_result.get("submissionConfirmed"),
         "verification": bridge_result.get("verification"),
+        **{key: bridge_result[key] for key in ("resultVersion", "evidenceVersion", "deliveryClass", "candidateSha256", "evidenceSummary", "humanConfirmed", "completionSource", "candidateRevision") if key in bridge_result},
         "bridge_output_sha256": bridge_result.get("outputSha256"),
         "source_sha256": source_sha, "prompt_sha256": prompt_sha,
         "output_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
@@ -308,7 +314,8 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
             with lock:
                 _mark_artifact(store, lease, artifact_key, "confirmed")
             return {"artifact": artifact_key, "status": "confirmed", "reused": True,
-                    "request_id": effect["request_id"], "output_sha256": receipt["output_sha256"]}
+                    "request_id": effect["request_id"], "output_sha256": receipt["output_sha256"],
+                    "human_confirmed": receipt.get("humanConfirmed") is True}
         _renew_for_external_wait(store, lease, lock)
         bridge_result = observe_fn(
             original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
@@ -385,7 +392,8 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
         body = validate(verified_text(bridge_result))
     except Exception as exc:
         reason = re.sub(r"[^A-Za-z0-9_.:/+-]", "-", f"{type(exc).__name__}")[:120]
-        failure_metadata = {"verification": "live-dom+snapshot", "content_sha256": bridge_result.get("outputSha256"),
+        failure_metadata = {"verification": bridge_result.get("verification"), "content_sha256": bridge_result.get("outputSha256"),
+                            "human_confirmed": bridge_result.get("humanConfirmed") is True,
                             "failure_stage": "output-validation", "reason_code": "output-validation"}
         if execution_started is not None:
             failure_metadata["duration_ms"] = round((time.monotonic() - execution_started) * 1000)
@@ -418,7 +426,8 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
                             prompt_sha=prompt_sha, source_sha=source_sha, bridge_result=bridge_result,
                             prompt_assets=prompt_assets)
     remote_id = _conversation_id(bridge_result.get("conversationUrl"))
-    success_metadata = {"verification": "live-dom+snapshot", "content_sha256": record["output_sha256"]}
+    success_metadata = {"verification": bridge_result.get("verification"), "content_sha256": record["output_sha256"],
+                        "human_confirmed": bridge_result.get("humanConfirmed") is True}
     if execution_started is not None:
         success_metadata["duration_ms"] = round((time.monotonic() - execution_started) * 1000)
     with lock:
@@ -433,13 +442,15 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
         _mark_artifact(store, lease, artifact_key, "confirmed")
     return {"artifact": artifact_key, "status": "confirmed", "request_id": effect["request_id"],
             "output_sha256": record["output_sha256"], "recovered": recovered,
-            "business_validation_status": "succeeded"}
+            "business_validation_status": "succeeded", "human_confirmed": bridge_result.get("humanConfirmed") is True}
 
 
-def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int) -> None:
+def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int, *,
+                                store: WorkflowStore | None = None, lease: Lease | None = None,
+                                lock: threading.RLock | None = None) -> bool:
     request_id = result.get("request_id")
     if outcome_recorder is None or not request_id:
-        return
+        return False
     branch_status = result.get("status")
     outcome_status = "succeeded" if branch_status == "confirmed" else "failed" if branch_status == "failed" else "needs_review"
     validation_status = result.get("business_validation_status")
@@ -450,21 +461,12 @@ def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int
             validation_status = "failed"
         else:
             validation_status = "unknown"
-    try:
-        outcome_recorder({
-            "source": "read-x", "caller": CALLER,
-            "attemptId": request_id, "runId": request_id, "clientRequestId": request_id,
-            "status": outcome_status, "deliveryStatus": outcome_status,
-            "businessValidationStatus": validation_status,
-            "readbackStatus": result.get("readback_status", "unknown"),
-            "durationMs": max(0, duration_ms),
-        })
-    except Exception:
-        # Outcome persistence is diagnostic-only and cannot change the durable worker result.
+
+    def emit_diagnostic(reason: str, error_code: str) -> None:
         diagnostic = {
             "event": "bridge-business-outcome-diagnostic-failed",
-            "reason": "read-x-outcome-recorder-raised",
-            "errorCode": "diagnostic-write-failed",
+            "reason": reason,
+            "errorCode": error_code,
             "source": "read-x",
             "caller": CALLER,
         }
@@ -479,6 +481,104 @@ def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int
             print(json.dumps(diagnostic, separators=(",", ":")), file=sys.stderr)
         except Exception:
             pass
+
+    effect = None
+    if (store is None) != (lease is None):
+        emit_diagnostic("read-x-outcome-state-unavailable", "outcome-state-persistence-failed")
+        return False
+    if store is None or lease is None:
+        # The shared journal is an external side effect too; do not append it
+        # when this call has no local intent to make the append recoverable.
+        emit_diagnostic("read-x-outcome-state-unavailable", "outcome-state-persistence-failed")
+        return False
+    if store is not None and lease is not None:
+        artifact_key = result.get("artifact") or result.get("artifact_key")
+        try:
+            with lock if lock is not None else contextlib.nullcontext():
+                if not artifact_key:
+                    store.record_bridge_outcome_diagnostic(
+                        lease, request_id=request_id, artifact_key=None,
+                        reason_code="outcome-artifact-missing",
+                    )
+                    emit_diagnostic("read-x-outcome-artifact-missing", "outcome-artifact-missing")
+                    return False
+                effect = store.find_effect(lease.job_id, artifact_key, "bridge-submit")
+                if effect is None:
+                    store.record_bridge_outcome_diagnostic(
+                        lease, request_id=request_id, artifact_key=artifact_key,
+                        reason_code="outcome-effect-missing",
+                    )
+                    emit_diagnostic("read-x-outcome-effect-missing", "outcome-effect-missing")
+                    return False
+                if effect.get("request_id") != request_id:
+                    store.record_bridge_outcome_diagnostic(
+                        lease, request_id=request_id, artifact_key=artifact_key,
+                        reason_code="outcome-effect-mismatch",
+                        durable_request_id=effect.get("request_id"),
+                    )
+                    emit_diagnostic("read-x-outcome-effect-mismatch", "outcome-effect-mismatch")
+                    return False
+                metadata = effect.get("metadata") or {}
+                old_value = metadata.get("business_outcome_value")
+                old_persistence = metadata.get("business_outcome_persistence")
+                if old_value == outcome_status and old_persistence in {"recorded", "uncertain"}:
+                    return old_persistence == "recorded"
+                if old_value == outcome_status and old_persistence == "attempting":
+                    store.update_bridge_outcome_state(
+                        lease, effect["op_key"], outcome_value=outcome_status,
+                        persistence="uncertain", error_code="outcome-write-interrupted",
+                    )
+                    return False
+                store.update_bridge_outcome_state(
+                    lease, effect["op_key"], outcome_value=outcome_status,
+                    persistence="attempting",
+                )
+        except Exception:
+            # Without a durable intent, never write to the shared outcome journal.
+            emit_diagnostic("read-x-outcome-state-unavailable", "outcome-state-persistence-failed")
+            return False
+    failure_reason = "read-x-outcome-recorder-raised"
+    try:
+        event = {
+            "source": "read-x", "caller": CALLER,
+            "attemptId": request_id, "runId": request_id, "clientRequestId": request_id,
+            "status": outcome_status, "deliveryStatus": "unknown",
+            "businessValidationStatus": validation_status,
+            "readbackStatus": result.get("readback_status", "unknown"),
+            "durationMs": max(0, duration_ms),
+            **({"humanConfirmed": True} if result.get("human_confirmed") is True else {}),
+        }
+        if result.get("failure_stage") == "output-validation":
+            event.update({"failureStage": "output-validation", "errorCode": "output-validation"})
+        recorder_result = outcome_recorder(event)
+        persisted = (recorder_result is None or
+                     isinstance(recorder_result, dict) and recorder_result.get("status") == "recorded")
+        if effect is not None and store is not None and lease is not None:
+            with lock if lock is not None else contextlib.nullcontext():
+                store.update_bridge_outcome_state(
+                    lease, effect["op_key"], outcome_value=outcome_status,
+                    persistence="recorded" if persisted else "uncertain",
+                    error_code=None if persisted else "diagnostic-write-failed",
+                )
+        if not persisted:
+            failure_reason = "read-x-outcome-recorder-not-confirmed"
+            raise RuntimeError("outcome journal did not confirm persistence")
+        return True
+    except Exception:
+        # Outcome persistence is diagnostic-only and cannot change the durable worker result.
+        emit_diagnostic(failure_reason, "diagnostic-write-failed")
+        if effect is not None and store is not None and lease is not None:
+            try:
+                with lock if lock is not None else contextlib.nullcontext():
+                    current = store.get_effect(effect["op_key"])
+                    if current and (current.get("metadata") or {}).get("business_outcome_persistence") == "attempting":
+                        store.update_bridge_outcome_state(
+                            lease, effect["op_key"], outcome_value=outcome_status,
+                            persistence="uncertain", error_code="diagnostic-write-failed",
+                        )
+            except Exception:
+                pass
+        return False
 
 
 def _publish_main_document(*, store: WorkflowStore, lease: Lease, payload: dict,
@@ -732,11 +832,8 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         local = _read_local_receipt(*_receipt_paths(munger_output), munger_effect["request_id"], prompt_sha, source_sha)
         if local:
             body, receipt = local
-            bridge_text = body.rstrip("\n")
-            munger._validate_text({"status": "succeeded", "format": "markdown", "verification": "live-dom+snapshot",
-                                  "submissionConfirmed": True, "actualConversationUrl": receipt.get("conversation_url"),
-                                  "conversationUrl": receipt.get("conversation_url"), "text": bridge_text,
-                                  "outputSha256": hashlib.sha256(bridge_text.encode("utf-8")).hexdigest()})
+            # _read_local_receipt already verifies the persisted original evidence
+            # and the transformed business artifact; do not fabricate a legacy observation.
             _mark_artifact(store, lease, "analysis:munger-analysis", "confirmed")
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
                              "reuse": True, "output": munger_output, "status": "confirmed",
@@ -770,8 +867,10 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                 prompt_sha=branch.get("prompt_sha"),
                 bridge_fn=bridge_fn, observe_fn=observe_fn,
             )
-        _record_read_x_text_outcome(outcome_recorder, result,
-                                    round((time.monotonic() - started) * 1000))
+        _record_read_x_text_outcome(
+            outcome_recorder, result, round((time.monotonic() - started) * 1000),
+            store=store, lease=lease, lock=lock,
+        )
         return {"name": branch["name"], **result}
 
     with ThreadPoolExecutor(max_workers=min(MAX_BRANCHES, max(1, len(branches)))) as pool:
@@ -836,8 +935,11 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             validate=document_supplement.validate_supplement,
             bridge_fn=bridge_fn, observe_fn=observe_fn,
         )
-        _record_read_x_text_outcome(outcome_recorder, supplement_outcome,
-                                    round((time.monotonic() - supplement_started) * 1000))
+        _record_read_x_text_outcome(
+            outcome_recorder, supplement_outcome,
+            round((time.monotonic() - supplement_started) * 1000),
+            store=store, lease=lease, lock=lock,
+        )
         outcomes.append({"name": "document-supplement", **supplement_outcome})
     else:
         article_status = current_artifacts.get("analysis:article-decode", {}).get("status")
@@ -1058,6 +1160,52 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
 
 def _delivery_result(store: WorkflowStore, job_id: str, status: str, **extra) -> dict:
     return {"status": status, "job_id": job_id, "delivery_complete": status == "succeeded", **extra}
+
+
+def _record_delivery_outcomes(store: WorkflowStore, lease: Lease, result: dict, recorder) -> None:
+    if recorder is None:
+        return
+    caller_task_id = hashlib.sha256(lease.job_id.encode()).hexdigest()
+    artifacts = {item["artifact_key"]: item for item in store.artifacts(lease.job_id)}
+    events = []
+    for image_key in ("core-image", "munger-image"):
+        effect = store.latest_effect_for_action(lease.job_id, image_key, "image-generate")
+        if not effect:
+            continue
+        status = "succeeded" if effect["status"] == "confirmed" else "failed" if effect["status"] == "failed" else "needs_review"
+        delivered = all(artifacts.get(key, {}).get("status") == "confirmed"
+                        for key in (image_key, f"{image_key}-insert", f"{image_key}-send"))
+        events.append({"caller": "read-x:long-read-image", "outcomeKind": "stage", "artifactKind": "image",
+                       "runId": effect["request_id"], "clientRequestId": effect["request_id"], "status": status,
+                       "businessValidationStatus": "succeeded" if status == "succeeded" else "unknown",
+                       "deliveryStatus": "succeeded" if delivered else "unknown",
+                       "readbackStatus": "succeeded" if delivered else "unknown", "durationMs": 0,
+                       "humanConfirmed": (effect.get("metadata") or {}).get("human_confirmed") is True})
+    status = result.get("status")
+    required = [item for item in artifacts.values() if item["required"]]
+    delivered = status == "succeeded" and bool(required) and all(item["status"] == "confirmed" for item in required)
+    analyses = [item for key, item in artifacts.items() if key.startswith("analysis:") and item["required"]]
+    validation = "succeeded" if analyses and all(item["status"] == "confirmed" for item in analyses) else "failed" if any(item["status"] == "failed" for item in analyses) else "unknown"
+    human_confirmed = any((effect.get("metadata") or {}).get("human_confirmed") is True
+                          for key in artifacts for effect in store.effects_for(lease.job_id, key))
+    events.append({"caller": "read-x:long-read-task", "outcomeKind": "task", "artifactKind": "task",
+                   "status": status if status in {"succeeded", "failed", "needs_review"} else "unknown",
+                   "businessValidationStatus": validation, "deliveryStatus": "succeeded" if delivered else "unknown",
+                   "readbackStatus": "succeeded" if delivered else "unknown", "durationMs": max(0, round(result.get("elapsed_seconds", 0) * 1000)),
+                   "humanConfirmed": human_confirmed})
+    for event in events:
+        event.update(source="read-x", callerTaskId=caller_task_id)
+        identity = json.dumps({key: value for key, value in event.items() if key != "durationMs"}, sort_keys=True, separators=(",", ":"))
+        event["attemptId"] = str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+        try:
+            if not store.claim_business_outcome(lease, event):
+                continue
+            response = recorder(event)
+            store.finish_business_outcome(lease, event["attemptId"], recorded=response is None or isinstance(response, dict) and response.get("status") == "recorded")
+        except Exception:
+            # The intent remains visible when appending or acknowledging is uncertain.
+            print(json.dumps({"event": "bridge-business-outcome-diagnostic-failed", "reason": "delivery-outcome-write-unconfirmed",
+                              "source": "read-x", "caller": event["caller"], "attemptId": event["attemptId"]}), file=sys.stderr)
 
 
 def _mark_failed_if_open(store: WorkflowStore, lease: Lease, artifact_key: str,
@@ -1361,6 +1509,10 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
             result = {"status": "needs_review", "job_id": job_id, "delivery_complete": False,
                       "reason": f"{type(exc).__name__}: {exc}"}
         finally:
+            try:
+                _record_delivery_outcomes(store, lease, result, outcome_recorder)
+            except Exception:
+                print('{"event":"bridge-business-outcome-diagnostic-failed","reason":"delivery-outcome-state-unavailable"}', file=sys.stderr)
             with lock:
                 try:
                     store.release_lease(lease)

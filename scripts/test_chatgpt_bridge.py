@@ -79,6 +79,9 @@ def test_command_streams_prompt_and_disables_only_success_cooldown():
     assert 'preallocatedRunId: "12345678-1234-5678-1234-567812345678"' in command
     image_command = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True)[-1]
     assert "image: true" in image_command
+    assert "resultVersion: 1" in image_command
+    enabled = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True, observer={"mode": "single", "order": ["C"]})[-1]
+    assert "resultVersion: 2" in enabled
 
 
 def test_observe_command_uses_original_identity_and_never_submits_a_prompt():
@@ -94,6 +97,11 @@ def test_observe_command_uses_original_identity_and_never_submits_a_prompt():
     assert 'callerLabel: "read-x:long-read-image"' in command
     assert "maxWaitSeconds: 420" in command
     assert "runBridge" not in command
+    assert "resultVersion: 1" in command
+    assert command != bridge.observe_bridge_command(
+        Path("/tmp/bridge.mjs"), original_run_id="12345678-1234-5678-1234-567812345678",
+        conversation_url="https://chatgpt.com/c/1", caller_label="read-x:long-read-image", max_wait_seconds=420,
+    )[-1], "each recovery attempt has its own client request identity"
     entrypoint_command = bridge.observe_bridge_command(
         Path("/tmp/bridge.mjs"),
         original_run_id="12345678-1234-5678-1234-567812345678",
@@ -150,6 +158,42 @@ def test_verified_image_requires_current_contract():
             pass
         else:
             raise AssertionError("legacy or unverifiable image result must fail")
+
+
+def test_v2_evidence_accepts_degraded_format_but_rejects_unsafe_or_visual_only_results():
+    text = "完整且业务可解析的正文"
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    value = result(text, runId="12345678-1234-5678-1234-567812345678",
+                   conversationUrl="https://chatgpt.com/c/v2", actualConversationUrl="https://chatgpt.com/c/v2",
+                   resultVersion=2, evidenceVersion=2, verification="bridge-evidence/v2",
+                   deliveryClass="usable_with_warnings", candidateSha256=digest,
+                   evidenceSummary={"identity": "matched", "generation": "complete", "body": "available",
+                                    "truncation": "unknown", "candidateSha256": digest})
+    assert bridge.verified_text(value) == text
+    for change in ({"candidateSha256": "0" * 64}, {"outputSha256": "0" * 64}, {"runId": "bad"},
+                   {"resultVersion": 1}, {"evidenceVersion": 1}, {"evidenceSummary": {"confidence": .99}},
+                   {"deliveryClass": "requires_user_review"}, {"submissionConfirmed": False}):
+        try:
+            bridge.verified_text({**value, **change})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"unsafe v2 delivery was accepted: {list(change)}")
+    for field, state in (("identity", "unknown"), ("generation", "generating"), ("truncation", "possible")):
+        try:
+            bridge.verified_text({**value, "evidenceSummary": {**value["evidenceSummary"], field: state}})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"unsafe {field} evidence was accepted")
+
+
+def test_observer_configuration_is_forwarded_without_changing_submission_identity():
+    observer = {"mode": "single", "order": ["C"]}
+    command = bridge.bridge_command(Path("/tmp/bridge.mjs"), observer=observer,
+                                    request_id="12345678-1234-5678-1234-567812345678")[-1]
+    assert f"observer: {json.dumps(observer)}" in command
+    assert 'preallocatedRunId: "12345678-1234-5678-1234-567812345678"' in command
 
 
 def test_process_timeout_fails_closed():
@@ -376,6 +420,18 @@ def test_business_outcome_rejects_content_fields_before_running_node():
             raise AssertionError("content-bearing event must be rejected")
     finally:
         bridge.subprocess.run = original
+
+
+def test_manual_candidate_acceptance_keeps_hash_and_identity_gates():
+    value = result("accepted partial", runId="123e4567-e89b-42d3-a456-426614174000", resultVersion=2,evidenceVersion=2,verification="bridge-evidence/v2",deliveryClass="usable_with_warnings",humanConfirmed=True,completionSource="user-manual",candidateRevision=1,conversationUrl="https://chatgpt.com/c/target",actualConversationUrl="https://chatgpt.com/c/target")
+    value["candidateSha256"] = value["outputSha256"]
+    value["evidenceSummary"] = {"identity":"matched","generation":"unknown","body":"available","truncation":"present","candidateSha256":value["outputSha256"]}
+    bridge.verify_result_evidence(value)
+    for field, bad in [("humanConfirmed",False),("candidateSha256","0"*64),("candidateRevision",True),("candidateRevision",0)]:
+        changed = dict(value); changed[field] = bad
+        try: bridge.verify_result_evidence(changed)
+        except RuntimeError: pass
+        else: raise AssertionError("manual acceptance must retain safety gates")
 
 
 def main():

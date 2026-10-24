@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -322,6 +323,93 @@ class WorkerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_v2_receipts_preserve_evidence_and_resume_without_fabricating_legacy_verification(self):
+        bridge = FakeBridge()
+
+        def run_v2(prompt, **kwargs):
+            result = bridge.run(prompt, **kwargs)
+            result.update(resultVersion=2, evidenceVersion=2, verification="bridge-evidence/v2",
+                          deliveryClass="usable_with_warnings", candidateSha256=result["outputSha256"],
+                          evidenceSummary={"identity": "matched", "generation": "complete", "body": "available",
+                                           "truncation": "unknown", "candidateSha256": result["outputSha256"]})
+            return result
+
+        first = worker.process_job(
+            self.state, self.job_id, bridge_fn=run_v2, observe_fn=bridge.observe,
+            prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(publish_status="uncertain"),
+            notification_fn=fake_notifications,
+        )
+        self.assertEqual(first["status"], "needs_review")
+        receipt_path = self.state / "jobs" / self.job_id / "analysis" / "article-decode.md.receipt.json"
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(receipt["verification"], "bridge-evidence/v2")
+        self.assertEqual(receipt["candidateSha256"], receipt["evidenceSummary"]["candidateSha256"])
+        before = len(bridge.submissions)
+        second = worker.process_job(
+            self.state, self.job_id,
+            bridge_fn=lambda *_args, **_kwargs: self.fail("completed v2 request cannot be submitted twice"),
+            observe_fn=lambda **_kwargs: self.fail("intact v2 receipt needs no browser observation"),
+            prompt_fetcher=lambda _prompt_id: self.fail("cached v2 content must not refetch Prompt"),
+            document_compiler=FakeDocumentCompiler(recovery_status="confirmed"),
+            image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
+        )
+        self.assertEqual(second["status"], "succeeded", second)
+        self.assertEqual(len(bridge.submissions), before)
+
+    def test_delivery_outcome_lost_acknowledgement_is_not_replayed_and_readback_stays_unknown(self):
+        calls = []
+
+        def lost(event):
+            calls.append(event)
+            raise RuntimeError("private details must not reach diagnostics")
+
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "outcome-test")
+            with patch("sys.stderr", io.StringIO()) as stderr:
+                for _ in range(2):
+                    worker._record_delivery_outcomes(store, lease, {"status": "needs_review"}, lost)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["outcomeKind"], "task")
+            self.assertEqual(calls[0]["deliveryStatus"], "unknown")
+            self.assertEqual(calls[0]["readbackStatus"], "unknown")
+            self.assertNotIn(self.job_id, json.dumps(calls[0]))
+            self.assertNotIn("private details", stderr.getvalue())
+            events = store.events(self.job_id)
+            self.assertEqual(len([item for item in events if item["event_type"] == "business_outcome_intent"]), 1)
+            self.assertFalse(any(item["event_type"] == "business_outcome_persistence" for item in events))
+
+    def test_manual_candidate_receipt_stays_reusable_and_task_outcome_retains_human_intervention(self):
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "manual-receipt-test")
+            calls = []
+
+            def bridge(prompt, **kwargs):
+                calls.append(kwargs["request_id"])
+                text = "用户确认接受的候选正文"
+                candidate_sha = digest(text.encode())
+                return {"status": "succeeded", "runId": kwargs["request_id"], "format": "markdown", "text": text,
+                        "submissionConfirmed": True, "conversationUrl": "https://chatgpt.com/c/manual", "actualConversationUrl": "https://chatgpt.com/c/manual",
+                        "resultVersion": 2, "evidenceVersion": 2, "verification": "bridge-evidence/v2", "deliveryClass": "usable_with_warnings",
+                        "outputSha256": candidate_sha, "candidateSha256": candidate_sha, "candidateRevision": 2,
+                        "humanConfirmed": True, "completionSource": "user-manual",
+                        "evidenceSummary": {"identity": "matched", "generation": "unknown", "body": "available", "truncation": "present", "candidateSha256": candidate_sha}}
+
+            kwargs = dict(store=store, lease=lease, lock=threading.RLock(), artifact_key="analysis:article-decode",
+                          output=self.state / "jobs" / self.job_id / "analysis" / "manual.md",
+                          source_sha="a" * 64, prompt="authorized prompt", validate=lambda value: value, bridge_fn=bridge)
+            first = worker._run_text_branch(**kwargs)
+            self.assertEqual(first["status"], "confirmed")
+            self.assertTrue(first["human_confirmed"])
+            second = worker._run_text_branch(**kwargs)
+            self.assertTrue(second["reused"])
+            self.assertTrue(second["human_confirmed"])
+            self.assertEqual(len(calls), 1)
+            outcomes = []
+            worker._record_delivery_outcomes(store, lease, {"status": "needs_review"}, outcomes.append)
+            task = next(item for item in outcomes if item["outcomeKind"] == "task")
+            self.assertTrue(task["humanConfirmed"])
+            self.assertEqual(task["readbackStatus"], "unknown")
+
     def test_output_validation_failure_remains_distinct_in_shared_business_outcome(self):
         bridge = FakeBridge()
         with WorkflowStore(self.state) as store:
@@ -336,30 +424,51 @@ class WorkerTests(unittest.TestCase):
                 validate=lambda _value: (_ for _ in ()).throw(ValueError("private validation details")),
                 prompt_assets=[], bridge_fn=bridge.run,
             )
-            store.release_lease(lease)
+            outcomes = []
+            self.assertTrue(worker._record_read_x_text_outcome(
+                outcomes.append, result, 12, store=store, lease=lease,
+                lock=threading.RLock(),
+            ))
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "ValueError")
         self.assertEqual(result["failure_stage"], "output-validation")
-        outcomes = []
-        worker._record_read_x_text_outcome(outcomes.append, result, 12)
         self.assertEqual(outcomes[0]["status"], "failed")
+        self.assertEqual(outcomes[0]["deliveryStatus"], "unknown")
         self.assertEqual(outcomes[0]["businessValidationStatus"], "failed")
+        self.assertEqual(outcomes[0]["failureStage"], "output-validation")
+        self.assertEqual(outcomes[0]["errorCode"], "output-validation")
 
     def test_unexpected_outcome_recorder_exception_is_logged_without_exception_details(self):
         stderr = io.StringIO()
         result = {
             "request_id": "12345678-1234-5678-1234-567812345678",
-            "status": "needs_review", "reason": "response-text-unstable",
+            "artifact": "analysis:article-decode", "status": "needs_review",
+            "reason": "response-text-unstable",
         }
         def fail_recorder(_event):
             raise OSError("PRIVATE PATH SENTINEL")
-        with patch.object(worker.sys, "stderr", stderr):
-            worker._record_read_x_text_outcome(fail_recorder, result, 23)
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "outcome-recorder-error")
+            store.prepare_effect(lease, result["artifact"], "bridge-submit", "b" * 64,
+                                 request_id=result["request_id"])
+            with patch.object(worker.sys, "stderr", stderr):
+                self.assertFalse(worker._record_read_x_text_outcome(
+                    fail_recorder, result, 23, store=store, lease=lease,
+                    lock=threading.RLock(),
+                ))
         report = stderr.getvalue()
         self.assertIn("bridge-business-outcome-diagnostic-failed", report)
         self.assertIn("diagnostic-write-failed", report)
         self.assertIn(result["request_id"], report)
         self.assertNotIn("PRIVATE PATH SENTINEL", report)
+
+    def test_outcome_recorder_without_durable_context_fails_closed(self):
+        outcomes = []
+        result = {"request_id": "12345678-1234-5678-1234-567812345678", "status": "confirmed"}
+        with patch.object(worker.sys, "stderr", io.StringIO()) as stderr:
+            self.assertFalse(worker._record_read_x_text_outcome(outcomes.append, result, 10))
+        self.assertEqual(outcomes, [])
+        self.assertIn("outcome-state-persistence-failed", stderr.getvalue())
 
     def test_deferred_notification_outbox_is_scheduled_while_job_needs_review(self):
         with WorkflowStore(self.state) as store:
@@ -704,13 +813,19 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(bridge.submissions), 4)
         self.assertTrue(all(item[1] == "read-x:long-read-text" for item in bridge.submissions))
         self.assertTrue(all(item[2] == "https://chatgpt.com/" for item in bridge.submissions))
-        self.assertEqual(len(business_outcomes), 4)
+        text_outcomes = [item for item in business_outcomes if item["caller"] == "read-x:long-read-text"]
+        image_outcomes = [item for item in business_outcomes if item["caller"] == "read-x:long-read-image"]
+        task_outcomes = [item for item in business_outcomes if item.get("outcomeKind") == "task"]
+        self.assertEqual(len(text_outcomes), 4)
+        self.assertEqual(len(image_outcomes), 2)
+        self.assertEqual(len(task_outcomes), 1)
         self.assertTrue(all(item["source"] == "read-x" for item in business_outcomes))
-        self.assertTrue(all(item["caller"] == "read-x:long-read-text" for item in business_outcomes))
-        self.assertTrue(all(item["status"] == item["deliveryStatus"] == "succeeded" for item in business_outcomes))
-        self.assertTrue(all(item["readbackStatus"] == "unknown" for item in business_outcomes))
-        self.assertEqual({item["attemptId"] for item in business_outcomes},
-                         {item["runId"] for item in business_outcomes})
+        self.assertTrue(all(item["status"] == "succeeded" for item in business_outcomes))
+        self.assertTrue(all(item["deliveryStatus"] == "unknown" for item in text_outcomes))
+        self.assertTrue(all(item["readbackStatus"] == "unknown" for item in text_outcomes))
+        self.assertTrue(all(item["deliveryStatus"] == item["readbackStatus"] == "succeeded" for item in image_outcomes + task_outcomes))
+        self.assertEqual({item["attemptId"] for item in text_outcomes},
+                         {item["runId"] for item in text_outcomes})
         self.assertTrue(all(not ({"prompt", "response", "conversationUrl"} & set(item))
                             for item in business_outcomes))
         with WorkflowStore(self.state) as store:
@@ -803,6 +918,208 @@ class WorkerTests(unittest.TestCase):
             self.assertIsNone(store.find_effect(self.job_id, "final-notification", "message-send"))
             artifacts = {item["artifact_key"]: item for item in store.artifacts(self.job_id)}
             self.assertEqual(artifacts["core-image"]["status"], "uncertain")
+
+    def test_image_recovery_does_not_duplicate_confirmed_text_outcomes(self):
+        outcomes = []
+
+        def uncertain_image(*, store, lease, image_key, **_kwargs):
+            effect = store.find_effect(lease.job_id, image_key, "image-generate")
+            if effect is None:
+                effect = store.prepare_effect(
+                    lease, image_key, "image-generate", digest(b"unknown-image-result"),
+                )
+                effect = store.begin_effect(lease, effect["op_key"])
+                store.finish_effect(lease, effect["op_key"], "uncertain", metadata={
+                    "failure_stage": "image-generate",
+                    "reason_code": "simulated-observation-pending",
+                })
+            return {"status": "uncertain", "failure_stage": "image-generate",
+                    "reason_code": "simulated-observation-pending"}
+
+        for _ in range(2):
+            bridge = FakeBridge()
+            result = worker.process_job(
+                self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+                prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+                image_delivery_fn=uncertain_image, notification_fn=fake_notifications,
+                outcome_recorder=outcomes.append,
+            )
+            self.assertEqual(result["status"], "needs_review", result)
+        self.assertEqual(len([event for event in outcomes if event["caller"] == "read-x:long-read-text"]), 4)
+        self.assertEqual(len(outcomes), 6)
+        self.assertEqual(len({event["attemptId"] for event in outcomes}), 6)
+        self.assertTrue(all(event["deliveryStatus"] == event["readbackStatus"] == "unknown" for event in outcomes))
+        with WorkflowStore(self.state) as store:
+            effects = store.connection.execute(
+                "SELECT metadata_json FROM effects WHERE job_id=? AND action='bridge-submit'",
+                (self.job_id,),
+            ).fetchall()
+            self.assertTrue(all(json.loads(item["metadata_json"]).get("business_outcome_persistence") == "recorded"
+                                for item in effects))
+
+    def test_failed_outcome_journal_remains_durable_and_is_not_blindly_retried(self):
+        def uncertain_image(*, store, lease, image_key, **_kwargs):
+            effect = store.find_effect(lease.job_id, image_key, "image-generate")
+            if effect is None:
+                effect = store.prepare_effect(
+                    lease, image_key, "image-generate", digest(b"unknown-image-result"),
+                )
+                effect = store.begin_effect(lease, effect["op_key"])
+                store.finish_effect(lease, effect["op_key"], "uncertain", metadata={
+                    "failure_stage": "image-generate",
+                    "reason_code": "simulated-observation-pending",
+                })
+            return {"status": "uncertain", "failure_stage": "image-generate",
+                    "reason_code": "simulated-observation-pending"}
+
+        def failed_recorder(_event):
+            raise OSError("simulated shared journal unavailable")
+
+        def run(recorder):
+            bridge = FakeBridge()
+            return worker.process_job(
+                self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
+                prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
+                image_delivery_fn=uncertain_image, notification_fn=fake_notifications,
+                outcome_recorder=recorder,
+            )
+
+        with patch.object(worker.sys, "stderr", io.StringIO()):
+            first = run(failed_recorder)
+        self.assertEqual(first["status"], "needs_review", first)
+        recovered_outcomes = []
+        second = run(recovered_outcomes.append)
+        self.assertEqual(second["status"], "needs_review", second)
+        self.assertEqual(recovered_outcomes, [])
+        with WorkflowStore(self.state) as store:
+            effects = store.connection.execute(
+                "SELECT metadata_json FROM effects WHERE job_id=? AND action='bridge-submit'",
+                (self.job_id,),
+            ).fetchall()
+            self.assertEqual(len(effects), 4)
+            metadata = [json.loads(item["metadata_json"]) for item in effects]
+            self.assertTrue(all(item.get("business_outcome_persistence") == "uncertain" for item in metadata))
+            self.assertTrue(all(item.get("business_outcome_error_code") == "diagnostic-write-failed"
+                                for item in metadata))
+
+    def test_interrupted_outcome_write_is_left_uncertain_without_replay(self):
+        bridge = FakeBridge()
+        outcomes = []
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+            lease = store.acquire_lease(self.job_id, "outcome-interruption")
+            lock = threading.RLock()
+            result = worker._run_text_branch(
+                store=store, lease=lease, lock=lock, artifact_key="analysis:article-decode",
+                output=self.state / "jobs" / self.job_id / "analysis" / "article-decode.md",
+                source_sha=digest(source_path.read_bytes()), prompt="outcome interruption test",
+                validate=lambda value: value, prompt_assets=[], bridge_fn=bridge.run,
+                observe_fn=bridge.observe,
+            )
+            effect = store.find_effect(self.job_id, "analysis:article-decode", "bridge-submit")
+            store.update_bridge_outcome_state(
+                lease, effect["op_key"], outcome_value="succeeded", persistence="attempting",
+            )
+            self.assertFalse(worker._record_read_x_text_outcome(
+                outcomes.append, result, 0, store=store, lease=lease, lock=lock,
+            ))
+            self.assertEqual(outcomes, [])
+            recovered = store.get_effect(effect["op_key"])
+            self.assertEqual(recovered["metadata"]["business_outcome_persistence"], "uncertain")
+            self.assertEqual(recovered["metadata"]["business_outcome_error_code"], "outcome-write-interrupted")
+
+    def test_outcome_state_write_failure_does_not_escape_or_call_shared_recorder(self):
+        bridge = FakeBridge()
+        outcomes = []
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(self.job_id)
+            source_path = Path(job["payload"]["inputs"]["source.md"]["path"])
+            lease = store.acquire_lease(self.job_id, "outcome-db-failure")
+            result = worker._run_text_branch(
+                store=store, lease=lease,
+                lock=threading.RLock(), artifact_key="analysis:article-decode",
+                output=self.state / "jobs" / self.job_id / "analysis" / "article-decode.md",
+                source_sha=digest(source_path.read_bytes()), prompt="outcome state failure test",
+                validate=lambda value: value, prompt_assets=[], bridge_fn=bridge.run,
+                observe_fn=bridge.observe,
+            )
+            with patch.object(store, "update_bridge_outcome_state",
+                              side_effect=sqlite3.OperationalError("database is locked")):
+                with patch.object(worker.sys, "stderr", io.StringIO()) as stderr:
+                    self.assertFalse(worker._record_read_x_text_outcome(
+                        outcomes.append, result, 12, store=store, lease=lease,
+                        lock=threading.RLock(),
+                    ))
+            self.assertEqual(result["status"], "confirmed")
+            self.assertEqual(outcomes, [])
+            self.assertIn("outcome-state-persistence-failed", stderr.getvalue())
+
+    def test_missing_bridge_effect_is_diagnosed_without_shared_outcome_write(self):
+        request_id = "12345678-1234-5678-1234-567812345678"
+        result = {"request_id": request_id, "status": "confirmed",
+                  "artifact": "analysis:missing", "business_validation_status": "succeeded"}
+        outcomes = []
+        stderr = io.StringIO()
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "outcome-effect-missing")
+            with patch.object(worker.sys, "stderr", stderr):
+                recorded = worker._record_read_x_text_outcome(
+                    outcomes.append, result, 20, store=store, lease=lease,
+                    lock=threading.RLock(),
+                )
+                repeated = worker._record_read_x_text_outcome(
+                    outcomes.append, result, 20, store=store, lease=lease,
+                    lock=threading.RLock(),
+                )
+            self.assertFalse(recorded)
+            self.assertFalse(repeated)
+            self.assertEqual(outcomes, [])
+            diagnostics = [event for event in store.events(self.job_id)
+                           if event["event_type"] == "bridge_business_outcome_diagnostic"]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["details"]["reason_code"], "outcome-effect-missing")
+            self.assertEqual(diagnostics[0]["details"]["request_id"], request_id)
+        self.assertIn("outcome-effect-missing", stderr.getvalue())
+
+    def test_mismatched_bridge_effect_request_is_diagnosed_without_shared_outcome_write(self):
+        outcomes = []
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "outcome-effect-mismatch")
+            effect = store.prepare_effect(lease, "analysis:article-decode", "bridge-submit", "a" * 64)
+            result = {"request_id": "12345678-1234-5678-1234-567812345678",
+                      "status": "confirmed", "artifact": "analysis:article-decode",
+                      "business_validation_status": "succeeded"}
+            with patch.object(worker.sys, "stderr", io.StringIO()) as stderr:
+                recorded = worker._record_read_x_text_outcome(
+                    outcomes.append, result, 20, store=store, lease=lease,
+                    lock=threading.RLock(),
+                )
+            self.assertFalse(recorded)
+            self.assertEqual(outcomes, [])
+            diagnostics = [event for event in store.events(self.job_id)
+                           if event["event_type"] == "bridge_business_outcome_diagnostic"]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["details"]["reason_code"], "outcome-effect-mismatch")
+            self.assertEqual(diagnostics[0]["details"]["durable_request_id"], effect["request_id"])
+        self.assertIn("outcome-effect-mismatch", stderr.getvalue())
+
+    def test_missing_bridge_artifact_is_diagnosed_without_shared_outcome_write(self):
+        outcomes = []
+        result = {"request_id": "12345678-1234-5678-1234-567812345678", "status": "confirmed"}
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "outcome-artifact-missing")
+            with patch.object(worker.sys, "stderr", io.StringIO()) as stderr:
+                self.assertFalse(worker._record_read_x_text_outcome(
+                    outcomes.append, result, 20, store=store, lease=lease,
+                    lock=threading.RLock(),
+                ))
+            self.assertEqual(outcomes, [])
+            diagnostics = [event for event in store.events(self.job_id)
+                           if event["event_type"] == "bridge_business_outcome_diagnostic"]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["details"]["reason_code"], "outcome-artifact-missing")
+        self.assertIn("outcome-artifact-missing", stderr.getvalue())
 
     def test_subprocess_kill_after_bridge_side_effect_recovers_same_request(self):
         with WorkflowStore(self.state) as store:
@@ -1003,10 +1320,11 @@ with WorkflowStore(state) as store:
 
     def test_lost_bridge_response_recovers_original_request_without_second_submission(self):
         bridge = FakeBridge(lose_response_for="name: ljg-think")
+        outcomes = []
         first = worker.process_job(
             self.state, self.job_id, bridge_fn=bridge.run, observe_fn=bridge.observe,
             prompt_fetcher=asset_fetcher, document_compiler=FakeDocumentCompiler(),
-            notification_fn=fake_notifications,
+            notification_fn=fake_notifications, outcome_recorder=outcomes.append,
         )
         self.assertEqual(first["status"], "needs_review")
         self.assertEqual(first["content_review_notification"]["status"], "confirmed")
@@ -1023,10 +1341,13 @@ with WorkflowStore(state) as store:
             prompt_fetcher=lambda _prompt_id: (_ for _ in ()).throw(AssertionError("resume must not refetch or resubmit Prompt")),
             document_compiler=FakeDocumentCompiler(),
             image_delivery_fn=fake_image_delivery, notification_fn=fake_notifications,
+            outcome_recorder=outcomes.append,
         )
         self.assertEqual(second["status"], "succeeded", second)
         self.assertEqual(len(bridge.submissions), original_count + 1)
         self.assertEqual(len(calls), 1)
+        recovered_events = [event for event in outcomes if event["attemptId"] in calls]
+        self.assertEqual([event["status"] for event in recovered_events], ["needs_review", "succeeded"])
         self.assertTrue((self.state / "jobs" / self.job_id / "analysis" / "ljg-think.md").is_file())
         munger_receipt = self.state / "jobs" / self.job_id / "analysis" / "munger-analysis.md.receipt.json"
         self.assertEqual(json.loads(munger_receipt.read_text(encoding="utf-8"))["prompt_assets"][0]["prompt_id"],

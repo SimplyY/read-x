@@ -105,6 +105,16 @@ def _score_text(value, label: str, field: str) -> str:
     return f"{rendered}/10 · {label.strip()}"
 
 
+def validate_scoring_fields(scoring: dict) -> None:
+    """Validate the score fields required by the assembled document."""
+    for value_key, label_key, field in (
+        ("quality_score", "quality_label", "quality_score"),
+        ("relevance_score", "priority_label", "relevance_score"),
+        ("interest_score", "interest_label", "interest_score"),
+    ):
+        _score_text(scoring.get(value_key), scoring.get(label_key), field)
+
+
 def _validate_url(value: str, label: str) -> str:
     parsed = urlparse(value or "")
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -131,6 +141,7 @@ def assemble_markdown(*, evidence: dict, scoring: dict, article_decode: str,
     source_url = _validate_url(metadata.get("source_url"), "original source URL")
     if scoring.get("score_status") != "scored" or scoring.get("route") != "long_read":
         raise ValueError("document assembly requires a scored long_read route")
+    validate_scoring_fields(scoring)
     title = metadata["title"].strip()
     evidence_findings = validate_output.check_structure(evidence) + validate_output.check_quotes_substring(evidence, source)
     if evidence_findings:

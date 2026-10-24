@@ -15,7 +15,7 @@ import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
-from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_image
+from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_image, verify_result_evidence
 from run_chatgpt_munger import fetch_prompt_asset
 
 
@@ -154,8 +154,9 @@ def _reuse_image(output: Path, summary: dict, source_hash: str, request_id: str 
         raise ValueError("existing image request_id mismatch")
     if conversation_url is not None and conversation_url not in (summary.get("conversationUrl"), summary.get("conversation_url_requested")):
         raise ValueError("existing image conversation mismatch")
-    if summary.get("submissionConfirmed") is not True or summary.get("verification") != "live-dom+snapshot":
+    if summary.get("submissionConfirmed") is not True:
         raise ValueError("existing image submission was not verified")
+    verify_result_evidence(summary)
     for key in ("prompt_sha256", "input_sha256", "outputSha256", "image_sha256"):
         if not isinstance(summary.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", summary[key]):
             raise ValueError(f"existing image summary is missing {key}")
@@ -256,6 +257,7 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
         "conversation_url": result.get("conversationUrl"),
         "actualConversationUrl": result.get("actualConversationUrl"),
         "verification": result.get("verification"),
+        **{key: result[key] for key in ("resultVersion", "evidenceVersion", "deliveryClass", "candidateSha256", "evidenceSummary", "humanConfirmed", "completionSource", "candidateRevision") if key in result},
         "submissionConfirmed": result.get("submissionConfirmed"),
         "outputSha256": result.get("outputSha256"),
         "output_sha256": result.get("outputSha256"),
@@ -318,6 +320,7 @@ def recover(source_path: Path, output_path: Path, summary_path: Path, *, request
         "conversation_url": result.get("conversationUrl"),
         "actualConversationUrl": result.get("actualConversationUrl"),
         "verification": result.get("verification"),
+        **{key: result[key] for key in ("resultVersion", "evidenceVersion", "deliveryClass", "candidateSha256", "evidenceSummary", "humanConfirmed", "completionSource", "candidateRevision") if key in result},
         "submissionConfirmed": result.get("submissionConfirmed"),
         "outputSha256": result.get("outputSha256"),
         "output_sha256": result.get("outputSha256"),
