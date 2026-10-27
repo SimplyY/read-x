@@ -35,14 +35,14 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 | 单一概念、底层机制 | `ljg-think` |
 | 多层结构、多维系统 | `ljg-learn` |
 | 真实争议、利益冲突 | `ljg-roundtable` |
-| 长因果链、逐问推进 | `ljg-qa` |
 | 值得形成独立批评文章 | `ljg-writes` |
 | 罕见概念或单词 | `ljg-word` |
+
+新任务仅从以上五个 Skill 中选择；已持久接管的任务仍按其冻结的问题文件计划恢复。
 
 搭配限制：
 
 - `ljg-think` 与 `ljg-learn` 不同时选；
-- `ljg-roundtable` 与 `ljg-qa` 不同时选；
 - `ljg-word` 独立使用；
 - 不为凑数量选择同一问题的不同写法。
 

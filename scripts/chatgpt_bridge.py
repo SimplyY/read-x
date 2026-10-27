@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 
 BRIDGE_PROCESS_GRACE_SECONDS = 30
+CONTEXT_PACK_BUDGET_SECONDS = 30
 BUSY_RETRY_MAX_WAIT_SECONDS = 600
 WORKFLOW_NEW_CHAT_URL = "https://chatgpt.com/"
 READ_X_OUTCOME_CALLERS = {"read-x:long-read-text", "read-x:long-read-image", "read-x:long-read-task"}
@@ -43,6 +44,19 @@ def resolve_bridge() -> Path:
     raise FileNotFoundError("chatgpt-web-bridge/scripts/bridge.mjs is not installed")
 
 
+def requested_bridge_result_version(result_version: int | None = None, observer: dict | None = None) -> int:
+    if result_version is not None:
+        if type(result_version) is not int or result_version not in {1, 2}:
+            raise ValueError("bridge result version must be 1 or 2")
+        return result_version
+    if observer is not None:
+        return 2
+    configured = os.getenv("CHATGPT_WEB_BRIDGE_RESULT_VERSION")
+    if configured is not None and configured not in {"1", "2"}:
+        raise ValueError("bridge result version must be 1 or 2")
+    return 1 if configured == "1" else 2
+
+
 def bridge_command(
     bridge: Path | None = None,
     *,
@@ -53,6 +67,8 @@ def bridge_command(
     caller_label: str = "read-x:chatgpt-bridge",
     request_id: str | None = None,
     observer: dict | None = None,
+    result_version: int | None = None,
+    context_pack_delivery: dict | None = None,
 ) -> list[str]:
     if not isinstance(caller_label, str) or not caller_label.strip() or len(caller_label.strip()) > 100:
         raise ValueError("bridge caller label must contain 1 to 100 characters")
@@ -65,13 +81,15 @@ def bridge_command(
     conversation = json.dumps(conversation_url) if conversation_url else "undefined"
     caller = json.dumps(caller_label.strip())
     correlation_id = json.dumps(request_id)
-    observer_option = f", observer: {json.dumps(observer)}" if observer is not None else ""
+    requested_version = requested_bridge_result_version(result_version, observer)
+    observer_option = f", observer: {json.dumps(observer)}" if observer is not None and requested_version == 2 else ""
+    delivery_option = f", contextPackDelivery: {json.dumps(context_pack_delivery)}" if context_pack_delivery is not None else ""
     module = (
         f"import {{ runBridge }} from {json.dumps(bridge_uri)};"
         "process.stdin.setEncoding('utf8');"
         "let prompt = '';"
         "for await (const chunk of process.stdin) prompt += chunk;"
-        f"const result = await runBridge({{ prompt, resultVersion: {2 if observer is not None or os.getenv('CHATGPT_WEB_BRIDGE_RESULT_VERSION') == '2' else 1}, maxWaitSeconds: {int(max_wait_seconds)}, successCooldownSeconds: {int(success_cooldown_seconds)}, image: {'true' if image else 'false'}, conversationUrl: {conversation}, callerLabel: {caller}, preallocatedRunId: {correlation_id}{observer_option} }});"
+        f"const result = await runBridge({{ prompt, resultVersion: {requested_version}, maxWaitSeconds: {int(max_wait_seconds)}, successCooldownSeconds: {int(success_cooldown_seconds)}, image: {'true' if image else 'false'}, conversationUrl: {conversation}, callerLabel: {caller}, preallocatedRunId: {correlation_id}{observer_option}{delivery_option} }});"
         "process.stdout.write(JSON.stringify(result) + '\\n');"
         "process.exitCode = result.status === 'succeeded' ? 0 : 2;"
     )
@@ -86,6 +104,7 @@ def observe_bridge_command(
     caller_label: str,
     max_wait_seconds: int = 720,
     observer: dict | None = None,
+    result_version: int | None = None,
 ) -> list[str]:
     try:
         uuid.UUID(original_run_id)
@@ -102,10 +121,11 @@ def observe_bridge_command(
         raise ValueError("observe wait must be between 1 and 3600 seconds")
     bridge_uri = (bridge or resolve_bridge()).resolve().as_uri()
     request_id = str(uuid.uuid4())
-    observer_option = f", observer: {json.dumps(observer)}" if observer is not None else ""
+    requested_version = requested_bridge_result_version(result_version, observer)
+    observer_option = f", observer: {json.dumps(observer)}" if observer is not None and requested_version == 2 else ""
     module = (
         f"import {{ observeBridge }} from {json.dumps(bridge_uri)};"
-        f"const result = await observeBridge({{ resultVersion: {2 if observer is not None or os.getenv('CHATGPT_WEB_BRIDGE_RESULT_VERSION') == '2' else 1}, requestId: {json.dumps(request_id)}, originalRunId: {json.dumps(original_run_id)}, conversationUrl: {json.dumps(conversation_url)}, callerLabel: {json.dumps(caller_label.strip())}, maxWaitSeconds: {max_wait_seconds}{observer_option} }});"
+        f"const result = await observeBridge({{ resultVersion: {requested_version}, requestId: {json.dumps(request_id)}, originalRunId: {json.dumps(original_run_id)}, conversationUrl: {json.dumps(conversation_url)}, callerLabel: {json.dumps(caller_label.strip())}, maxWaitSeconds: {max_wait_seconds}{observer_option} }});"
         "process.stdout.write(JSON.stringify(result) + '\\n');"
         "process.exitCode = result.status === 'succeeded' ? 0 : 2;"
     )
@@ -126,16 +146,16 @@ def _parse_stdout(stdout: str) -> dict:
     return values[0]
 
 
-def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int, image: bool, conversation_url: str | None = None, caller_label: str = "read-x:chatgpt-bridge", request_id: str | None = None, observer: dict | None = None) -> dict:
+def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int, image: bool, conversation_url: str | None = None, caller_label: str = "read-x:chatgpt-bridge", request_id: str | None = None, observer: dict | None = None, result_version: int | None = None, context_pack_delivery: dict | None = None) -> dict:
     request_id = request_id or str(uuid.uuid4())
     try:
         completed = subprocess.run(
-            bridge_command(bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url, caller_label=caller_label, request_id=request_id, observer=observer),
+            bridge_command(bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url, caller_label=caller_label, request_id=request_id, observer=observer, result_version=result_version, context_pack_delivery=context_pack_delivery),
             input=prompt,
             text=True,
             capture_output=True,
             check=False,
-            timeout=max(int(max_wait_seconds) + BRIDGE_PROCESS_GRACE_SECONDS, BRIDGE_PROCESS_GRACE_SECONDS),
+            timeout=max(int(max_wait_seconds) + BRIDGE_PROCESS_GRACE_SECONDS + CONTEXT_PACK_BUDGET_SECONDS, BRIDGE_PROCESS_GRACE_SECONDS),
         )
     except subprocess.TimeoutExpired:
         return {"status": "needs_review", "reason": "bridge-process-timeout", "runId": request_id, "callerLabel": caller_label}
@@ -147,7 +167,9 @@ def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int,
             reason = f"bridge-exit-{completed.returncode}: {reason}"
         return {"status": "needs_review", "reason": reason, "runId": request_id, "callerLabel": caller_label}
     if completed.returncode != 0 and result.get("status") == "succeeded":
-        return {"status": "needs_review", "reason": f"bridge-exit-{completed.returncode}", "runId": request_id, "callerLabel": caller_label}
+        return {**result, "status": "needs_review", "reason": f"bridge-exit-{completed.returncode}", "runId": request_id, "callerLabel": caller_label}
+    if requested_bridge_result_version(result_version, observer) == 2 and result.get("status") == "succeeded" and result.get("resultVersion") != 2:
+        return {**result,"status":"needs_review","reason":"bridge-v2-evidence-required","runId":request_id,"callerLabel":caller_label}
     return result
 
 
@@ -159,6 +181,7 @@ def observe_bridge(
     bridge: Path | None = None,
     max_wait_seconds: int = 720,
     observer: dict | None = None,
+    result_version: int | None = None,
 ) -> dict:
     """Read the original Bridge result by identity; this never submits a new prompt."""
     command = observe_bridge_command(
@@ -168,6 +191,7 @@ def observe_bridge(
         caller_label=caller_label,
         max_wait_seconds=max_wait_seconds,
         observer=observer,
+        result_version=result_version,
     )
     try:
         completed = subprocess.run(
@@ -184,9 +208,11 @@ def observe_bridge(
     except Exception as exc:
         return {"status": "needs_review", "reason": f"bridge-observe-result-invalid: {exc}", "runId": original_run_id}
     if result.get("runId") != original_run_id:
-        return {"status": "needs_review", "reason": "bridge-observe-run-id-mismatch", "runId": original_run_id}
+        return {**result, "status": "needs_review", "reason": "bridge-observe-run-id-mismatch", "runId": original_run_id}
     if completed.returncode != 0 and result.get("status") == "succeeded":
-        return {"status": "needs_review", "reason": "bridge-observe-exit-status-mismatch", "runId": original_run_id}
+        return {**result, "status": "needs_review", "reason": "bridge-observe-exit-status-mismatch", "runId": original_run_id}
+    if requested_bridge_result_version(result_version, observer) == 2 and result.get("status") == "succeeded" and result.get("resultVersion") != 2:
+        return {**result,"status":"needs_review","reason":"bridge-v2-evidence-required","runId":original_run_id}
     return result
 
 
@@ -286,6 +312,8 @@ def run_bridge(
     caller_label: str = "read-x:chatgpt-bridge",
     request_id: str | None = None,
     observer: dict | None = None,
+    result_version: int | None = None,
+    context_pack_delivery: dict | None = None,
 ) -> dict:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("bridge prompt must not be empty")
@@ -302,13 +330,16 @@ def run_bridge(
             caller_label=caller_label,
             request_id=request_id,
             **({"observer": observer} if observer is not None else {}),
+            **({"result_version": result_version} if result_version is not None else {}),
+            **({"context_pack_delivery": context_pack_delivery} if context_pack_delivery is not None else {}),
         )
     started = time.monotonic()
     busy_retries: list[dict] = []
     while True:
         request_id = str(uuid.uuid4())
         result = _run_bridge_once(prompt, bridge=bridge, max_wait_seconds=max_wait_seconds, image=image, conversation_url=conversation_url, caller_label=caller_label, request_id=request_id,
-                                  **({"observer": observer} if observer is not None else {}))
+                                  **({"observer": observer} if observer is not None else {}), **({"result_version": result_version} if result_version is not None else {}),
+                                  **({"context_pack_delivery": context_pack_delivery} if context_pack_delivery is not None else {}))
         wait = _busy_retry_seconds(result, started, busy_retry_max_wait_seconds)
         if wait is None:
             if busy_retries:

@@ -70,6 +70,17 @@ def resolve_delivery_target(trigger: dict, store: WorkflowStore | None = None) -
         return None
 
 
+def context_pack_delivery(trigger: dict, store: WorkflowStore | None = None) -> dict:
+    """Bind the private TXT to this job's own app and verified P2P target."""
+    target = resolve_delivery_target(trigger, store)
+    profile, app_id, user_id = trigger.get("larkCliProfile"), trigger.get("appId"), trigger.get("senderId")
+    if (target is None or trigger.get("senderType") != "user"
+            or not all(isinstance(value, str) and value for value in (profile, app_id, user_id))):
+        # Explicitly invalid rather than falling back to another project's bot.
+        return {"invalid": True}
+    return {"profile": profile, "appId": app_id, "userId": user_id, "chatId": target[1]}
+
+
 def _correlate_card(card: dict, request_id: str) -> dict:
     """Bind the visible card payload to this outbox operation for safe readback."""
     correlated = json.loads(_canonical(card))

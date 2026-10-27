@@ -32,6 +32,7 @@ def image_result(**extra):
     return value
 
 
+
 def test_stdout_is_one_object():
     assert bridge._parse_stdout('{"status":"failed"}\n') == {"status": "failed"}
     for value in ("", "{}\n{}\n", "[]\n"):
@@ -77,7 +78,7 @@ def test_command_streams_prompt_and_disables_only_success_cooldown():
     assert "image: false" in command
     assert 'callerLabel: "read-x:weekly"' in command
     assert 'preallocatedRunId: "12345678-1234-5678-1234-567812345678"' in command
-    image_command = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True)[-1]
+    image_command = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True, result_version=1)[-1]
     assert "image: true" in image_command
     assert "resultVersion: 1" in image_command
     enabled = bridge.bridge_command(Path("/tmp/bridge.mjs"), image=True, observer={"mode": "single", "order": ["C"]})[-1]
@@ -86,7 +87,7 @@ def test_command_streams_prompt_and_disables_only_success_cooldown():
 
 def test_observe_command_uses_original_identity_and_never_submits_a_prompt():
     command = bridge.observe_bridge_command(
-        Path("/tmp/bridge.mjs"),
+        Path("/tmp/bridge.mjs"), result_version=1,
         original_run_id="12345678-1234-5678-1234-567812345678",
         conversation_url="https://chatgpt.com/c/1",
         caller_label="read-x:long-read-image",
@@ -200,7 +201,7 @@ def test_process_timeout_fails_closed():
     original = bridge.subprocess.run
 
     def timeout(*args, **kwargs):
-        assert kwargs["timeout"] == 330
+        assert kwargs["timeout"] == 360
         raise bridge.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
 
     bridge.subprocess.run = timeout
@@ -211,6 +212,30 @@ def test_process_timeout_fails_closed():
     assert result["status"] == "needs_review"
     assert result["reason"] == "bridge-process-timeout"
     assert result["runId"] and result["callerLabel"] == "read-x:chatgpt-bridge"
+
+
+def test_context_pack_delivery_and_failure_metadata_survive_adapter():
+    delivery = {"profile": "readx-fixture", "appId": "cli_fixture", "userId": "ou_fixture", "chatId": "oc_fixture"}
+    command = bridge.bridge_command(Path("/tmp/bridge.mjs"), context_pack_delivery=delivery)[-1]
+    assert f"contextPackDelivery: {json.dumps(delivery)}" in command
+    pack = {"status": "ready", "path": "/private/context/request.txt", "delivery": {"status": "failed"}}
+    original = bridge.subprocess.run
+    seen = []
+
+    def fake(command, **kwargs):
+        seen.append(kwargs)
+        assert kwargs["input"] == "原文与原提示词🙂\n"
+        assert f"contextPackDelivery: {json.dumps(delivery)}" in command[-1]
+        return bridge.subprocess.CompletedProcess(command, 2, json.dumps({"status": "succeeded", "contextPack": pack}), "")
+
+    bridge.subprocess.run = fake
+    try:
+        output = bridge.run_bridge("原文与原提示词🙂\n", bridge=Path("/tmp/bridge.mjs"), max_wait_seconds=300,
+                                   request_id="12345678-1234-5678-1234-567812345678", context_pack_delivery=delivery)
+    finally:
+        bridge.subprocess.run = original
+    assert output["status"] == "needs_review" and output["contextPack"] == pack
+    assert seen[0]["timeout"] == 360
 
 
 def test_busy_rejection_waits_for_a_free_slot_once_then_succeeds():
@@ -432,6 +457,24 @@ def test_manual_candidate_acceptance_keeps_hash_and_identity_gates():
         try: bridge.verify_result_evidence(changed)
         except RuntimeError: pass
         else: raise AssertionError("manual acceptance must retain safety gates")
+
+
+def test_default_v2_activation_and_explicit_rollback_share_one_resolver():
+    previous = os.environ.pop("CHATGPT_WEB_BRIDGE_RESULT_VERSION", None)
+    try:
+        assert bridge.requested_bridge_result_version() == 2
+        assert "resultVersion: 2" in bridge.bridge_command(Path("/tmp/bridge.mjs"))[-1]
+        os.environ["CHATGPT_WEB_BRIDGE_RESULT_VERSION"] = "1"
+        assert bridge.requested_bridge_result_version() == 1
+        assert bridge.requested_bridge_result_version(2) == 2
+        assert bridge.requested_bridge_result_version(1, {"mode":"single","order":["C"]}) == 1
+        for bad in [True, 0, 3, "2"]:
+            try: bridge.requested_bridge_result_version(bad)
+            except ValueError: pass
+            else: raise AssertionError("invalid version must stop before submission")
+    finally:
+        if previous is None: os.environ.pop("CHATGPT_WEB_BRIDGE_RESULT_VERSION", None)
+        else: os.environ["CHATGPT_WEB_BRIDGE_RESULT_VERSION"] = previous
 
 
 def main():

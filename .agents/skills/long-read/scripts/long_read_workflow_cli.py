@@ -34,6 +34,9 @@ from run_isolated_analyses import ALLOWED_LJG, validate_evidence
 DEFAULT_STATE_DIR = REPO_ROOT / "state" / "long-read"
 CANARY_PREFIX = "【CANARY｜Read-X long_read 端到端验收】"
 CANARY_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+# Keep the isolated runner's full allowlist for already-admitted jobs, while
+# preventing new Read-X submissions from adding this retired branch.
+NEW_SUBMISSION_LJG = ALLOWED_LJG - {"ljg-qa"}
 
 
 def _canonical(value) -> bytes:
@@ -315,7 +318,9 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
     if not isinstance(source_message_id, str) or not source_message_id.startswith("om_"):
         raise ValueError("submission requires a trusted Feishu source message id")
     names = [name for name, _ in questions]
-    if len(names) > 3 or len(names) != len(set(names)) or set(names) - ALLOWED_LJG:
+    if "ljg-qa" in names:
+        raise ValueError("ljg-qa is retired for new Read-X long-read submissions")
+    if len(names) > 3 or len(names) != len(set(names)) or set(names) - NEW_SUBMISSION_LJG:
         raise ValueError("questions require zero to three unique supported text skills")
     files = {
         "source.md": _read_regular(source), "evidence.json": _read_regular(evidence),

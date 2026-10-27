@@ -15,12 +15,12 @@ cd read-x
 
 **2. 安装 ljg-skills**
 
-`long-read` 调度 7 个文字 Skill，用 [skills CLI](https://github.com/vercel-labs/skills) 装到全局：
+`long-read` 调度 5 个文字 Skill，用 [skills CLI](https://github.com/vercel-labs/skills) 装到全局：
 
 ```bash
 bunx skills add lijigang/ljg-skills -g -a codex \
   --skill ljg-think --skill ljg-learn --skill ljg-roundtable \
-  --skill ljg-qa --skill ljg-writes --skill ljg-word -y
+  --skill ljg-writes --skill ljg-word -y
 ```
 
 
@@ -97,14 +97,13 @@ content-scoring（quality -> 条件 relevance -> decision）
 
 [`ljg-skills`](https://github.com/lijigang/ljg-skills) 是独立的外部 Skill 仓库，通过 [skills CLI](https://github.com/vercel-labs/skills) 安装到全局 `~/.agents/skills/`，**不在本仓库内**。
 
-`long-read` 通过 `references/routing.md` 调度其中 6 个 Skill；文字分析由 ChatGPT web-bridge 独立会话运行，互不可见：
+`long-read` 通过 `references/routing.md` 调度其中 5 个 Skill；文字分析由 ChatGPT web-bridge 独立会话运行，互不可见：
 
 | 触发条件 | Skill |
 |----------|-------|
 | 单一概念、底层机制 | `ljg-think` |
 | 多层结构、多维系统 | `ljg-learn` |
 | 真实争议、利益冲突 | `ljg-roundtable` |
-| 长因果链、逐问推进 | `ljg-qa` |
 | 值得独立成文批评 | `ljg-writes` |
 | 罕见概念或单词 | `ljg-word` |
 

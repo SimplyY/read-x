@@ -7,6 +7,12 @@ description: "长文精读编排器：接收已判定为 route=long_read 的任�
 
 只处理 `route=long_read`。**评分由 content-scoring 在上游完成，long-read 只消费评分结果，禁止重评。** 使用持久工作流 CLI 接管生成、装配、文档与图片交付、恢复和结果核验；不得以分析完成代替交付成功，也不得绕过工作流直接发布或发送。不要在同一次生成中模拟 `article-decode` 或 ljg Skill。
 
+## ChatGPT 请求上下文包
+
+本地评分、Evidence 和当前分支输入准备完成后，直接使用共享 [ChatGPT Bridge](/Users/yuwei/code/browser-runtime-governance/skills/chatgpt-web-bridge/SKILL.md)：每个实际请求在提交前默认生成一个相同输入的私有 TXT，不另建手动 Prompt 或独立导出流程。文字分支、后续补充和生图分别按各自实际准备时机导出，不等待整条精读完成。
+
+沿用稳定 `callerLabel`；附件身份从本任务可信 `larkCliProfile`、`appId`、本人用户和私聊目标绑定到 `contextPackDelivery`。向用户提供 `result.contextPack.path`，只有读回确认后才报告私聊附件已交付。附件交付默认预算 30 秒，失败或待核实不改变原工作流完成门；未知请求或发送不自动重发。完整接口、`exactInput` 和恢复规则以共享 Bridge 为准。
+
 ## 工作流
 
 ```text
@@ -37,7 +43,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 文字任务由持久 Worker 调用 `run_isolated_analyses.py` 和 `run_chatgpt_munger.py`。各请求保持独立、互不可见；全局并发 ≤3 路，请求发起错开 ≥10 秒。保留 Bridge 的提交确认、`verification=live-dom+snapshot`、会话 URL、哈希与进程退出码门禁。一个分支失败不得覆盖其他分支的成功结果。
 
-只有 `score_status=scored` 且 `route=long_read` 才可提交。提交前准备同一轮的原文、Evidence、评分结果、评分卡凭据、可信触发上下文和 0–3 个唯一问题文件。可信触发上下文必须包含 `bridge_context.sourceMessageId`；若字段缺失或本轮合并了多条消息，停止提交，不得猜测或替换消息 ID。将该 ID 原样传给 `--source-message-id`，用于按应用身份和来源事件去重。`long_read_workflow_cli.py submit` 校验后先保存不可变输入快照，再登记任务；只有返回 `status=accepted` 才表示持久接管。
+只有 `score_status=scored` 且 `route=long_read` 才可提交。提交前准备同一轮的原文、Evidence、评分结果、评分卡凭据、可信触发上下文和 0–3 个唯一问题文件；新任务只允许使用 `references/routing.md` 列出的五个 Skill。已持久接管的任务继续按冻结的问题文件计划恢复。可信触发上下文必须包含 `bridge_context.sourceMessageId`；若字段缺失或本轮合并了多条消息，停止提交，不得猜测或替换消息 ID。将该 ID 原样传给 `--source-message-id`，用于按应用身份和来源事件去重。`long_read_workflow_cli.py submit` 校验后先保存不可变输入快照，再登记任务；只有返回 `status=accepted` 才表示持久接管。
 
 重复入站以应用身份和来源消息 ID 去重。用户再次主动提交同一 URL 仍是新任务。提交失败时不得报告“已接管”。`status` 只读查看状态；`run-worker` 推进待办任务；`resume --job-id` 从检查点恢复。恢复时先只读核验在途副作用，不能把结果不明变成重新提交。已成功产物按内容哈希和收据复用。
 

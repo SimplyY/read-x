@@ -122,6 +122,12 @@ class SubmissionTests(unittest.TestCase):
         self.question.unlink()
         self.assertTrue((directory / "source.md").exists())
 
+    def test_retired_text_skill_is_rejected_before_creating_job_or_snapshot(self):
+        with self.assertRaisesRegex(ValueError, "retired for new Read-X long-read submissions"):
+            self.submit(questions=[("ljg-qa", self.question)])
+
+        self.assertFalse(self.state.exists())
+
     def test_group_without_private_chat_or_matching_saved_target_is_not_admitted(self):
         context = json.loads(self.context.read_text())
         context.pop("privateChatId")

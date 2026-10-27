@@ -17,7 +17,7 @@ from feishu_long_read_delivery import (
     match_image_messages, verify_image_message, message_rate_slot,
 )
 from long_read_workflow_store import WorkflowStore
-from long_read_workflow_notifications import resolve_delivery_target
+from long_read_workflow_notifications import resolve_delivery_target, context_pack_delivery
 
 
 RETRY_DELAY_SECONDS = 240
@@ -198,7 +198,7 @@ def _materialize_recovered_image(*, image_runner, source_path: Path, output: Pat
 
 def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_name: str,
                         source_path: Path, root: Path, round_number: int,
-                        conversation_url: str | None, prompt_fetcher, image_runner) -> dict:
+                        conversation_url: str | None, prompt_fetcher, image_runner, pack_target=None) -> dict:
     effect, action = _select_effect(store, lease.job_id, image_key, "image-generate", round_number)
     effect_round = _action_round(effect["action"]) if effect else round_number
     output, summary, request_path = _round_paths(root, image_name, effect_round)
@@ -310,6 +310,7 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
             conversation_url=request["conversation_url_requested"],
             prompt_fetcher=lambda _prompt_id: asset,
             request_id=attempt["request_id"],
+            **({"context_pack_delivery": pack_target} if pack_target is not None else {}),
         )
     except Exception:
         store.finish_effect(
@@ -962,7 +963,7 @@ def deliver_image(*, store: WorkflowStore, lease, payload: dict, root: Path,
         store=store, lease=lease, image_key=image_key, image_name=image_name,
         source_path=source_path, root=root, round_number=round_number,
         conversation_url=conversation_url, prompt_fetcher=prompt_fetcher or core_image.fetch_prompt_asset,
-        image_runner=image_runner,
+        image_runner=image_runner, pack_target=context_pack_delivery(trigger, store),
     )
     if generation["status"] != "confirmed":
         if generation.get("status") == "failed":

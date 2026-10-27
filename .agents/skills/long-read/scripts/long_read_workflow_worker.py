@@ -289,7 +289,7 @@ def _mark_artifact(store: WorkflowStore, lease: Lease, artifact_key: str, status
 def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
                      artifact_key: str, output: Path, source_sha: str, prompt: str,
                      validate, prompt_assets: list[dict] | None = None, prompt_sha: str | None = None,
-                     bridge_fn=run_bridge, observe_fn=observe_bridge) -> dict:
+                     bridge_fn=run_bridge, observe_fn=observe_bridge, context_pack_delivery=None) -> dict:
     with lock:
         effect = store.find_effect(lease.job_id, artifact_key, "bridge-submit")
     prompt_sha = prompt_sha or (effect["request_sha256"] if effect else None)
@@ -356,6 +356,7 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
             bridge_result = bridge_fn(
                 prompt, max_wait_seconds=360, caller_label=CALLER,
                 request_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+                **({"context_pack_delivery": context_pack_delivery} if context_pack_delivery is not None else {}),
             )
         except Exception as exc:
             reason = f"{type(exc).__name__}".lower()
@@ -787,6 +788,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
     lock = threading.RLock()
     job = store.get_job(job_id)
     payload, snapshot, source, source_sha = _load_job_inputs(job)
+    context_pack_delivery = workflow_notifications.context_pack_delivery(payload.get("trigger") or {}, store)
     evidence = _read_bytes(snapshot / "evidence.json").decode("utf-8")
     store.set_status(lease, "running")
     task_map = _prepare_text_tasks(payload, snapshot, root)
@@ -866,6 +868,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                 validate=branch["validate"], prompt_assets=branch.get("prompt_assets"),
                 prompt_sha=branch.get("prompt_sha"),
                 bridge_fn=bridge_fn, observe_fn=observe_fn,
+                context_pack_delivery=context_pack_delivery,
             )
         _record_read_x_text_outcome(
             outcome_recorder, result, round((time.monotonic() - started) * 1000),
@@ -934,6 +937,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             prompt_sha=supplement_effect["request_sha256"] if supplement_effect and supplement_prompt is None else None,
             validate=document_supplement.validate_supplement,
             bridge_fn=bridge_fn, observe_fn=observe_fn,
+            context_pack_delivery=context_pack_delivery,
         )
         _record_read_x_text_outcome(
             outcome_recorder, supplement_outcome,

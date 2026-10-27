@@ -13,7 +13,7 @@ from feishu_long_read_delivery import DeliveryError, RetryableDeliveryError, Unk
 from long_read_workflow_notifications import (
     NOTIFICATION_RECONCILE_INTERVAL_SECONDS, final_delivery_receipt,
     notify_content_review, notify_final, send_status_card,
-    _correlate_card, _preflight, _target,
+    _correlate_card, _preflight, _target, context_pack_delivery,
 )
 from long_read_workflow_store import VERIFIED_EFFECTS_BY_KIND, WorkflowStore
 from render_long_read_delivery_card import REQUIRED_SUCCESS_ARTIFACTS, render_card
@@ -95,6 +95,13 @@ class NotificationTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.temporary.cleanup()
+
+    def test_context_pack_uses_job_identity_and_never_guesses_missing_target(self):
+        self.assertEqual(context_pack_delivery(self.trigger, self.store), {
+            "profile": "app_bot", "appId": "app_bot", "userId": "ou_user", "chatId": "oc_private",
+        })
+        self.assertEqual(context_pack_delivery({**self.trigger, "senderType": "bot"}, self.store), {"invalid": True})
+        self.assertEqual(context_pack_delivery({**self.trigger, "chatType": "group", "privateChatId": None}, self.store), {"invalid": True})
 
     def send(self, client, *, now=None):
         now = now or (lambda: self.clock_value[0])

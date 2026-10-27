@@ -167,7 +167,7 @@ def _reuse_image(output: Path, summary: dict, source_hash: str, request_id: str 
     return {**summary, "reused": True}
 
 
-def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None, prompt_fetcher=None, request_id: str | None = None) -> dict:
+def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None, prompt_fetcher=None, request_id: str | None = None, context_pack_delivery=None) -> dict:
     doc = _read_regular(source_path, "source")
     source_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()
     prepared_summary = None
@@ -201,6 +201,8 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
     attempts: list[dict] = []
     requested_conversation_url = conversation_url or WORKFLOW_NEW_CHAT_URL
     call_args = {"bridge": bridge_path, "max_wait_seconds": MAX_WAIT_SECONDS, "image": True, "conversation_url": requested_conversation_url, "caller_label": CALLER_LABEL}
+    if context_pack_delivery is not None:
+        call_args["context_pack_delivery"] = context_pack_delivery
     if request_id is not None:
         call_args.update(request_id=request_id, busy_retry_max_wait_seconds=0)
     context = {
@@ -242,6 +244,7 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
             "run_id": request_id or result.get("runId"),
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "attempts": attempts,
+            **({"contextPack": result["contextPack"]} if isinstance(result.get("contextPack"), dict) else {}),
             "bridge": {k: result.get(k) for k in ("status", "runId", "reason", "retryAfterSeconds", "diagnostics")},
         }
         if summary_path:
@@ -266,6 +269,7 @@ def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, s
         "reason": None,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "attempts": attempts,
+        **({"contextPack": result["contextPack"]} if isinstance(result.get("contextPack"), dict) else {}),
     }
     _atomic_write_bytes(output_path, payload)
     if summary_path:

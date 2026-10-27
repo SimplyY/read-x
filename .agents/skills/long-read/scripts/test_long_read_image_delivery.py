@@ -25,7 +25,7 @@ class FakeImageRunner:
         self.recover_calls = 0
 
     def run(self, source_path, output_path, *, summary_path, conversation_url,
-            prompt_fetcher, request_id):
+            prompt_fetcher, request_id, context_pack_delivery=None):
         self.calls += 1
         source = source_path.read_text(encoding="utf-8")
         asset = prompt_fetcher(core_image.PROMPT_GOVERNANCE_ID)
