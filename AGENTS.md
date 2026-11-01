@@ -8,6 +8,8 @@
 
 README.md 保存项目事实；本文件保存 Agent 执行规则。
 
+飞书 Prompt 正文的本仓备份路径、维护真源和中央同步入口见 [`PROMPTS.md`](PROMPTS.md)。
+
 ## Harness 接入
 
 - 只在任务确实需要个性化相关性时读取通过校验的 YWNext `runtime/core-context/full.md`；完整核心上下文不得进入原文忠实度、质量评分、引用或交付状态判断。

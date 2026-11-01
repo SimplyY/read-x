@@ -1,0 +1,24 @@
+{
+  "schema_version": "prompt-repo-backups/v1",
+  "repository": "read-x",
+  "assets": {
+    "read-x.core-image": {
+      "local_path": "prompts/read-x.core-image.md",
+      "synced": {
+        "document_id": "LFyfdoMJFo0kJCxnKskcJY9qndf",
+        "revision": 2,
+        "sha256": "2c20eb38021e5c0b30abd94a7d1ce1925ebeaa929ef75efed47d6ae1c518a064",
+        "at": "2026-10-31T12:32:32.195Z"
+      }
+    },
+    "read-x.munger-analysis": {
+      "local_path": "prompts/read-x.munger-analysis.md",
+      "synced": {
+        "document_id": "J6FHdspjBocTSXxJ2BIc0iqSn4d",
+        "revision": 10,
+        "sha256": "4016b081e796859e7046f1bd9d84dd768348093ad6065e1cd8e9abb38158d8ff",
+        "at": "2026-10-31T12:32:32.695Z"
+      }
+    }
+  }
+}
