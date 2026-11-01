@@ -126,8 +126,16 @@ def _quote_block(value: str) -> str:
     return "\n".join("> " + line for line in value.splitlines())
 
 
+def _normalize_quote_blocks(markdown: str) -> str:
+    return "\n".join(
+        "- " + re.sub(r"^[ \t]*(?:>[ \t]*)+", "", line).strip()
+        if line.lstrip().startswith(">") else line
+        for line in markdown.splitlines()
+    )
+
+
 def _append_section(chunks: list[str], heading: str, body: str) -> None:
-    chunks.extend((f"# {heading}", body.strip(), ""))
+    chunks.extend((f"# {heading}", _normalize_quote_blocks(body.strip()), ""))
 
 
 def assemble_markdown(*, evidence: dict, scoring: dict, article_decode: str,
@@ -183,7 +191,7 @@ def assemble_markdown(*, evidence: dict, scoring: dict, article_decode: str,
     for key, heading in (("author_why", "作者为什么要写这篇文章"), ("structure", "作者心中的结构")):
         if key in sections:
             _append_section(chunks, heading, sections[key])
-    chunks.append(supplement.render_research_section(questions_fragment).rstrip())
+    chunks.append(_normalize_quote_blocks(supplement.render_research_section(questions_fragment).rstrip()))
     chunks.append("")
     dialogue = sections.get("dialogue", "目前没有可由原文确认、且能独立增加判断的作者对话点。")
     _append_section(chunks, "与作者对话", dialogue)
@@ -202,7 +210,7 @@ def assemble_markdown(*, evidence: dict, scoring: dict, article_decode: str,
             if skill not in LJG_TITLES or skill in seen or not isinstance(body, str) or not body.strip():
                 raise ValueError("text analysis list contains an unsupported, duplicated, or empty branch")
             seen.add(skill)
-            chunks.extend((f"## {skill} · {LJG_TITLES[skill]}", _demote_headings(body.strip(), by=2), ""))
+            chunks.extend((f"## {skill} · {LJG_TITLES[skill]}", _normalize_quote_blocks(_demote_headings(body.strip(), by=2)), ""))
     facts = evidence.get("facts")
     if not isinstance(facts, list):
         raise ValueError("Evidence facts must be a list")

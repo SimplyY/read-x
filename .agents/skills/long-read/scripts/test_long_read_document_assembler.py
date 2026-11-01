@@ -77,6 +77,7 @@ class DocumentAssemblerTests(unittest.TestCase):
             conversation_url="https://chatgpt.com/c/abc123",
         )
         self.assertEqual(validate_output.check_document_xml(xml), [])
+        self.assertEqual(xml.count("<blockquote>"), 1)
         self.assertEqual(xml.count('background-color="light-yellow"'), 1)
         self.assertIn("文章最重要的一刀", xml)
         self.assertIn('href="https://chatgpt.com/c/abc123"', xml)

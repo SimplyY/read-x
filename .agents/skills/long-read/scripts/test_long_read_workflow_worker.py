@@ -144,6 +144,7 @@ class FakeBridge:
         self.submissions = []
         self.lose_response_for = lose_response_for
         self.lost = False
+        self.observations = []
 
     @staticmethod
     def _text(prompt: str) -> str:
@@ -178,6 +179,7 @@ class FakeBridge:
         return result
 
     def observe(self, **kwargs):
+        self.observations.append(kwargs)
         return self.results.get(kwargs["original_run_id"], {
             "status": "needs_review", "runId": kwargs["original_run_id"], "reason": "original-run-result-pending",
         })
@@ -355,6 +357,41 @@ class WorkerTests(unittest.TestCase):
         )
         self.assertEqual(second["status"], "succeeded", second)
         self.assertEqual(len(bridge.submissions), before)
+
+    def test_uncertain_bridge_recovery_uses_original_evidence_identity(self):
+        observations = []
+
+        def observe(**kwargs):
+            observations.append(kwargs)
+            return {"status": "needs_review", "runId": kwargs["original_run_id"],
+                    "reason": "original-run-result-pending"}
+
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "uncertain-bridge-test")
+            effect = store.prepare_effect(
+                lease, "analysis:article-decode", "bridge-submit",
+                digest(b"uncertain bridge prompt"),
+            )
+            store.begin_effect(lease, effect["op_key"])
+            store.finish_effect(lease, effect["op_key"], "uncertain", metadata={
+                "reason_code": "observer-timeout", "failure_stage": "bridge",
+            })
+            output = self.state / "jobs" / self.job_id / "analysis" / "article-decode.md"
+            worker._load_or_store_request_metadata(
+                output, request_id=effect["request_id"],
+                prompt_sha=effect["request_sha256"], source_sha=digest(b"source"),
+                prompt_assets=[], existing_effect=False,
+            )
+            result = worker._run_text_branch(
+                store=store, lease=lease, lock=threading.RLock(),
+                artifact_key="analysis:article-decode", output=output,
+                source_sha=digest(b"source"), prompt="uncertain bridge prompt",
+                prompt_sha=effect["request_sha256"], validate=lambda value: value,
+                prompt_assets=[], observe_fn=observe,
+            )
+
+        self.assertEqual(result["status"], "needs_review", result)
+        self.assertEqual(observations[0]["conversation_url"], None)
 
     def test_delivery_outcome_lost_acknowledgement_is_not_replayed_and_readback_stays_unknown(self):
         calls = []
@@ -846,6 +883,7 @@ class WorkerTests(unittest.TestCase):
             self.assertIn("munger-image-insert", job["payload"]["required_artifacts"])
             self.assertIn("core-image-insert", job["payload"]["required_artifacts"])
         self.assertEqual(result["document_candidate"]["status"], "candidate_ready")
+        json.dumps(result, ensure_ascii=False, allow_nan=False)
         self.assertTrue(Path(result["document_candidate"]["xml_path"]).is_file())
         self.assertTrue(Path(result["document_candidate"]["markdown_path"]).is_file())
         self.assertEqual(result["document_delivery"]["status"], "confirmed")

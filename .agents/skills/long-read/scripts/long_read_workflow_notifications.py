@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 import sys
 import time
@@ -16,6 +17,7 @@ from feishu_long_read_delivery import (
     DeliveryError, FeishuLongReadDelivery, RetryableDeliveryError, UnknownRemoteResult,
     match_report_messages, message_rate_slot,
 )
+from feishu_long_read_delivery import _card_urls
 from long_read_workflow_store import WorkflowStore
 from render_long_read_delivery_card import render_card, DELIVERY_RECEIPT_SCHEMA
 
@@ -23,6 +25,7 @@ from render_long_read_delivery_card import render_card, DELIVERY_RECEIPT_SCHEMA
 NOTIFICATION_RETRY_DELAY_SECONDS = 60
 NOTIFICATION_RETRY_LIMIT = 2
 NOTIFICATION_RECONCILE_INTERVAL_SECONDS = 300
+NOTIFICATION_RECONCILE_RETRY_SECONDS = 10
 FEISHU_MESSAGE_IDEMPOTENCY_WINDOW_SECONDS = 3600
 
 
@@ -116,6 +119,28 @@ def _readback(client, message_id: str | None, *, chat_id: str, sender_id: str,
     messages = client.list_chat_messages(chat_id=chat_id, start_time=start_time, end_time=end_time)
     matches = _matches(messages, chat_id=chat_id, sender_id=sender_id, card=card)
     return matches[0]["message_id"] if len(matches) == 1 else None
+
+
+def _degraded_message_readback(client, message_id: str | None, *, chat_id: str,
+                               sender_id: str, card: dict) -> str | None:
+    """Verify a known message ID after Feishu degrades Card 2.0 for raw reads."""
+    if not message_id:
+        return None
+    try:
+        message = client.mget_message(message_id)
+    except DeliveryError:
+        return None
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if not isinstance(content, str):
+        return None
+    title_match = re.search(r'title="([^"]+)"', content)
+    header = card.get("header") if isinstance(card, dict) else None
+    header_title = (header or {}).get("title", {}).get("content") if isinstance(header, dict) else None
+    if not title_match or header_title not in (None, title_match.group(1)):
+        return None
+    if not all(url in content for url in _card_urls(card)):
+        return None
+    return message_id
 
 
 def _preflight(client, *, chat_id: str, sender_id: str, now: float) -> bool:
@@ -263,6 +288,23 @@ def send_status_card(*, store: WorkflowStore, lease, payload: dict, root: Path,
                 metadata={"failure_stage": "notification-send", "reason_code": "worker-interrupted"},
             )
             effect = store.get_effect(effect["op_key"])
+        if effect.get("remote_id"):
+            try:
+                recovered_id = _degraded_message_readback(
+                    client, effect.get("remote_id"), chat_id=history_chat_id,
+                    sender_id=sender_id, card=correlated_card,
+                )
+            except DeliveryError:
+                recovered_id = None
+            if recovered_id:
+                store.reconcile_effect(
+                    lease, effect["op_key"], "confirmed", remote_id=recovered_id,
+                    metadata={"verification": "message-id-degraded-card-readback"},
+                )
+                store.set_artifact(lease, artifact_key, "confirmed", metadata={
+                    "verification": "message-id-degraded-card-readback",
+                })
+                return {"status": "confirmed", "message_id": recovered_id, "recovered": True}
         reconcile_at = artifact_metadata.get(
             "next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"),
         )
@@ -386,12 +428,30 @@ def send_status_card(*, store: WorkflowStore, lease, payload: dict, root: Path,
         )
     except DeliveryError:
         verified_id = None
+    if not verified_id and message_id:
+        verified_id = _degraded_message_readback(
+            client, message_id, chat_id=history_chat_id, sender_id=sender_id,
+            card=correlated_card,
+        )
+    if not verified_id and message_id:
+        try:
+            downgraded = client.mget_message(message_id)
+            content = downgraded.get("content", "") if isinstance(downgraded, dict) else ""
+            expected_urls = _card_urls(correlated_card)
+            verified_id = message_id if expected_urls and all(url in content for url in expected_urls) else None
+        except (AttributeError, DeliveryError):
+            verified_id = None
     if not verified_id:
         store.finish_effect(
             lease, attempt["op_key"], "uncertain", remote_id=message_id,
             metadata={"failure_stage": "notification-send", "reason_code": "message-readback-unmatched"},
         )
-        return {"status": "uncertain", "reason_code": "notification-readback-unconfirmed"}
+        store.set_artifact(lease, artifact_key, "uncertain", metadata={
+            "failure_stage": "notification-send", "reason_code": "notification-readback-unconfirmed",
+            "next_reconcile_at": now + NOTIFICATION_RECONCILE_RETRY_SECONDS,
+        })
+        return {"status": "uncertain", "reason_code": "notification-readback-unconfirmed",
+                "retry_at": now + NOTIFICATION_RECONCILE_RETRY_SECONDS}
     store.finish_effect(
         lease, attempt["op_key"], "confirmed", remote_id=verified_id,
         metadata={"verification": "message-id-card-readback"},

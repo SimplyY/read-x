@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 import long_read_workflow_cli as cli
+import long_read_workflow_worker
 from long_read_workflow_store import (
     StoreConflict, WorkflowStore, is_verified_test_task, workflow_payload_issue,
 )
@@ -623,10 +624,16 @@ class SubmissionTests(unittest.TestCase):
         output = StringIO()
         with patch.object(cli, "resolve_worker_profile_key", return_value="app_one"), \
                 patch.object(cli, "verify_canary_source", side_effect=canary_proof), \
+                patch.object(long_read_workflow_worker, "run_once",
+                             return_value={"status": "idle", "job_id": "unused",
+                                           "delivery_complete": False}) as run_once, \
                 redirect_stdout(output):
             self.assertEqual(cli.main(args), 0)
         result = json.loads(output.getvalue())
         self.assertEqual(result["status"], "accepted")
+        self.assertEqual(result["worker"]["status"], "idle")
+        self.assertEqual(run_once.call_args.kwargs["job_id"], result["job_id"])
+        self.assertEqual(run_once.call_args.kwargs["owner"], "read-x-admission-worker")
         self.assertTrue(result["test_task"])
         output = StringIO()
         with redirect_stdout(output):
@@ -636,7 +643,6 @@ class SubmissionTests(unittest.TestCase):
         with redirect_stdout(output):
             self.assertEqual(cli.main(["--state-dir", str(self.state), "status", "--chat-id", "oc_group"]), 0)
         self.assertTrue(json.loads(output.getvalue())["has_nonterminal"])
-        import long_read_workflow_worker
         original = long_read_workflow_worker.run_once
         long_read_workflow_worker.run_once = lambda *args, **kwargs: {"status": "waiting_for_delivery_stages", "job_id": result["job_id"], "delivery_complete": False}
         try:

@@ -33,6 +33,7 @@ import long_read_workflow_notifications as workflow_notifications
 
 CALLER = "read-x:long-read-text"
 MAX_BRANCHES = 3
+SAFE_REASON_CODE_RE = re.compile(r"[A-Za-z0-9_.:/+-]{1,100}")
 LONG_EXTERNAL_WAIT_LEASE_SECONDS = 900
 DOCUMENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 SAFE_PRE_SUBMIT_FAILURES = {
@@ -318,14 +319,14 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
                     "human_confirmed": receipt.get("humanConfirmed") is True}
         _renew_for_external_wait(store, lease, lock)
         bridge_result = observe_fn(
-            original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+            original_run_id=effect["request_id"], conversation_url=None,
             caller_label=CALLER, max_wait_seconds=720,
         )
         recovered = True
     elif effect and effect["status"] in {"attempting", "uncertain"}:
         _renew_for_external_wait(store, lease, lock)
         bridge_result = observe_fn(
-            original_run_id=effect["request_id"], conversation_url=WORKFLOW_NEW_CHAT_URL,
+            original_run_id=effect["request_id"], conversation_url=None,
             caller_label=CALLER, max_wait_seconds=720,
         )
         recovered = True
@@ -726,8 +727,10 @@ def _notify(*, store: WorkflowStore, lease: Lease, payload: dict, root: Path,
             raise ValueError("document review notification artifact is missing")
         metadata = dict(artifact.get("metadata", {}))
         reason_code = metadata.get("notification_reason_code", metadata.get("reason_code"))
-        if not isinstance(reason_code, str) or not reason_code:
+        if not isinstance(reason_code, str) or not SAFE_REASON_CODE_RE.fullmatch(reason_code):
             reason_code = str(kwargs.get("reason_code") or "document-publish-result-unconfirmed")
+            if not SAFE_REASON_CODE_RE.fullmatch(reason_code):
+                reason_code = "document-publish-result-unconfirmed"
             metadata.update({"failure_stage": "document-publish", "reason_code": reason_code,
                              "notification_reason_code": reason_code})
             store.set_artifact(lease, artifact_key, artifact["status"], metadata=metadata)
@@ -838,7 +841,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             # and the transformed business artifact; do not fabricate a legacy observation.
             _mark_artifact(store, lease, "analysis:munger-analysis", "confirmed")
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
-                             "reuse": True, "output": munger_output, "status": "confirmed",
+                             "reuse": True, "output": str(munger_output), "status": "confirmed",
                              "request_id": munger_effect["request_id"]})
         else:
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
@@ -1044,6 +1047,21 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             markdown=assembled, xml=xml,
         )
 
+    content_review_artifact = next(
+        (item for item in store.artifacts(job_id)
+         if item["artifact_key"] == "content-review-notification"),
+        None,
+    )
+    if content_review_artifact is not None and content_review_artifact["status"] == "uncertain":
+        content_review_delivery = _notify(
+            store=store, lease=lease, payload=payload, root=root,
+            event="content_review", notification_fn=notification_fn,
+            clock=clock,
+        )
+        artifacts = store.artifacts(job_id)
+        if content_review_delivery.get("status") != "confirmed":
+            unresolved = True
+
     content_plan_ready = all(
         item["status"] in {"confirmed", "failed"}
         for item in artifacts if item["kind"] == "analysis" and item["required"]
@@ -1065,6 +1083,8 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         )
         if document_delivery["status"] in {"needs_review", "uncertain"}:
             unresolved = True
+        elif document_delivery["status"] == "confirmed":
+            unresolved = False
     required_analysis_unresolved = any(
         item["required"] and item["kind"] == "analysis" and item["status"] in {"pending", "uncertain"}
         for item in artifacts
@@ -1099,6 +1119,12 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                 event="content_review", notification_fn=notification_fn,
                 clock=clock,
             )
+        elif content_review_artifact is not None and content_review_artifact["status"] == "uncertain":
+            content_review_notification = _notify(
+                store=store, lease=lease, payload=payload, root=root,
+                event="content_review", notification_fn=notification_fn,
+                clock=clock,
+            )
         return {
             "status": "needs_review", "job_id": job_id, "delivery_complete": False,
             "content_branches": outcomes, "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -1117,30 +1143,23 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             None,
         )
         if unresolved_review:
-            review_artifact = next(
-                (item for item in store.artifacts(job_id) if item["artifact_key"] == review_key),
-                None,
-            )
-            metadata = (review_artifact or {}).get("metadata", {})
-            reason_code = metadata.get("notification_reason_code", metadata.get("reason_code"))
-            if not isinstance(reason_code, str) or not reason_code:
-                store.set_status(lease, "needs_review")
-                return _delivery_result(
-                    store, job_id, "needs_review", stage="document-publish-review-notification",
-                    reason="original-review-notification-payload-unavailable",
-                )
-            notice = _notify(
+            unresolved_reason = unresolved_review.get("metadata", {}).get("reason_code")
+            review_notification = _notify(
                 store=store, lease=lease, payload=payload, root=root,
                 event="document_review", notification_fn=notification_fn,
-                reason_code=reason_code, clock=clock,
+                reason_code=unresolved_reason or "document-publish-result-unconfirmed",
+                clock=clock,
             )
-            if notice.get("status") != "confirmed":
-                store.set_status(lease, "needs_review")
-                return _delivery_result(
-                    store, job_id, "needs_review", stage="document-publish-review-notification",
-                    reason=notice.get("reason_code", "notification-send-result-unconfirmed"),
-                    notification=notice.get("status"),
-                )
+            if review_notification.get("status") != "confirmed":
+                return {
+                    "status": "needs_review", "job_id": job_id, "delivery_complete": False,
+                    "document_delivery": document_delivery,
+                    "document_review_notification": review_notification,
+                    "next_stage": "resolve_document_review_notification",
+                    "required_artifacts": [
+                        item["artifact_key"] for item in store.artifacts(job_id) if item["required"]
+                    ],
+                }
 
     # Content can be useful even when a required branch failed. That must not
     # strand the job before delivery-state reporting; downstream impossible
@@ -1652,7 +1671,6 @@ def _notification_retry_due(store: WorkflowStore, artifacts: list[dict], now: fl
                     )
                     if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
                         return True
-                    continue
                 retry_at = metadata.get("next_retry_at", effect.get("metadata", {}).get("next_retry_at"))
                 if artifact["status"] in {"pending", "failed"}:
                     if not isinstance(retry_at, (int, float)):
@@ -1663,7 +1681,9 @@ def _notification_retry_due(store: WorkflowStore, artifacts: list[dict], now: fl
                 if artifact["status"] in {"failed", "uncertain"} and (
                         effect["attempts"] >= retry_limit
                         or now - float(effect["created_at"]) >= idempotency_window):
-                    reconcile_at = metadata.get("next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"))
+                    reconcile_at = metadata.get(
+                        "next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"),
+                    )
                     if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
                         return True
                 continue
@@ -1672,4 +1692,5 @@ def _notification_retry_due(store: WorkflowStore, artifacts: list[dict], now: fl
                 reconcile_at = metadata.get("next_reconcile_at", effect.get("metadata", {}).get("next_reconcile_at"))
                 if not isinstance(reconcile_at, (int, float)) or float(reconcile_at) <= now:
                     return True
+                continue
     return False

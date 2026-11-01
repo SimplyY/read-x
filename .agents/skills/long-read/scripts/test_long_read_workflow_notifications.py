@@ -11,7 +11,8 @@ import unittest
 import long_read_workflow_worker as workflow_worker
 from feishu_long_read_delivery import DeliveryError, RetryableDeliveryError, UnknownRemoteResult
 from long_read_workflow_notifications import (
-    NOTIFICATION_RECONCILE_INTERVAL_SECONDS, final_delivery_receipt,
+    NOTIFICATION_RECONCILE_INTERVAL_SECONDS, NOTIFICATION_RECONCILE_RETRY_SECONDS,
+    final_delivery_receipt,
     notify_content_review, notify_final, send_status_card,
     _correlate_card, _preflight, _target, context_pack_delivery,
 )
@@ -65,6 +66,16 @@ class FakeMessages:
 
     def get_message(self, message_id):
         return next(item for item in self.history if item["message_id"] == message_id)
+
+    def mget_message(self, message_id):
+        message = next((item for item in self.history if item["message_id"] == message_id), None)
+        if message is None:
+            raise DeliveryError("simulated unknown message id")
+        card = json.loads(message["body"]["content"])
+        header_title = card["header"]["title"]["content"]
+        subtitle = card["header"].get("subtitle", {}).get("content", "")
+        return {"message_id": message_id,
+                "content": f'<card title="{header_title}" subtitle="{subtitle}">降级</card>'}
 
 
 class NotificationTests(unittest.TestCase):
@@ -308,6 +319,52 @@ class NotificationTests(unittest.TestCase):
                         if item["artifact_key"] == "document-notification")
         self.assertEqual(artifact["metadata"]["next_reconcile_at"],
                          due_at + NOTIFICATION_RECONCILE_INTERVAL_SECONDS)
+
+    def test_message_id_readback_mismatch_is_quickly_reconciled(self):
+        class MismatchedMessageId(FakeMessages):
+            def send_interactive_card(self, **kwargs):
+                self.sends += 1
+                return "om_not_written"
+
+            def get_message(self, message_id):
+                raise DeliveryError("simulated missing message id")
+
+        client = MismatchedMessageId()
+        now = [1000.0]
+        first = self.send(client, now=lambda: now[0])
+        self.assertEqual(first["status"], "uncertain")
+        self.assertEqual(first["reason_code"], "notification-readback-unconfirmed")
+        self.assertEqual(client.sends, 1)
+        artifact = next(item for item in self.store.artifacts(self.job_id)
+                        if item["artifact_key"] == "document-notification")
+        due_at = artifact["metadata"]["next_reconcile_at"]
+        self.assertEqual(due_at, now[0] + NOTIFICATION_RECONCILE_RETRY_SECONDS)
+        self.assertFalse(workflow_worker._notification_retry_due(
+            self.store, self.store.artifacts(self.job_id), due_at - 1,
+        ))
+        self.assertTrue(workflow_worker._notification_retry_due(
+            self.store, self.store.artifacts(self.job_id), due_at,
+        ))
+
+    def test_degraded_card_readback_confirms_known_message_id_without_resend(self):
+        class Degraded(FakeMessages):
+            def get_message(self, message_id):
+                raise DeliveryError("simulated raw Card 2.0 mismatch")
+
+            def list_chat_messages(self, **kwargs):
+                if self.sends == 0:
+                    return []
+                raise DeliveryError("simulated raw history mismatch")
+
+        client = Degraded()
+        now = [1000.0]
+
+        first = self.send(client, now=lambda: now[0])
+
+        self.assertEqual(first["status"], "confirmed")
+        self.assertEqual(client.sends, 1)
+        effect = self.store.find_effect(self.job_id, "document-notification", "message-send")
+        self.assertEqual(effect["metadata"]["verification"], "message-id-card-readback")
 
     def test_known_rejected_send_retries_after_backoff_with_same_effect(self):
         class RejectOnce(FakeMessages):

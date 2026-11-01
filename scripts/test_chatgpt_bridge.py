@@ -110,6 +110,13 @@ def test_observe_command_uses_original_identity_and_never_submits_a_prompt():
         caller_label="read-x:long-read-text",
     )[-1]
     assert "observeBridge" in entrypoint_command
+    evidence_command = bridge.observe_bridge_command(
+        Path("/tmp/bridge.mjs"),
+        original_run_id="12345678-1234-5678-1234-567812345678",
+        conversation_url=None,
+        caller_label="read-x:long-read-text",
+    )[-1]
+    assert "conversationUrl: undefined" in evidence_command
     try:
         bridge.observe_bridge_command(
             Path("/tmp/bridge.mjs"),

@@ -388,6 +388,17 @@ class FeishuLongReadDelivery:
             raise DeliveryError("message read-back does not match requested message")
         return message
 
+    def mget_message(self, message_id: str) -> dict:
+        """Return the CLI-enriched card summary when the raw API downgrades schema 2.0."""
+        message_id = self._validate_id(message_id, "message_id")
+        data = _data(self._run(["im", "+messages-mget", "--message-ids", message_id], write=False))
+        messages = data.get("messages")
+        if (not isinstance(messages, list) or len(messages) != 1
+                or not isinstance(messages[0], dict)
+                or messages[0].get("message_id") != message_id):
+            raise DeliveryError("message read-back did not return exactly one enriched message")
+        return messages[0]
+
     def send_image_message(self, *, image_key: str, idempotency_key: str,
                            chat_id: str | None = None, user_id: str | None = None) -> str:
         if bool(chat_id) == bool(user_id):
@@ -590,6 +601,16 @@ def _message_content(message: dict) -> dict | None:
     except (ValueError, TypeError, AttributeError):
         return None
     return content if isinstance(content, dict) else None
+
+
+def _card_urls(value):
+    if isinstance(value, str):
+        return [url.rstrip(').,;:!?，。；：！？') for url in re.findall(r"https?://[^\s\"'<>]+", value)]
+    if isinstance(value, dict):
+        return [url for nested in value.values() for url in _card_urls(nested)]
+    if isinstance(value, list):
+        return [url for nested in value for url in _card_urls(nested)]
+    return []
 
 
 def match_report_messages(messages: list[dict], *, chat_id: str, sender_id: str,

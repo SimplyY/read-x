@@ -616,7 +616,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     commands = parser.add_subparsers(dest="command", required=True)
-    submit = commands.add_parser("submit", help="校验并持久接管输入；不启动交付")
+    submit = commands.add_parser("submit", help="校验并持久接管输入，然后立即推进一次 Worker")
     for name in ("source", "evidence", "scoring-result", "score-gate", "trigger-context"):
         submit.add_argument("--" + name, type=Path, required=True)
     submit.add_argument("--app-id", required=True)
@@ -684,6 +684,11 @@ def main(argv=None) -> int:
                                    profile_resolver=resolve_worker_profile_key,
                                    canary_verifier=verify_canary_source,
                                    state_dir=args.state_dir)
+            from long_read_workflow_worker import run_once
+            result["worker"] = run_once(
+                args.state_dir, job_id=result["job_id"], owner="read-x-admission-worker",
+                outcome_recorder=record_business_outcome,
+            )
         elif args.command == "status":
             result = inspect_jobs(args.state_dir, job_id=args.job_id, chat_id=args.chat_id,
                                   report_key=args.report_key)

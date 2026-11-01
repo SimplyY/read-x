@@ -100,7 +100,7 @@ def observe_bridge_command(
     bridge: Path | None = None,
     *,
     original_run_id: str,
-    conversation_url: str,
+    conversation_url: str | None = None,
     caller_label: str,
     max_wait_seconds: int = 720,
     observer: dict | None = None,
@@ -112,20 +112,22 @@ def observe_bridge_command(
         raise ValueError("original bridge run id must be a UUID") from exc
     if not isinstance(caller_label, str) or not caller_label.strip() or len(caller_label.strip()) > 100:
         raise ValueError("bridge caller label must contain 1 to 100 characters")
-    parsed = urlparse(conversation_url)
-    is_session = parsed.path.startswith("/c/") and parsed.hostname in {"chatgpt.com", "chat.openai.com"}
-    is_new_chat_entry = parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and parsed.path in {"", "/"}
-    if parsed.scheme not in {"http", "https"} or not (is_session or is_new_chat_entry):
-        raise ValueError("conversation URL must be a ChatGPT session or the exact new-chat entrypoint")
+    if conversation_url is not None:
+        parsed = urlparse(conversation_url)
+        is_session = parsed.path.startswith("/c/") and parsed.hostname in {"chatgpt.com", "chat.openai.com"}
+        is_new_chat_entry = parsed.scheme == "https" and parsed.hostname == "chatgpt.com" and parsed.path in {"", "/"}
+        if parsed.scheme not in {"http", "https"} or not (is_session or is_new_chat_entry):
+            raise ValueError("conversation URL must be a ChatGPT session or the exact new-chat entrypoint")
     if isinstance(max_wait_seconds, bool) or not isinstance(max_wait_seconds, int) or not 1 <= max_wait_seconds <= 3600:
         raise ValueError("observe wait must be between 1 and 3600 seconds")
     bridge_uri = (bridge or resolve_bridge()).resolve().as_uri()
     request_id = str(uuid.uuid4())
     requested_version = requested_bridge_result_version(result_version, observer)
+    conversation = json.dumps(conversation_url) if conversation_url is not None else "undefined"
     observer_option = f", observer: {json.dumps(observer)}" if observer is not None and requested_version == 2 else ""
     module = (
         f"import {{ observeBridge }} from {json.dumps(bridge_uri)};"
-        f"const result = await observeBridge({{ resultVersion: {requested_version}, requestId: {json.dumps(request_id)}, originalRunId: {json.dumps(original_run_id)}, conversationUrl: {json.dumps(conversation_url)}, callerLabel: {json.dumps(caller_label.strip())}, maxWaitSeconds: {max_wait_seconds}{observer_option} }});"
+        f"const result = await observeBridge({{ resultVersion: {requested_version}, requestId: {json.dumps(request_id)}, originalRunId: {json.dumps(original_run_id)}, conversationUrl: {conversation}, callerLabel: {json.dumps(caller_label.strip())}, maxWaitSeconds: {max_wait_seconds}{observer_option} }});"
         "process.stdout.write(JSON.stringify(result) + '\\n');"
         "process.exitCode = result.status === 'succeeded' ? 0 : 2;"
     )
@@ -176,7 +178,7 @@ def _run_bridge_once(prompt: str, *, bridge: Path | None, max_wait_seconds: int,
 def observe_bridge(
     *,
     original_run_id: str,
-    conversation_url: str,
+    conversation_url: str | None = None,
     caller_label: str,
     bridge: Path | None = None,
     max_wait_seconds: int = 720,
