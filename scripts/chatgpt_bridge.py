@@ -44,6 +44,53 @@ def resolve_bridge() -> Path:
     raise FileNotFoundError("chatgpt-web-bridge/scripts/bridge.mjs is not installed")
 
 
+def run_context_pack(command: str, *, pack_id: str, bridge: Path | None = None,
+                     root: Path | None = None, prompt: str | None = None,
+                     metadata: dict | None = None, timeout_seconds: int = 40) -> dict:
+    """Invoke only the pack CLI. This path never imports or submits to ChatGPT."""
+    if command not in {"prepare", "status", "verify", "deliver"}:
+        raise ValueError("invalid context pack operation")
+    uuid.UUID(pack_id)
+    script = (bridge or resolve_bridge()).with_name("context-pack-cli.mjs")
+    if not script.is_file():
+        raise FileNotFoundError("context-pack-cli.mjs is not installed")
+    arguments = ["node", str(script), command, "--run-id", pack_id]
+    if root is not None:
+        arguments.extend(("--root", str(root)))
+    if command == "prepare":
+        if not isinstance(prompt, str) or not prompt.strip() or not isinstance(metadata, dict):
+            raise ValueError("context pack preparation requires business input and metadata")
+        for key in ("caller-label", "title", "pack-type", "title-source", "task-id", "artifact-id",
+                    "prompt-sha256", "input-sha256"):
+            value = metadata.get(key.replace("-", "_"))
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"context pack metadata is missing {key}")
+            arguments.extend(("--" + key, value))
+        for key in ("prompt-asset-json", "delivery-context-json"):
+            value = metadata.get(key.removesuffix("-json").replace("-", "_"))
+            if not isinstance(value, dict):
+                raise ValueError(f"context pack metadata is missing {key}")
+            arguments.extend(("--" + key, json.dumps(value, ensure_ascii=False, separators=(",", ":"))))
+    elif prompt is not None or metadata is not None:
+        raise ValueError("only pack preparation accepts business input")
+    if command == "deliver":
+        arguments.append("--retry")
+    try:
+        completed = subprocess.run(arguments, input=prompt if command == "prepare" else None,
+                                   capture_output=True, encoding="utf-8", check=False, timeout=timeout_seconds)
+        result = _parse_stdout(completed.stdout)
+    except subprocess.TimeoutExpired:
+        return {"runId": pack_id, "deliveryStatus": "needs_review" if command == "deliver" else "unavailable",
+                "errorCode": "context-pack-process-timeout"}
+    except (OSError, ValueError):
+        return {"runId": pack_id, "deliveryStatus": "needs_review" if command == "deliver" else "unavailable",
+                "errorCode": "context-pack-process-unavailable"}
+    if result.get("runId") != pack_id or completed.returncode != 0 and not result.get("errorCode"):
+        return {"runId": pack_id, "deliveryStatus": "needs_review" if command == "deliver" else "unavailable",
+                "errorCode": "context-pack-process-result-mismatch"}
+    return result
+
+
 def requested_bridge_result_version(result_version: int | None = None, observer: dict | None = None) -> int:
     if result_version is not None:
         if type(result_version) is not int or result_version not in {1, 2}:

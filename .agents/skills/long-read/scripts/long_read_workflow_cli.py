@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import re
+import uuid
 from datetime import datetime
 from urllib.parse import urlsplit, urlunsplit
 
@@ -26,17 +27,18 @@ from chatgpt_bridge import record_business_outcome
 from long_read_document_assembler import validate_scoring_fields
 from render_long_read_delivery_card import _load_score_evidence
 from long_read_workflow_store import (
-    StoreConflict, WORKFLOW_CONTRACT_VERSION, WorkflowStore, is_valid_source_created_at,
+    StoreConflict, WORKFLOW_CONTRACT_VERSION, CONTEXT_WORKFLOW_CONTRACT_VERSION,
+    CONTEXT_ARTIFACTS, WorkflowStore, is_valid_source_created_at,
     state_lock, workflow_payload_issue,
 )
-from run_isolated_analyses import ALLOWED_LJG, validate_evidence
+from run_isolated_analyses import validate_evidence
 
 DEFAULT_STATE_DIR = REPO_ROOT / "state" / "long-read"
 CANARY_PREFIX = "【CANARY｜Read-X long_read 端到端验收】"
 CANARY_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
-# Keep the isolated runner's full allowlist for already-admitted jobs, while
-# preventing new Read-X submissions from adding this retired branch.
-NEW_SUBMISSION_LJG = ALLOWED_LJG - {"ljg-qa"}
+# Already-admitted jobs may resume frozen plans, but new submissions never add
+# optional text-skill branches; long-read now runs article-decode only.
+NEW_SUBMISSION_LJG = frozenset()
 
 
 def _canonical(value) -> bytes:
@@ -317,21 +319,16 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
         raise ValueError("test_task must be a boolean")
     if not isinstance(source_message_id, str) or not source_message_id.startswith("om_"):
         raise ValueError("submission requires a trusted Feishu source message id")
-    names = [name for name, _ in questions]
-    if "ljg-qa" in names:
-        raise ValueError("ljg-qa is retired for new Read-X long-read submissions")
-    if len(names) > 3 or len(names) != len(set(names)) or set(names) - NEW_SUBMISSION_LJG:
-        raise ValueError("questions require zero to three unique supported text skills")
+    if questions:
+        names = sorted({name for name, _ in questions})
+        raise ValueError(
+            f"text skill questions are removed for new Read-X long-read submissions: {', '.join(names)}"
+        )
     files = {
         "source.md": _read_regular(source), "evidence.json": _read_regular(evidence),
         "scoring-result.json": _read_regular(scoring_result), "score-gate.json": _read_regular(score_gate),
         "trigger-context.json": _read_regular(trigger_context),
     }
-    question_files = []
-    for index, (name, path) in enumerate(questions, 1):
-        filename = f"question-{index:02d}-{name}.md"
-        files[filename] = _read_regular(path)
-        question_files.append({"skill": name, "file": filename})
     scoring = _object(files["scoring-result.json"], "scoring result")
     if scoring.get("score_status") != "scored" or scoring.get("route") != "long_read":
         raise ValueError("submission requires score_status=scored and route=long_read")
@@ -404,7 +401,7 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
             "schema": "long-read-submission/v1", "snapshot_sha256": digest,
             "workflow_contract_version": WORKFLOW_CONTRACT_VERSION,
             "inputs": {name: {"path": str(snapshot / name), "sha256": _hash(value)} for name, value in sorted(files.items())},
-            "questions": question_files, "route": "long_read", "score_status": "scored",
+            "route": "long_read", "score_status": "scored",
             "bridge_new_chat_url": "https://chatgpt.com/",
             "trigger": {
                 **{key: context[key] for key in ("profile", "feishuProfile", "appId", "chatType", "chatId", "privateChatId", "senderId", "senderType", "sourceMessageId") if key in context},
@@ -427,7 +424,6 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
                                    {"key": "analysis:article-decode", "kind": "analysis"},
                                    {"key": "analysis:munger-analysis", "kind": "analysis"},
                                    {"key": "analysis:document-supplement", "kind": "analysis"},
-                                   *[{"key": f"analysis:{name}", "kind": "analysis"} for name in names],
                                    {"key": "main-document", "kind": "document"},
                                    {"key": "document-notification", "kind": "message"},
                                    {"key": "content-review-notification", "kind": "message", "required": False},
@@ -458,6 +454,173 @@ def submit_inputs(*, source: Path, evidence: Path, scoring_result: Path, score_g
                     _fsync_directory(artifacts_dir)
             finally:
                 snapshot_lock.__exit__(None, None, None)
+
+
+def submit_context_inputs(**options) -> dict:
+    """Persist a non-content admission receipt before preparation can fail."""
+    if options.get("score_only") or options.get("special_fast_path"):
+        return _submit_context_inputs(**options)
+    app_id, source_id = options.get("app_id"), options.get("source_message_id")
+    if (not isinstance(app_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", app_id)
+            or not isinstance(source_id, str) or not re.fullmatch(r"om_[A-Za-z0-9_-]{1,150}", source_id)):
+        raise ValueError("context admission requires a valid trusted task identity")
+    state_dir = Path(options.get("state_dir", DEFAULT_STATE_DIR)).absolute()
+    _reject_symlink_path(state_dir)
+    task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"read-x:context:{app_id}:{source_id}"))
+    fields = {"task_id": task_id, "app_id": app_id, "source_message_id": source_id}
+    with WorkflowStore(state_dir) as store:
+        store.record_context_admission(**fields, status="preparing")
+    try:
+        result = _submit_context_inputs(**options)
+    except Exception as exc:
+        safe_reasons = {"context packages require a complete source": "context-source-incomplete",
+                        "context packages require a nonempty source": "context-source-empty",
+                        "input files must not be empty": "context-input-empty",
+                        "source message already submitted with different context input": "context-input-conflict"}
+        reason = safe_reasons.get(str(exc), f"context-admission-{type(exc).__name__.lower()}")
+        with WorkflowStore(state_dir) as store:
+            store.record_context_admission(**fields, status="blocked", reason_code=reason)
+        error = StoreConflict(reason) if isinstance(exc, StoreConflict) else ValueError(reason)
+        error.task_id = task_id
+        raise error from None
+    with WorkflowStore(state_dir) as store:
+        store.record_context_admission(**fields, status="accepted")
+    return result
+
+
+def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Path,
+                          title: str, title_source: str, source_status: str,
+                          app_id: str, feishu_profile: str, source_message_id: str,
+                          route: str = "context", score_only: bool = False,
+                          special_fast_path: bool = False, context_pack_dir: Path | None = None,
+                          prompt_fetcher=None, profile_resolver=resolve_worker_profile_key,
+                          state_dir: Path = DEFAULT_STATE_DIR) -> dict:
+    """Freeze business bytes and a context-only plan, without any model submission."""
+    from long_read_context_packs import context_result
+    import run_isolated_analyses as isolated
+    import run_chatgpt_munger as munger
+    from long_read_prompt_contract import CONCISION_PROMPT_PATH, load_concision_prompt
+
+    if score_only or special_fast_path:
+        return {"status": "not_requested", "context_packages": {"required": 0, "completed": 0},
+                "reason_code": "score-only" if score_only else "special-fast-path"}
+    if source_status != "complete":
+        raise ValueError("context packages require a complete source")
+    if (not isinstance(title, str) or not title.strip() or len(title) > 200
+            or any(ord(char) < 32 for char in title) or title_source not in {"original", "agent"}
+            or route not in {"context", "card", "long_read"}):
+        raise ValueError("context package title, title source or route is invalid")
+    files = {"source.md": _read_regular(source), "evidence.json": _read_regular(evidence),
+             "trigger-context.json": _read_regular(trigger_context)}
+    source_text = files["source.md"].decode("utf-8")
+    if not source_text.strip():
+        raise ValueError("context packages require a nonempty source")
+    evidence_text = validate_evidence(files["evidence.json"].decode("utf-8"), source_text)
+    context = _object(files["trigger-context.json"], "trigger context")
+    if (context.get("appId") != app_id or context.get("sourceMessageId") != source_message_id
+            or not source_message_id.startswith("om_") or context.get("feishuProfile") != feishu_profile
+            or context.get("senderType") != "user"):
+        raise ValueError("context packages require trusted matching trigger identity")
+    state_dir = Path(state_dir).absolute()
+    _reject_symlink_path(state_dir)
+    admission_sha = _hash(_canonical({"files": {key: _hash(value) for key, value in files.items()},
+                                     "title": title, "title_source": title_source, "route": route,
+                                     "context_pack_dir": str(context_pack_dir.absolute()) if context_pack_dir else None}))
+
+    def existing_job(store):
+        row = store.connection.execute("SELECT job_id FROM jobs WHERE app_id=? AND source_message_id=?",
+                                       (app_id, source_message_id)).fetchone()
+        if not row:
+            return None
+        job = store.get_job(row["job_id"])
+        if (not job.get("payload") or job["payload"].get("workflow_contract_version") != CONTEXT_WORKFLOW_CONTRACT_VERSION
+                or job["payload"].get("admission_sha256") != admission_sha):
+            raise StoreConflict("source message already submitted with different context input")
+        return {"status": "accepted", "job_id": job["job_id"], "created": False,
+                **context_result(job, store.artifacts(job["job_id"]))}
+
+    with WorkflowStore(state_dir) as store:
+        prior = existing_job(store)
+        if prior:
+            return prior
+    profile = profile_resolver(app_id=app_id, bridge_profile_key=feishu_profile)
+    from long_read_workflow_notifications import resolve_delivery_target
+    trigger = {**context, "larkCliProfile": profile, "identity": "bot"}
+    with WorkflowStore(state_dir) as store:
+        target = resolve_delivery_target(trigger, store)
+    if target is None:
+        raise ValueError("context packages require a verified private delivery target")
+    if trigger.get("chatType") == "group":
+        trigger["privateChatId"] = target[1]
+    article_raw = _read_regular(isolated.ARTICLE_SKILL)
+    concision_raw = _read_regular(CONCISION_PROMPT_PATH)
+    concision = load_concision_prompt()
+    asset = (prompt_fetcher or munger.fetch_prompt_asset)("read-x.munger-analysis")
+    if (not isinstance(asset, dict) or asset.get("prompt_id") != "read-x.munger-analysis"
+            or _hash(str(asset.get("content", "")).encode("utf-8")) != asset.get("prompt_sha256")):
+        raise ValueError("Munger Prompt asset hash is invalid")
+    if any(key not in asset for key in ("prompt_source", "prompt_revision", "prompt_fetched_at")):
+        raise ValueError("Munger Prompt asset provenance is incomplete")
+    article_task = isolated.prepare_tasks([], state_dir / ".context-prompt-staging")[0]
+    if article_task.skill_sha256 != _hash(article_raw):
+        raise ValueError("article Skill changed while freezing the task")
+    files["article-decode.prompt.txt"] = isolated.build_business_prompt(
+        article_task, source_text, evidence_text, concision_prompt=concision).encode("utf-8")
+    files["munger-analysis.prompt.txt"] = munger.build_business_prompt(source_text, [asset], concision).encode("utf-8")
+    files["prompt-assets.json"] = _canonical({
+        "article-decode": {"prompt_id": "article-decode", "prompt_source": str(isolated.ARTICLE_SKILL),
+                           "prompt_revision": _hash(article_raw), "prompt_sha256": _hash(article_raw),
+                           "content": article_raw.decode("utf-8")},
+        "concision": {"prompt_source": str(CONCISION_PROMPT_PATH), "prompt_sha256": _hash(concision_raw),
+                      "content": concision_raw.decode("utf-8")}, "munger-analysis": asset})
+    task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"read-x:context:{app_id}:{source_message_id}"))
+    input_sha = _hash(_canonical({"source": _hash(files["source.md"]), "evidence": _hash(files["evidence.json"])}))
+    packs = [{"artifact_key": key, "pack_id": str(uuid.uuid5(uuid.UUID(task_id), key)),
+              "prompt_file": filename, "prompt_sha256": _hash(files[filename]),
+              "input_sha256": input_sha if index == 0 else _hash(files["source.md"]),
+              "pack_type": "文章深层解码" if index == 0 else "芒格洞察",
+              "prompt_asset": {"promptId": "article-decode" if index == 0 else asset["prompt_id"],
+                               "revision": _hash(article_raw) if index == 0 else asset["prompt_revision"],
+                               "sha256": _hash(article_raw) if index == 0 else asset["prompt_sha256"]}}
+             for index, (key, filename) in enumerate(zip(CONTEXT_ARTIFACTS,
+                 ("article-decode.prompt.txt", "munger-analysis.prompt.txt")))]
+    with state_lock(state_dir):
+        with WorkflowStore(state_dir) as store:
+            prior = existing_job(store)
+            if prior:
+                return prior
+            artifacts_dir = state_dir / "artifacts"
+            _private_directory(artifacts_dir)
+            manifest = _canonical({name: {"sha256": _hash(value), "bytes": len(value)} for name, value in sorted(files.items())})
+            digest = _hash(manifest)
+            snapshot = artifacts_dir / digest
+            temporary = Path(tempfile.mkdtemp(prefix=".incoming-", dir=artifacts_dir))
+            try:
+                for name, value in files.items():
+                    _write_private(temporary / name, value)
+                _write_private(temporary / "manifest.json", manifest)
+                _fsync_directory(temporary)
+                if not snapshot.exists():
+                    os.rename(temporary, snapshot)
+                    _fsync_directory(artifacts_dir)
+                _verify_snapshot(snapshot, files, manifest)
+                payload = {"schema": "read-x-context-submission/v1", "workflow_contract_version": CONTEXT_WORKFLOW_CONTRACT_VERSION,
+                           "admission_sha256": admission_sha, "snapshot_sha256": digest,
+                           "inputs": {name: {"path": str(snapshot / name), "sha256": _hash(value)} for name, value in files.items()},
+                           "title": title, "title_source": title_source, "source_status": source_status, "route": route,
+                           "trigger": trigger, "requested_automatic": [], "required_artifacts": list(CONTEXT_ARTIFACTS),
+                           "artifact_plan_finalized": True, "context_packs": packs,
+                           "context_pack_dir": str(context_pack_dir.absolute()) if context_pack_dir else None}
+                issue = workflow_payload_issue(payload, app_id=app_id, source_message_id=source_message_id)
+                if issue:
+                    raise ValueError(f"context submission failed workflow validation: {issue}")
+                job = store.submit(payload, app_id=app_id, source_message_id=source_message_id, job_id=task_id,
+                                   artifacts=[{"key": key, "kind": "context_pack"} for key in CONTEXT_ARTIFACTS])
+                return {"status": "accepted", "job_id": job["job_id"], "created": job["created"],
+                        **context_result(job, store.artifacts(job["job_id"]))}
+            finally:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
 
 
 def inspect_jobs(state_dir: Path = DEFAULT_STATE_DIR, *, job_id: str | None = None,
@@ -501,12 +664,21 @@ def inspect_jobs(state_dir: Path = DEFAULT_STATE_DIR, *, job_id: str | None = No
                     "execution_performed": False}
         where, params = (" WHERE job_id=?", (job_id,)) if job_id else ("", ())
         rows = connection.execute("SELECT job_id,status,version,created_at,updated_at,lease_expires_at,payload_json FROM jobs" + where + " ORDER BY created_at,job_id", params).fetchall()
+        if not rows and job_id and connection.execute("SELECT 1 FROM sqlite_master WHERE name='admission_attempts'").fetchone():
+            attempt = connection.execute("SELECT * FROM admission_attempts WHERE task_id=?", (job_id,)).fetchone()
+            if attempt:
+                admission = dict(attempt)
+                admission["requested_plan"] = json.loads(admission.pop("requested_plan_json"))
+                return {"status": "admission_status", "admission": admission, "jobs": [], "execution_performed": False}
         jobs = []
         chat_nonterminal_count = 0
         for row in rows:
-            if chat_id is not None:
+            try:
                 payload = json.loads(row["payload_json"])
-                if payload.get("trigger", {}).get("chatId") != chat_id:
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if chat_id is not None:
+                if not isinstance(payload, dict) or payload.get("trigger", {}).get("chatId") != chat_id:
                     continue
                 if row["status"] in {"succeeded", "failed"}:
                     continue
@@ -519,6 +691,12 @@ def inspect_jobs(state_dir: Path = DEFAULT_STATE_DIR, *, job_id: str | None = No
             job["artifacts"] = [dict(item) for item in connection.execute("SELECT artifact_key,kind,required,status,retry_count FROM artifacts WHERE job_id=? ORDER BY artifact_key", (row["job_id"],))]
             effects = [dict(item) for item in connection.execute("SELECT op_key,artifact_key,action,status,attempts FROM effects WHERE job_id=? AND status IN ('attempting','uncertain') ORDER BY created_at,op_key", (row["job_id"],))]
             job["unresolved_effects"] = effects
+            if isinstance(payload, dict) and payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION:
+                from long_read_context_packs import context_result
+                artifacts = []
+                for item in connection.execute("SELECT * FROM artifacts WHERE job_id=? ORDER BY artifact_key", (row["job_id"],)):
+                    artifacts.append(WorkflowStore._decode(item))
+                job.update(context_result(job, artifacts))
             if resume:
                 active = row["lease_expires_at"] is not None and row["lease_expires_at"] > time.time()
                 job["recovery_action"] = "wait_for_lease" if active else "reconcile_only" if effects else "continue_from_checkpoint"
@@ -537,18 +715,28 @@ def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict, inc
     from long_read_workflow_scheduler import run_due_reports
     from long_read_workflow_worker import run_once
 
+    # New context tasks get an independent turn before legacy reports or recovery.
+    context_job = run_once(Path(state_dir), owner=owner, context_only=True)
+    if context_job.get("status") != "idle":
+        result = {"status": "tick", "reports": {"status": "deferred", "reason_code": "context-task-priority"},
+                  "worker": context_job}
+        patrol = _voice_x_patrol_tick() if include_patrol else None
+        if patrol is not None:
+            result["voice_x_patrol"] = patrol
+        return result
     database = Path(state_dir) / "workflow.sqlite3"
+    unadmitted = []
     if database.is_file():
         with WorkflowStore(Path(state_dir)) as store:
             unadmitted = store.unadmitted_nonterminal_jobs()
-        if unadmitted:
-            job_ids = ", ".join(item["job_id"] for item in unadmitted)
-            raise StoreConflict(
-                f"unadmitted legacy jobs require read-only review before worker service: {job_ids}"
-            )
-    reports = run_due_reports(Path(state_dir), delivery_target=report_target)
+    try:
+        reports = run_due_reports(Path(state_dir), delivery_target=report_target)
+    except Exception:
+        reports = {"status": "needs_review", "reason_code": "legacy-report-unavailable"}
     job = run_once(Path(state_dir), owner=owner, outcome_recorder=record_business_outcome)
     result = {"status": "tick", "reports": reports, "worker": job}
+    if unadmitted:
+        result["legacy_jobs_skipped"] = len(unadmitted)
     patrol = _voice_x_patrol_tick() if include_patrol else None
     if patrol is not None:
         result["voice_x_patrol"] = patrol
@@ -624,7 +812,17 @@ def main(argv=None) -> int:
     submit.add_argument("--source-message-id", required=True, help="trusted source Feishu message id for event deduplication")
     submit.add_argument("--test-task", action="store_true",
                         help="仅对显式 CANARY/验收任务启用；从正式成功率统计中排除")
-    submit.add_argument("--question", action="append", nargs=2, metavar=("SKILL", "FILE"), default=[])
+    context_submit = commands.add_parser("submit-context-packs", help="冻结完整正文与双业务 Prompt；不提交 ChatGPT")
+    for name in ("source", "evidence", "trigger-context"):
+        context_submit.add_argument("--" + name, type=Path, required=True)
+    for name in ("app-id", "feishu-profile", "source-message-id", "title"):
+        context_submit.add_argument("--" + name, required=True)
+    context_submit.add_argument("--title-source", choices=("original", "agent"), default="agent")
+    context_submit.add_argument("--source-status", choices=("complete", "partial", "unknown"), required=True)
+    context_submit.add_argument("--route", choices=("context", "card", "long_read"), default="context")
+    context_submit.add_argument("--score-only", action="store_true")
+    context_submit.add_argument("--special-fast-path", action="store_true")
+    context_submit.add_argument("--context-pack-dir", type=Path)
     status = commands.add_parser("status")
     status.add_argument("--chat-id", help="只读查询该会话的持久工作流终态")
     status.add_argument("--report-key", help="只读查看可靠性报告和附件/卡片投递收据")
@@ -659,7 +857,7 @@ def main(argv=None) -> int:
     ))
     record_event.add_argument("--details-json", required=True,
                               help="符合该事件类型字段契约的 JSON 对象；禁止包含文章正文或凭据")
-    for command in (submit, status, resume, worker, report, due_reports, configure_target, record_event):
+    for command in (submit, context_submit, status, resume, worker, report, due_reports, configure_target, record_event):
         command.add_argument("--state-dir", type=Path, default=argparse.SUPPRESS)
         if command is status:
             command.add_argument("--job-id")
@@ -679,7 +877,7 @@ def main(argv=None) -> int:
             result = submit_inputs(source=args.source, evidence=args.evidence, scoring_result=args.scoring_result,
                                    score_gate=args.score_gate, trigger_context=args.trigger_context, app_id=args.app_id,
                                    feishu_profile=args.feishu_profile,
-                                   source_message_id=args.source_message_id, questions=[(name, Path(path)) for name, path in args.question],
+                                   source_message_id=args.source_message_id,
                                    test_task=args.test_task,
                                    profile_resolver=resolve_worker_profile_key,
                                    canary_verifier=verify_canary_source,
@@ -689,6 +887,16 @@ def main(argv=None) -> int:
                 args.state_dir, job_id=result["job_id"], owner="read-x-admission-worker",
                 outcome_recorder=record_business_outcome,
             )
+        elif args.command == "submit-context-packs":
+            result = submit_context_inputs(source=args.source, evidence=args.evidence,
+                trigger_context=args.trigger_context, title=args.title, title_source=args.title_source,
+                source_status=args.source_status, app_id=args.app_id, feishu_profile=args.feishu_profile,
+                source_message_id=args.source_message_id, route=args.route, score_only=args.score_only,
+                special_fast_path=args.special_fast_path, context_pack_dir=args.context_pack_dir,
+                state_dir=args.state_dir)
+            if result["status"] == "accepted":
+                from long_read_workflow_worker import run_once
+                result["worker"] = run_once(args.state_dir, job_id=result["job_id"], owner="read-x-context-admission")
         elif args.command == "status":
             result = inspect_jobs(args.state_dir, job_id=args.job_id, chat_id=args.chat_id,
                                   report_key=args.report_key)
@@ -759,7 +967,12 @@ def main(argv=None) -> int:
                               manual_document_id=args.document_id if args.command == "resume" else None,
                               outcome_recorder=record_business_outcome)
     except (ValueError, OSError, StoreConflict, sqlite3.Error) as exc:
-        print(json.dumps({"status": "blocked", "reason_code": type(exc).__name__, "message": str(exc)}, ensure_ascii=False))
+        failure = {"status": "blocked", "reason_code": type(exc).__name__, "message": str(exc)}
+        if args.command == "submit-context-packs":
+            failure.update(task_id=getattr(exc, "task_id", None),
+                           context_packages={"required": 2, "completed": 0, "summary": "上下文包：已完成 0/2。"},
+                           automatic_artifacts={"status": "not_requested", "requested": []})
+        print(json.dumps(failure, ensure_ascii=False))
         return 2
     print(json.dumps(result, ensure_ascii=False))
     return 0

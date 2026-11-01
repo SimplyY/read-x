@@ -25,6 +25,12 @@ import uuid
 
 
 WORKFLOW_CONTRACT_VERSION = "read-x-long-read-delivery/v2"
+CONTEXT_WORKFLOW_CONTRACT_VERSION = "read-x-context-delivery/v1"
+CONTEXT_ARTIFACTS = ("context:article-decode", "context:munger-analysis")
+CONTEXT_SUBMISSION_INPUTS = {
+    "source.md", "evidence.json", "trigger-context.json", "prompt-assets.json",
+    "article-decode.prompt.txt", "munger-analysis.prompt.txt",
+}
 REQUIRED_SUBMISSION_INPUTS = {
     "source.md", "evidence.json", "scoring-result.json", "score-gate.json", "trigger-context.json",
 }
@@ -104,9 +110,33 @@ def is_verified_test_task(payload: object) -> bool:
 def workflow_payload_issue(payload: object, *, app_id: str | None = None,
                            source_message_id: str | None = None) -> str | None:
     """Return a safe admission failure code for a persisted workflow payload."""
-    if not isinstance(payload, dict) or payload.get("workflow_contract_version") != WORKFLOW_CONTRACT_VERSION:
+    if not isinstance(payload, dict) or payload.get("workflow_contract_version") not in {
+            WORKFLOW_CONTRACT_VERSION, CONTEXT_WORKFLOW_CONTRACT_VERSION}:
         return "unadmitted-legacy-job"
-    if (payload.get("schema") != "long-read-submission/v1"
+    context_only = payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION
+    if context_only:
+        if (payload.get("schema") != "read-x-context-submission/v1"
+                or payload.get("source_status") != "complete"
+                or payload.get("route") not in {"card", "long_read", "context"}
+                or payload.get("requested_automatic") != []
+                or payload.get("artifact_plan_finalized") is not True
+                or payload.get("required_artifacts") != list(CONTEXT_ARTIFACTS)
+                or payload.get("title_source") not in {"original", "agent"}
+                or not isinstance(payload.get("title"), str) or not payload["title"].strip()):
+            return "invalid-workflow-payload"
+        packs = payload.get("context_packs")
+        if not isinstance(packs, list) or len(packs) != 2:
+            return "invalid-workflow-payload"
+        try:
+            pack_ids = [str(uuid.UUID(pack["pack_id"])) for pack in packs]
+            if (len(set(pack_ids)) != 2 or [pack["artifact_key"] for pack in packs] != list(CONTEXT_ARTIFACTS)
+                    or any(pack["prompt_file"] not in CONTEXT_SUBMISSION_INPUTS
+                           or not _SHA256.fullmatch(pack.get("prompt_sha256", ""))
+                           or not _SHA256.fullmatch(pack.get("input_sha256", "")) for pack in packs)):
+                return "invalid-workflow-payload"
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return "invalid-workflow-payload"
+    elif (payload.get("schema") != "long-read-submission/v1"
             or payload.get("route") != "long_read"
             or payload.get("score_status") != "scored"):
         return "invalid-workflow-payload"
@@ -116,7 +146,8 @@ def workflow_payload_issue(payload: object, *, app_id: str | None = None,
     if not isinstance(test_task, bool):
         return "invalid-workflow-payload"
     inputs = payload.get("inputs")
-    if not isinstance(inputs, dict) or not REQUIRED_SUBMISSION_INPUTS.issubset(inputs):
+    required_inputs = CONTEXT_SUBMISSION_INPUTS if context_only else REQUIRED_SUBMISSION_INPUTS
+    if not isinstance(inputs, dict) or not required_inputs.issubset(inputs):
         return "invalid-workflow-payload"
     for name, reference in inputs.items():
         if (not isinstance(name, str) or not name or Path(name).name != name
@@ -198,6 +229,7 @@ VERIFIED_EFFECTS_BY_KIND = {
     "image": {"image-generate"},
     "image_insert": {"image-block-create", "image-upload", "image-block-patch"},
     "message": {"message-send"},
+    "context_pack": {"context-pack-deliver"},
 }
 
 
@@ -253,7 +285,7 @@ def _metadata(value: dict | None) -> str:
     allowed = {"reason_code", "notification_reason_code", "failure_stage", "duration_ms", "retryable",
                "retry_allowed", "code", "verification", "content_sha256", "next_retry_at", "next_reconcile_at",
                "round", "image_sha256", "business_outcome_value", "business_outcome_persistence",
-               "business_outcome_error_code", "human_confirmed"}
+               "business_outcome_error_code", "human_confirmed", "remote_name_status"}
     value = {} if value is None else value
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("metadata must contain only approved receipt fields")
@@ -394,6 +426,12 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS workflow_meta (
  key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS admission_attempts (
+ task_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, source_message_id TEXT NOT NULL,
+ requested_plan_json TEXT NOT NULL, status TEXT NOT NULL,
+ reason_code TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ UNIQUE(app_id,source_message_id)
+);
 CREATE TABLE IF NOT EXISTS reports (
  report_key TEXT PRIMARY KEY, period_type TEXT NOT NULL,
  window_start REAL NOT NULL, window_end REAL NOT NULL,
@@ -528,12 +566,14 @@ class WorkflowStore:
         return value
 
     def submit(self, payload: dict, *, app_id: str, source_message_id: str | None = None,
-               artifacts: list[dict] | None = None) -> dict:
+               artifacts: list[dict] | None = None, job_id: str | None = None) -> dict:
         _name(app_id)
         if source_message_id is not None:
             _name(source_message_id)
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
+        if job_id is not None:
+            job_id = str(uuid.UUID(job_id))
         specs = []
         for artifact in artifacts or []:
             key, kind = _name(artifact["key"]), _name(artifact["kind"])
@@ -555,7 +595,7 @@ class WorkflowStore:
                 result = self._decode(old)
                 result["created"] = False
                 return result
-            job_id, now = str(uuid.uuid4()), self.clock()
+            job_id, now = job_id or str(uuid.uuid4()), self.clock()
             self.connection.execute("INSERT INTO jobs(job_id,app_id,source_message_id,input_sha256,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)",
                                     (job_id, app_id, source_message_id, digest, encoded, now, now))
             for item in specs:
@@ -572,6 +612,24 @@ class WorkflowStore:
             (job_id,),
         ).fetchone()
         return self._decode(row)
+
+    def record_context_admission(self, *, task_id: str, app_id: str, source_message_id: str,
+                                 status: str, reason_code: str | None = None) -> None:
+        """Count intended new tasks even if input/Prompt admission cannot finish."""
+        task_id = str(uuid.UUID(task_id))
+        _name(app_id)
+        _name(source_message_id)
+        if status not in {"preparing", "accepted", "blocked"}:
+            raise ValueError("invalid context admission state")
+        if reason_code is not None:
+            _name(reason_code)
+        now = self.clock()
+        with self._transaction():
+            self.connection.execute("INSERT OR IGNORE INTO admission_attempts VALUES(?,?,?,?,?,?,?,?)",
+                (task_id, app_id, source_message_id, _json(list(CONTEXT_ARTIFACTS)), status, reason_code, now, now))
+            if status != "preparing":
+                self.connection.execute("UPDATE admission_attempts SET status=?,reason_code=?,updated_at=? "
+                    "WHERE task_id=? AND status!='accepted'", (status, reason_code, now, task_id))
 
     def record_reliability_event(self, job_id: str, event_type: str, details: dict) -> dict:
         """Append a validated operator event used by reliability reports."""

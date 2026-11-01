@@ -6,6 +6,10 @@ import re
 
 
 CONCISION_PROMPT_PATH = Path(__file__).resolve().parents[1] / "references/single-branch-concision.md"
+BRIDGE_BOUNDARY = """
+
+【调用层边界】
+Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
 HARD_TOTAL_LENGTH = re.compile(
     r"(?:\d{2,5}\s*[-~～—–到至]\s*\d{2,5}\s*(?:字|words?)|"
     r"(?:总字数|总量|篇幅|输出.{0,8}|全文.{0,8}).{0,16}(?:不超过|至少|不少于|至多|最多)?\s*\d{2,5}\s*(?:字|words?)|"

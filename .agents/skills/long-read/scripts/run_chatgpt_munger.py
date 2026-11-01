@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
 from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, bridge_command, run_bridge, verified_text
-from long_read_prompt_contract import assert_no_hard_total_length, load_concision_prompt
+from long_read_prompt_contract import BRIDGE_BOUNDARY, assert_no_hard_total_length, load_concision_prompt
 
 
 MAX_PROMPT_CHARS = 120_000
@@ -99,7 +99,7 @@ def fetch_prompt_asset(prompt_id: str) -> dict:
     return asset
 
 
-def build_prompt(source: str, prompt_assets: list[dict], concision_prompt: str | None = None) -> str:
+def build_business_prompt(source: str, prompt_assets: list[dict], concision_prompt: str | None = None) -> str:
     if not prompt_assets:
         raise ValueError("prompt-assets-empty")
     asset_text = "\n\n".join(str(asset["content"]).strip() for asset in prompt_assets)
@@ -113,10 +113,14 @@ def build_prompt(source: str, prompt_assets: list[dict], concision_prompt: str |
 {source}
 
 【本次交付要求】
-输出独立成篇的最终 Markdown；按信息价值保留必要论证，删除低价值冗余。
+输出独立成篇的最终 Markdown；按信息价值保留必要论证，删除低价值冗余。"""
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise ValueError(f"prompt-too-large: {len(prompt)} > {MAX_PROMPT_CHARS}")
+    return prompt
 
-【调用层边界】
-Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
+
+def build_prompt(source: str, prompt_assets: list[dict], concision_prompt: str | None = None) -> str:
+    prompt = build_business_prompt(source, prompt_assets, concision_prompt) + BRIDGE_BOUNDARY
     if len(prompt) > MAX_PROMPT_CHARS:
         raise ValueError(f"prompt-too-large: {len(prompt)} > {MAX_PROMPT_CHARS}")
     return prompt

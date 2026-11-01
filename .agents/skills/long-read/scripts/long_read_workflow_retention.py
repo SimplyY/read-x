@@ -29,6 +29,7 @@ _REASON_CODES = frozenset({
     "bridge-image-recovery-failed", "bridge-image-recovery-unconfirmed",
     "bridge-image-result-unknown", "bridge-run-id-mismatch", "compiler-process-unavailable",
     "confirmed-image-local-output-missing", "create-result-unknown", "document-compiler-blocked",
+    "context-pack-name-mismatch", "context-pack-pending", "context-task-priority",
     "document-compiler-dry-run", "document-compiler-publish-unknown",
     "document-compiler-recovery-unconfirmed", "document-compiler-recovery-unreadable",
     "feishu-profile-missing", "image-block-confirmation-lost", "image-block-create-plan-invalid",
@@ -43,6 +44,7 @@ _REASON_CODES = frozenset({
     "image-send-identity-unverified", "image-send-rejected", "image-stage-recovery-pending", "image-upload-rejected",
     "image-upload-request-changed", "image-upload-result-unconfirmed", "image-delivery-failed",
     "invalid-document-id", "invalid-publish-outcome", "lease-expired", "main-document-publish-failed",
+    "legacy-report-unavailable",
     "main-document-result-unconfirmed", "main-document-unavailable", "message-image-upload-rejected",
     "message-image-upload-request-changed", "message-image-upload-result-unconfirmed",
     "message-rate-limit", "message-rate-preflight-unavailable",
@@ -70,7 +72,8 @@ _REASON_CODES = frozenset({
     "worker-interrupted", "unknown",
 })
 _FAILURE_STAGES = frozenset({
-    "assembly", "bridge", "content-assembly", "document-publish", "image-block-create", "image-block-patch",
+    "assembly", "bridge", "content-assembly", "context-pack-delivery", "context-pack-prepare",
+    "document-publish", "image-block-create", "image-block-patch",
     "image-delivery", "image-insert",
     "image-generate", "image-send", "image-upload", "message-image-upload", "notification",
     "notification-send", "output-validation", "prompt-governance", "unknown", "upstream-delivery",

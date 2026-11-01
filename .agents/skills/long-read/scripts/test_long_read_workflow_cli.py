@@ -79,7 +79,7 @@ class SubmissionTests(unittest.TestCase):
     @staticmethod
     def valid_scoring():
         return {
-            "score_status": "scored", "route": "long_read", "ljg_range": [0, 3],
+            "score_status": "scored", "route": "long_read",
             "quality_score": 8.4, "quality_label": "完整深读",
             "relevance_score": 0.6, "priority_label": "相关",
             "interest_score": 0.6, "interest_label": "高兴趣",
@@ -88,7 +88,7 @@ class SubmissionTests(unittest.TestCase):
     def submit(self, **overrides):
         values = {"source": self.source, "evidence": self.evidence, "scoring_result": self.scoring,
                   "score_gate": self.gate, "trigger_context": self.context, "app_id": "app_one", "feishu_profile": "app_one",
-                  "source_message_id": "om_source", "questions": [("ljg-think", self.question)], "state_dir": self.state,
+                  "source_message_id": "om_source", "state_dir": self.state,
                   "profile_resolver": lambda **_: "app_one", "canary_verifier": canary_proof}
         values.update(overrides)
         return cli.submit_inputs(**values)
@@ -102,7 +102,6 @@ class SubmissionTests(unittest.TestCase):
         manifest = directory / "manifest.json"
         self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), directory.name)
         self.assertEqual((directory / "source.md").read_bytes(), self.source.read_bytes())
-        self.assertEqual((directory / "question-01-ljg-think.md").read_bytes(), self.question.read_bytes())
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.state.parent.stat().st_mode & 0o777, 0o700)
@@ -110,22 +109,25 @@ class SubmissionTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         with WorkflowStore(self.state) as store:
             payload = store.get_job(result["job_id"])["payload"]
+            artifact_keys = {item["artifact_key"] for item in store.artifacts(result["job_id"])}
         self.assertEqual(payload["route"], "long_read")
         self.assertIs(payload["test_task"], False)
         self.assertEqual(payload["workflow_contract_version"], "read-x-long-read-delivery/v2")
         self.assertEqual(payload["trigger"]["feishuProfile"], "app_one")
         self.assertEqual(payload["trigger"]["larkCliProfile"], "app_one")
         self.assertFalse(payload["artifact_plan_finalized"])
+        self.assertEqual(artifact_keys, {"analysis:article-decode", "analysis:munger-analysis", "analysis:document-supplement", "main-document", "document-notification", "content-review-notification", "document-publish-review-notification", "final-notification", "core-image", "core-image-insert", "core-image-send", "core-image-recovery-notification", "munger-image", "munger-image-insert", "munger-image-send", "munger-image-recovery-notification"})
         self.assertNotIn(str(self.inputs), json.dumps(payload))
         for item in payload["inputs"].values():
             self.assertEqual(hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest(), item["sha256"])
         self.source.unlink()
-        self.question.unlink()
         self.assertTrue((directory / "source.md").exists())
 
-    def test_retired_text_skill_is_rejected_before_creating_job_or_snapshot(self):
-        with self.assertRaisesRegex(ValueError, "retired for new Read-X long-read submissions"):
-            self.submit(questions=[("ljg-qa", self.question)])
+    def test_text_skill_questions_are_rejected_before_creating_job_or_snapshot(self):
+        for skill in ("ljg-qa", "ljg-think", "ljg-roundtable", "ljg-learn", "ljg-word", "ljg-writes"):
+            with self.subTest(skill=skill):
+                with self.assertRaisesRegex(ValueError, "text skill questions are removed"):
+                    self.submit(questions=[(skill, self.question)])
 
         self.assertFalse(self.state.exists())
 
@@ -443,7 +445,12 @@ class SubmissionTests(unittest.TestCase):
 
     def test_changed_input_on_same_event_is_conflict(self):
         first = self.submit()
-        self.question.write_text("另一个问题。", encoding="utf-8")
+        self.source.write_text("另一个正文。", encoding="utf-8")
+        dump(self.evidence, {
+            "metadata": {"title": "文章", "author": None, "source_url": CANARY_URL, "published_at": None, "genre": "test", "word_count": 6},
+            "claims": [{"id": "C1", "claim": "另一个正文", "evidence": "另一个正文", "evidence_type": "quote", "confidence": "high"}],
+            "facts": [], "data_points": [], "quotes": ["另一个正文"], "uncertainties": [], "article_structure": [],
+        })
         with self.assertRaises(StoreConflict):
             self.submit()
         with WorkflowStore(self.state) as store:
@@ -618,7 +625,7 @@ class SubmissionTests(unittest.TestCase):
         dump(self.context, context)
         args = ["submit", "--state-dir", str(self.state), "--source", str(self.source), "--evidence", str(self.evidence),
                 "--scoring-result", str(self.scoring), "--score-gate", str(self.gate), "--trigger-context", str(self.context),
-                "--app-id", "app_one", "--source-message-id", "om_source", "--question", "ljg-think", str(self.question)]
+                "--app-id", "app_one", "--source-message-id", "om_source"]
         args.extend(["--feishu-profile", "app_one"])
         args.append("--test-task")
         output = StringIO()
@@ -754,9 +761,9 @@ class SubmissionTests(unittest.TestCase):
              patch.object(long_read_workflow_worker, "run_once",
                           side_effect=lambda *args, **kwargs: calls.append(("worker", kwargs["owner"])) or {"status": "idle"}):
             result = cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
-        self.assertEqual([item[0] for item in calls], ["reports", "worker"])
-        self.assertEqual(calls[0][1], target)
-        self.assertEqual(calls[1][1], "worker-a")
+        self.assertEqual([item[0] for item in calls], ["worker", "reports", "worker"])
+        self.assertEqual(calls[1][1], target)
+        self.assertEqual(calls[2][1], "worker-a")
         self.assertEqual(result, {"status": "tick", "reports": {"status": "checked"}, "worker": {"status": "idle"}})
         patrol_run.assert_not_called()
 
@@ -773,7 +780,7 @@ class SubmissionTests(unittest.TestCase):
              patch.object(cli.subprocess, "run", side_effect=lambda *args, **kwargs: calls.append("patrol") or cli.subprocess.CompletedProcess(
                  ["node"], 0, '{"status":"spawned","runId":"run-1","recordId":"rec1","generation":1}', "")) as patrol_run:
             result = cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
-        self.assertEqual(calls, ["reports", "worker", "patrol"])
+        self.assertEqual(calls, ["worker", "reports", "worker", "patrol"])
         self.assertEqual(result["status"], "tick")
         self.assertEqual(result["voice_x_patrol"], {"status": "spawned", "runId": "run-1", "recordId": "rec1", "generation": 1})
         args, kwargs = patrol_run.call_args
@@ -841,7 +848,7 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(result["worker"], {"status": "idle"})
         self.assertEqual(result["voice_x_patrol"], {"status": "timeout", "reason": "supervisor-timeout"})
 
-    def test_worker_service_blocks_legacy_nonterminal_jobs_before_any_delivery(self):
+    def test_worker_service_skips_legacy_nonterminal_jobs_without_modifying_them(self):
         import long_read_workflow_scheduler
         import long_read_workflow_worker
 
@@ -852,12 +859,12 @@ class SubmissionTests(unittest.TestCase):
         target = {"identity": "bot", "profile": "read-x", "user_id": "ou_self",
                   "chat_id": "oc_private", "sender_id": "app_one"}
         with patch.object(long_read_workflow_scheduler, "run_due_reports",
-                          side_effect=lambda *args, **kwargs: calls.append("reports")), \
+                          side_effect=lambda *args, **kwargs: calls.append("reports") or {"status": "checked"}), \
              patch.object(long_read_workflow_worker, "run_once",
-                          side_effect=lambda *args, **kwargs: calls.append("worker")):
-            with self.assertRaisesRegex(StoreConflict, "unadmitted legacy jobs"):
-                cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
-        self.assertEqual(calls, [])
+                          side_effect=lambda *args, **kwargs: calls.append("worker") or {"status": "idle"}):
+            result = cli.worker_service_tick(self.state, owner="worker-a", report_target=target)
+        self.assertEqual(calls, ["worker", "reports", "worker"])
+        self.assertEqual(result["legacy_jobs_skipped"], 1)
         with WorkflowStore(self.state) as store:
             self.assertEqual(store.get_job(legacy["job_id"])["status"], "pending")
 

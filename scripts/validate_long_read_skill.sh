@@ -64,10 +64,10 @@ require '≤300 字'
 ! grep -Fq 'lark-cli docs +media-insert --as bot' "$skill"
 ! grep -Fq 'lark-cli im +messages-send --as bot' "$skill"
 ! grep -Fq '500～1500' "$skill"
-require_link_card '持久 long-read 工作流'
-require_link_card '只有持久工作流返回 `accepted` 才能显示“已接管”'
-require_link_card '`ljg_card` 仅作评分留档'
-require_link_card '入口不得重复发送交付卡或提前显示完成'
+require_link_card '持久双上下文包工作流'
+require_link_card '只有包收据、文件校验和两份附件送达读回均确认后'
+require_link_card 'route=long_read` 本身不得启动旧 `submit` 自动链'
+require_link_card '只有包收据、文件校验和两份附件送达读回均确认后'
 ! grep -Fq '`ljg_card=true` 时在文档交付后独立运行' "$link_card"
 ! grep -Fq 'run_chatgpt_core_image.py' "$link_card"
 echo 'long-read scoring and delivery rules: ok'

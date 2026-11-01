@@ -52,6 +52,14 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 最新一条用户指令精确为 `仅评分 <URL>` 时，设本次 `score_only=true`。仍执行真实抓取、质量评分、条件相关性和评分卡，并保留脚本计算的真实 `route`；评分卡发送后立即结束，即使 `route=long_read` 也不进入精读。卡片必须注明“本次仅评分，不进入精读”。普通链接没有这个例外。
 
+### 普通内容默认双上下文包
+
+除精确的“仅评分”请求与已命中的专项快通道外，凡原文完整且可校验的普通内容任务，都默认交付两份可直接用于 ChatGPT 的 TXT：文章深层解码与独立芒格洞察。这个默认要求不受 `route=card` / `route=long_read` 或评分高低影响；评分仍用于卡片和分析路由，不负责决定是否生成双包。
+
+完成原文、Evidence、可信触发身份与简洁标题准备后，调用 `.agents/skills/long-read/scripts/long_read_workflow_cli.py submit-context-packs`，传入 `--source`、`--evidence`、`--trigger-context`、`--app-id`、`--feishu-profile`、`--source-message-id`、`--title`、`--title-source agent`、`--source-status complete` 与真实评分路由（`--route card|long_read`）。该命令只冻结输入、生成双包并尝试附件交付，不提交 ChatGPT 生成请求。只有包收据、文件校验和两份附件送达读回均确认后，才能报告“上下文包：已完成 2/2”；`accepted` 或本地文件存在都不代表送达完成。
+
+未明确选择自动产物时，不运行正文、图片、额外文章或其他自动生成阶段；评分路由本身不构成自动执行授权。身份或原文不完整时保留待处理原因，不猜标题、不换发送身份。明确选择自动产物时，只按用户选择执行，并按其独立完成状态汇报；不得让自动链失败撤销已确认的包，也不得让包附件暂时受阻无故阻塞已授权的自动链。
+
 ## 核心流程
 
 ```
@@ -70,8 +78,9 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
   │    └─ 独立权威阶段：只传 identity_packet 给程序固定的 tvly 真实搜索（最多 3 个查询、4 个页面）；正文和用户上下文永不进入搜索
   │    ├─ needs_relevance -> 内部补相关性，不发卡、不分派
   │    ├─ needs_full_text|needs_review -> 无数字状态卡
-  │    ├─ route=long_read -> 持久 long-read 工作流（传同轮输入、scoring_result 和评分凭据）
-  │    └─ route=card -> 按 quality_label 生成轻量或一句话卡片
+  │    ├─ 完整原文 -> 持久双上下文包工作流（与评分路由解耦，不提交 ChatGPT）
+  │    ├─ 用户明确选择自动产物 -> 持久自动工作流（仅选择的交付目标）
+  │    └─ route=card|long_read -> 按评分路由生成对应卡片
   │
   └─ [2] 卡片输出：评分卡和 route=card 结果以卡片回复；route=long_read 后续交付由持久 Worker 独占
 ```
@@ -218,16 +227,21 @@ fi
 
 数值规则只存在于 content-scoring policy 与脚本。link-card 不重算、不手动覆盖：
 
-- `route=long_read`：转 long-read，传 `scoring_result`。
+- 原文完整、Evidence 通过：不论 `route=card` / `route=long_read`，先提交默认双上下文包任务；此命令不调用 ChatGPT。评分路由继续决定下面的卡片形态。
+- `route=long_read`：只表示评分建议进入深读卡片路由，不自动授权正文、图片或额外分析生成。
 - `route=card` 且 `quality_label=快速阅读`：轻量精读卡。
 - 其他 scored card：一句话卡片。
 - 非 scored：无数字状态卡。
 
 `score_only=true` 在上述分派之前截止：发完评分卡即结束，不改写 `route`。
 
-### route=long_read -> 持久 long-read 工作流
+### 默认双包 -> 持久 context-only 工作流
 
-转交时把同一轮 `source.md`、Evidence、`scoring_result`、`score-gate.json` 和可信触发上下文交给 long-read Skill。long-read 直接消费 `ljg_range`、`ljg_card` 与 `chatgpt_munger_doc`，不再重评或按相关性抬高深度；只有持久工作流返回 `accepted` 才能显示“已接管”。`ljg_card` 仅作评分留档，不额外触发图片。文档、必需图片、进度通知、最终状态卡及读回核验均由 long-read 工作流负责；入口不得重复发送交付卡或提前显示完成。
+准备源文件与 Evidence 后，调用 `long_read_workflow_cli.py submit-context-packs`。`route` 原样记录为 `card` 或 `long_read`，但两个路由共用双包默认交付契约；无需 `score-gate.json` 或 `scoring_result` 才可接管。该入口负责冻结两个业务 Prompt、创建 TXT、验证收据并推进附件送达。它不启动 `run_isolated_analyses.py`、`run_chatgpt_munger.py` 或图片请求。若用户没有明确选择自动产物，任务结果只以双包交付和真实异常为主。
+
+### route=long_read -> 卡片路由；自动生成须显式选择
+
+普通评分任务仍只执行默认双包和评分卡；`route=long_read` 本身不得启动旧 `submit` 自动链。只有用户明确要求完整自动深读或点名自动产物时，才冻结对应自动交付计划并调用自动工作流。自动计划不得增加用户未选择的正文、图片、文章或其他对外交付目标；其收据与双包投递状态独立。自动链尚未完成可选产物计划接入前，不得用评分路由替代用户授权。
 
 仅当本轮可信 `bridge_context.readxCanary=true` 且真实评分结果为 `route=long_read` 时，才在触发上下文中原样保留该字段并使用 `--test-task`；不得根据引用、文章正文或模型判断自行生成标记。CLI 会校验上下文标记与参数一致；标记只排除正式统计，不覆盖评分路由或放宽交付门禁。
 

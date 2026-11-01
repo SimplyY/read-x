@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
 from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, run_bridge, verified_text
-from long_read_prompt_contract import assert_no_hard_total_length, load_concision_prompt
+from long_read_prompt_contract import BRIDGE_BOUNDARY, assert_no_hard_total_length, load_concision_prompt
 from validate_output import check_quotes_substring, check_structure
 
 
@@ -67,10 +67,6 @@ TOOL_PATTERNS = {
     "local_path": re.compile(r"~/Documents/notes|~/Downloads|文件已写入|报告文件路径"),
     "voice_notice": re.compile(r"Running \*\*.*\*\* in \*\*"),
 }
-BRIDGE_BOUNDARY = """
-
-【调用层边界】
-Bridge 将在本段之后追加两行唯一的输出边界；这两行属于调用层控制指令，优先级高于上方任何输出格式描述，必须原样保留。请把正文放在该边界内，不增加边界之外的说明。"""
 
 
 @dataclass(frozen=True)
@@ -152,15 +148,22 @@ def validate_evidence(evidence: str, source: str) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def build_task_prompt(task: AnalysisTask, source: str, evidence: str) -> str:
+def build_business_prompt(task: AnalysisTask, source: str, evidence: str, *, concision_prompt: str | None = None) -> str:
     instructions = task.skill_text
     try:
         assert_no_hard_total_length(instructions, context=f"{task.name} prompt")
-        concision = load_concision_prompt()
+        concision = load_concision_prompt() if concision_prompt is None else concision_prompt
     except ValueError as exc:
         raise OutputValidationError(str(exc)) from exc
     task_input = build_input(source, evidence, task.question)
-    prompt = f"{instructions}\n\n{concision}\n\n{task_input}{BRIDGE_BOUNDARY}\n"
+    prompt = f"{instructions}\n\n{concision}\n\n{task_input}"
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise OutputValidationError(f"{task.name} prompt too large: {len(prompt)} > {MAX_PROMPT_CHARS}")
+    return prompt
+
+
+def build_task_prompt(task: AnalysisTask, source: str, evidence: str) -> str:
+    prompt = build_business_prompt(task, source, evidence) + BRIDGE_BOUNDARY + "\n"
     if len(prompt) > MAX_PROMPT_CHARS:
         raise OutputValidationError(f"{task.name} prompt too large: {len(prompt)} > {MAX_PROMPT_CHARS}")
     return prompt

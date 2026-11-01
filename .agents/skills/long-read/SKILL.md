@@ -5,7 +5,15 @@ description: "长文精读编排器：接收已判定为 route=long_read 的任�
 
 # long-read：长文精读编排器
 
-只处理 `route=long_read`。**评分由 content-scoring 在上游完成，long-read 只消费评分结果，禁止重评。** 使用持久工作流 CLI 接管生成、装配、文档与图片交付、恢复和结果核验；不得以分析完成代替交付成功，也不得绕过工作流直接发布或发送。不要在同一次生成中模拟 `article-decode` 或 ljg Skill。
+## Read-X 默认双上下文包
+
+对普通完整文章，默认交付 `article-decode` 与独立 `read-x.munger-analysis` 两份可直接用于 ChatGPT 的 TXT；不自动提交 ChatGPT。运行 Skill 的 Agent 负责理解原文并提供简洁标题，记录标题来源。输入、Evidence 或治理 Prompt 未通过校验时停止并留下安全失败状态。
+
+准备好完整原文、Evidence、可信触发上下文和标题后，使用 `long_read_workflow_cli.py submit-context-packs` 持久接管。该入口适用于评分得到的 `route=card` 与 `route=long_read`，不要求 `score-gate.json`，也不触发自动正文、图片或文档发布。以本地状态读取为准：任务返回 `accepted` 只代表已接管；只有双包文件/版本校验和两份附件送达读回均确认后，才汇报“上下文包：已完成 2/2”。
+
+只有用户明确要求完整自动深读时，才使用本文件下方的旧 `submit` 自动链；评分路由、Skill 名称或文章质量不能代替这项选择。普通自动链中的文档、图片与通知仍须按独立业务校验、发布和读回证据分别判定，不能改变已确认的双包状态。
+
+只处理 `route=long_read` 的自动工作。**评分由 content-scoring 在上游完成，long-read 只消费评分结果，禁止重评。** 使用持久工作流 CLI 接管生成、装配、文档与图片交付、恢复和结果核验；不得以分析完成代替交付成功，也不得绕过工作流直接发布或发送。不要在同一次生成中模拟 `article-decode` 或 ljg Skill。
 
 ## ChatGPT 请求上下文包
 

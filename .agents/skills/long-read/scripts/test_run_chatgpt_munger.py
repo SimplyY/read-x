@@ -354,7 +354,17 @@ def test_cli_boundary_with_fake_node_bridge():
             "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
             "import hashlib, json\n"
             f"text = {ANALYSIS!r}\n"
-            "print(json.dumps({'status':'succeeded','runId':'cli','format':'markdown','verification':'live-dom+snapshot','conversationUrl':'https://chatgpt.test/c/1','actualConversationUrl':'https://chatgpt.test/c/1','submissionConfirmed':True,'text':text,'outputSha256':hashlib.sha256(text.encode()).hexdigest()}))\n",
+            "digest = hashlib.sha256(text.encode()).hexdigest()\n"
+            "print(json.dumps({\n"
+            "    'status': 'succeeded', 'runId': '11111111-1111-4111-8111-111111111111',\n"
+            "    'format': 'markdown', 'resultVersion': 2, 'evidenceVersion': 2,\n"
+            "    'verification': 'bridge-evidence/v2', 'deliveryClass': 'verified',\n"
+            "    'conversationUrl': 'https://chatgpt.com/c/1',\n"
+            "    'actualConversationUrl': 'https://chatgpt.com/c/1',\n"
+            "    'submissionConfirmed': True,\n"
+            "    'evidenceSummary': {'identity': 'matched', 'generation': 'complete', 'body': 'available', 'truncation': 'absent', 'candidateSha256': digest},\n"
+            "    'text': text, 'outputSha256': digest, 'candidateSha256': digest,\n"
+            "}))\n",
             encoding="utf-8",
         )
         fake_node.chmod(0o755)

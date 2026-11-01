@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from chatgpt_bridge import WORKFLOW_NEW_CHAT_URL, observe_bridge, run_bridge, verified_text, verify_result_evidence
 from long_read_workflow_store import (
-    Lease, WorkflowStore, workflow_payload_issue,
+    Lease, WorkflowStore, workflow_payload_issue, CONTEXT_WORKFLOW_CONTRACT_VERSION,
 )
 from long_read_document_compiler import (
     DocumentCompilerAdapter, DocumentCompilerError, DocumentCompilerUnknown,
@@ -1496,7 +1496,8 @@ def _advance_delivery(*, store: WorkflowStore, lease: Lease, payload: dict, root
 def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", lease_seconds: float = 900,
                 bridge_fn=run_bridge, observe_fn=observe_bridge, prompt_fetcher=None,
                 document_compiler=None, image_delivery_fn=None, notification_fn=None,
-                clock=time.time, manual_document_id: str | None = None, outcome_recorder=None) -> dict:
+                clock=time.time, manual_document_id: str | None = None, outcome_recorder=None,
+                context_pack_fn=None) -> dict:
     state_dir = Path(state_dir).absolute()
     if manual_document_id is not None and not DOCUMENT_ID_RE.fullmatch(manual_document_id):
         return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
@@ -1514,9 +1515,18 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
         if admission_issue:
             return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
                     "reason_code": admission_issue}
+        context_only = payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION
+        if context_only and job["status"] in {"succeeded", "failed"}:
+            from long_read_context_packs import context_result
+            return {"status": job["status"], "job_id": job_id, **context_result(job, store.artifacts(job_id))}
         lease = store.acquire_lease(job_id, owner, lease_seconds)
         try:
-            result = _advance_claimed_job(store, lease, state_dir, bridge_fn=bridge_fn,
+            if context_only:
+                from long_read_context_packs import advance_context_job
+                context_options = {"pack_fn": context_pack_fn} if context_pack_fn is not None else {}
+                result = advance_context_job(store, lease, state_dir, clock=clock, **context_options)
+            else:
+                result = _advance_claimed_job(store, lease, state_dir, bridge_fn=bridge_fn,
                                           observe_fn=observe_fn, prompt_fetcher=prompt_fetcher,
                                           document_compiler=document_compiler,
                                           image_delivery_fn=image_delivery_fn,
@@ -1530,10 +1540,11 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
                 except Exception:
                     pass
             result = {"status": "needs_review", "job_id": job_id, "delivery_complete": False,
-                      "reason": f"{type(exc).__name__}: {exc}"}
+                      "reason": type(exc).__name__ if context_only else f"{type(exc).__name__}: {exc}"}
         finally:
             try:
-                _record_delivery_outcomes(store, lease, result, outcome_recorder)
+                if not context_only:
+                    _record_delivery_outcomes(store, lease, result, outcome_recorder)
             except Exception:
                 print('{"event":"bridge-business-outcome-diagnostic-failed","reason":"delivery-outcome-state-unavailable"}', file=sys.stderr)
             with lock:
@@ -1545,7 +1556,7 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
 
 
 def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x-worker",
-             manual_document_id: str | None = None, outcome_recorder=None) -> dict:
+             manual_document_id: str | None = None, outcome_recorder=None, context_only: bool = False) -> dict:
     state_dir = Path(state_dir).absolute()
     if job_id:
         return process_job(state_dir, job_id, owner=owner, manual_document_id=manual_document_id,
@@ -1559,7 +1570,11 @@ def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x
     with WorkflowStore(state_dir) as store:
         now = time.time()
         jobs = store.list_jobs()
-        selected = next((job["job_id"] for job in jobs if _job_is_due(store, job, now)), None)
+        context_jobs = [job for job in jobs if (store.get_job(job["job_id"]).get("payload") or {}).get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION]
+        context_ids = {job["job_id"] for job in context_jobs}
+        context_jobs.sort(key=lambda job: (job["updated_at"], job["created_at"], job["job_id"]))
+        candidates = context_jobs if context_only else context_jobs + [job for job in jobs if job["job_id"] not in context_ids]
+        selected = next((job["job_id"] for job in candidates if _job_is_due(store, job, now)), None)
     if selected is None:
         return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
     return process_job(state_dir, selected, owner=owner, outcome_recorder=outcome_recorder)
@@ -1579,6 +1594,9 @@ def _job_is_due(store: WorkflowStore, job: dict, now: float) -> bool:
     ).fetchone()
     if row and row["lease_expires_at"] and row["lease_expires_at"] > now:
         return False
+    if payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION:
+        from long_read_context_packs import context_job_due
+        return context_job_due(store, admitted, now)
     artifacts = store.artifacts(job["job_id"])
     if job["status"] == "needs_review":
         # Only uncertain remote actions are eligible for automatic, read-only

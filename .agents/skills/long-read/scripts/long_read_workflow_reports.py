@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from long_read_workflow_store import WorkflowStore, is_verified_test_task
+from long_read_workflow_store import WorkflowStore, is_verified_test_task, CONTEXT_WORKFLOW_CONTRACT_VERSION
 
 
 REPORT_TZ = ZoneInfo("Asia/Shanghai")
@@ -233,7 +233,8 @@ def create_report_snapshot(state_dir: Path, period: str, *, now: datetime | None
         jobs = []
         for row in rows:
             payload = json.loads(row["payload_json"])
-            if payload.get("synthetic") is True or is_verified_test_task(payload):
+            if (payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION
+                    or payload.get("synthetic") is True or is_verified_test_task(payload)):
                 continue
             jobs.append({**dict(row), "payload": payload})
         window_jobs = [row for row in jobs if start_epoch <= float(row["created_at"]) < end_epoch]
