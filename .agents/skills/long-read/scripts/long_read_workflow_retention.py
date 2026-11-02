@@ -12,14 +12,17 @@ import time
 import uuid
 from collections import Counter
 
-from long_read_workflow_store import WorkflowStore, is_verified_test_task, state_lock
+from long_read_workflow_store import (
+    CONTEXT_TASK_RETENTION_SECONDS, CONTEXT_WORKFLOW_CONTRACT_VERSION,
+    WorkflowStore, is_verified_test_task, state_lock,
+)
 
 
 CONTENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 STATISTICS_RETENTION_SECONDS = 180 * 24 * 60 * 60
 _EVENT_FIELDS = {
     "status", "artifact_key", "action", "retry_count", "required_artifacts",
-    "reconciled", "metadata", "reason_code", "failure_stage",
+    "reconciled", "metadata", "reason_code", "failure_stage", "duration_ms", "title_result",
 }
 _METADATA_FIELDS = {"reason_code", "notification_reason_code", "failure_stage", "duration_ms", "retryable", "retry_allowed", "code", "verification",
                     "next_retry_at", "next_reconcile_at"}
@@ -30,6 +33,7 @@ _REASON_CODES = frozenset({
     "bridge-image-result-unknown", "bridge-run-id-mismatch", "compiler-process-unavailable",
     "confirmed-image-local-output-missing", "create-result-unknown", "document-compiler-blocked",
     "context-pack-name-mismatch", "context-pack-pending", "context-task-priority",
+    "context-task-expired", "context-task-retention-unset", "context-retention-failed",
     "document-compiler-dry-run", "document-compiler-publish-unknown",
     "document-compiler-recovery-unconfirmed", "document-compiler-recovery-unreadable",
     "feishu-profile-missing", "image-block-confirmation-lost", "image-block-create-plan-invalid",
@@ -49,6 +53,16 @@ _REASON_CODES = frozenset({
     "message-image-upload-request-changed", "message-image-upload-result-unconfirmed",
     "message-rate-limit", "message-rate-preflight-unavailable",
     "manual-document-id-requires-job-id", "message-readback-unconfirmed", "message-readback-unmatched", "missing-private-message-target",
+    "manual-image-candidate-binding-mismatch", "manual-image-candidate-hash-mismatch",
+    "manual-image-candidate-materialization-failed", "manual-image-candidate-missing",
+    "manual-image-candidate-not-recoverable", "manual-image-candidate-pointer-invalid",
+    "manual-image-candidate-selection-required", "manual-image-effect-binding-mismatch",
+    "manual-image-effect-state-unsupported", "manual-image-existing-output-conflict",
+    "manual-image-handoff-prepared", "manual-image-input-version-mismatch",
+    "manual-image-package-invalid", "manual-image-png-validation-failed",
+    "manual-image-previous-known-failure", "manual-image-source-too-short",
+    "manual-image-source-unavailable", "manual-image-task-unavailable",
+    "manual-image-validated-output-mismatch",
     "outcome-artifact-missing", "outcome-effect-mismatch", "outcome-effect-missing",
     "notification-history-incomplete", "notification-identity-missing", "notification-identity-unverified",
     "notification-payload-changed", "notification-readback-ambiguous",
@@ -168,6 +182,11 @@ def _safe_event_details(value: str) -> str:
             continue
         if key in {"reason_code", "failure_stage"}:
             safe[key] = _retained_value(key, item)
+        elif key == "duration_ms":
+            safe[key] = _retained_value(key, item)
+        elif key == "title_result":
+            if item in {"correct", "incorrect"}:
+                safe[key] = item
         else:
             safe[key] = item
     metadata = details.get("metadata")
@@ -228,6 +247,157 @@ def _remove_orphan_snapshots(state_dir: Path, active_refs: Counter) -> int:
         if stale_temporary or unreferenced_snapshot:
             removed += int(_safe_remove_tree(parent, child.name))
     return removed
+
+
+def apply_context_retention(state_dir: Path, *, now: float | None = None) -> dict:
+    """Expire and scrub only new context-delivery jobs at their frozen 30-day deadline."""
+    state_dir = Path(state_dir).absolute()
+    now = time.time() if now is None else float(now)
+    if not (now > 0):
+        raise ValueError("retention clock must be positive")
+    result = {"context_jobs_expired": 0, "context_job_directories_removed": 0,
+              "context_snapshots_removed": 0, "context_admissions_scrubbed": 0,
+              "context_jobs_active_at_expiry": 0, "context_statistics_rows_removed": 0,
+              "context_statistics_active_rows_preserved": 0}
+    with WorkflowStore(state_dir):
+        pass
+    with state_lock(state_dir), WorkflowStore(state_dir) as store:
+        with store._transaction():
+            _set_meta(store, "retention_mode", "scrub")
+            cutoff = now - CONTEXT_TASK_RETENTION_SECONDS
+            cohort = store.connection.execute(
+                "SELECT task_id,created_at,app_id,source_message_id FROM admission_attempts "
+                "WHERE plan_revision=2 AND created_at<=? ORDER BY created_at,task_id", (cutoff,),
+            ).fetchall()
+            for admission in cohort:
+                job_id = admission["task_id"]
+                row = store.connection.execute(
+                    "SELECT app_id,source_message_id,input_sha256,payload_json,status,lease_expires_at,created_at "
+                    "FROM jobs WHERE job_id=?", (job_id,),
+                ).fetchone()
+                if row and row["lease_expires_at"] is not None and float(row["lease_expires_at"]) > now:
+                    result["context_jobs_active_at_expiry"] += 1
+                    continue
+                payload = {}
+                if row:
+                    try:
+                        decoded = json.loads(row["payload_json"])
+                        payload = decoded if isinstance(decoded, dict) else {}
+                    except (TypeError, ValueError):
+                        payload = {}
+                    if payload.get("content_scrubbed_at") is None:
+                        effects = store.connection.execute(
+                            "SELECT op_key,artifact_key,action,status,metadata_json FROM effects WHERE job_id=?",
+                            (job_id,),
+                        ).fetchall()
+                        effect_states: dict[str, set[str]] = {}
+                        for effect in effects:
+                            effect_status = effect["status"]
+                            if effect_status == "prepared":
+                                effect_status = "failed"
+                            elif effect_status == "attempting":
+                                effect_status = "uncertain"
+                            effect_states.setdefault(effect["artifact_key"], set()).add(effect_status)
+                            request_hash = hashlib.sha256(
+                                f"retained-context:{job_id}:{effect['artifact_key']}:{effect['action']}".encode()
+                            ).hexdigest()
+                            request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"retained-context:{job_id}:{effect['op_key']}"))
+                            store.connection.execute(
+                                "UPDATE effects SET status=?,request_sha256=?,request_id=?,remote_id=NULL,metadata_json=?,updated_at=? WHERE op_key=?",
+                                (effect_status, request_hash, request_id, _safe_metadata(effect["metadata_json"]), now, effect["op_key"]),
+                            )
+
+                        artifacts = store.connection.execute(
+                            "SELECT artifact_key,status,metadata_json FROM artifacts WHERE job_id=?", (job_id,),
+                        ).fetchall()
+                        for artifact in artifacts:
+                            status = artifact["status"]
+                            try:
+                                metadata = json.loads(artifact["metadata_json"])
+                            except (TypeError, ValueError):
+                                metadata = {}
+                            if status != "confirmed":
+                                states = effect_states.get(artifact["artifact_key"], set())
+                                if states & {"attempting", "uncertain"}:
+                                    status = "uncertain"
+                                elif status == "pending":
+                                    status = "failed"
+                                if status != "confirmed":
+                                    metadata = {"failure_stage": "context-pack-delivery", "reason_code": "context-task-expired"}
+                            store.connection.execute(
+                                "UPDATE artifacts SET status=?,metadata_json=? WHERE job_id=? AND artifact_key=?",
+                                (status, _safe_metadata(json.dumps(metadata, ensure_ascii=False)),
+                                 job_id, artifact["artifact_key"]),
+                            )
+
+                        if row["status"] not in {"succeeded", "failed", "expired"}:
+                            store.connection.execute("UPDATE jobs SET status='expired' WHERE job_id=?", (job_id,))
+                            store._event(job_id, "job_status", {"status": "expired"})
+                            store._event(job_id, "context_task_expired", {"reason_code": "context-task-expired"})
+                        snapshot = payload.get("snapshot_sha256")
+                        if snapshot is not None and (not isinstance(snapshot, str)
+                                or not re.fullmatch(r"[a-f0-9]{64}", snapshot)):
+                            raise ValueError("stored snapshot digest is invalid; retention stopped")
+                        result["context_job_directories_removed"] += int(
+                            _safe_remove_tree(state_dir / "jobs", job_id)
+                        )
+                        minimal = {
+                            "schema": "retained-context-delivery/v1",
+                            "workflow_contract_version": CONTEXT_WORKFLOW_CONTRACT_VERSION,
+                            "delivery_plan_revision": 2,
+                            "context_expires_at": float(admission["created_at"]) + CONTEXT_TASK_RETENTION_SECONDS,
+                            "content_scrubbed_at": now,
+                            "route": payload.get("route") if payload.get("route") in {"card", "long_read", "context"} else "context",
+                            "title_source": payload.get("title_source") if payload.get("title_source") in {"original", "agent"} else "safe_default",
+                            "snapshot_sha256": snapshot,
+                            "input_sha256": row["input_sha256"],
+                        }
+                        for event in store.connection.execute(
+                                "SELECT seq,details_json FROM events WHERE job_id=?", (job_id,)).fetchall():
+                            store.connection.execute("UPDATE events SET details_json=? WHERE seq=?",
+                                                     (_safe_event_details(event["details_json"]), event["seq"]))
+                        stored_input_hash = hashlib.sha256(f"retained-context:{job_id}".encode()).hexdigest()
+                        store.connection.execute(
+                            "UPDATE jobs SET app_id='retained',source_message_id=NULL,input_sha256=?,payload_json=?,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=?,version=version+1 WHERE job_id=?",
+                            (stored_input_hash, json.dumps(minimal, ensure_ascii=False, sort_keys=True), now, job_id),
+                        )
+                        if row["status"] not in {"succeeded", "failed", "expired"}:
+                            result["context_jobs_expired"] += 1
+                if admission["app_id"] != "retained":
+                    safe_source = "expired_" + hashlib.sha256(job_id.encode()).hexdigest()[:32]
+                    store.connection.execute(
+                        "UPDATE admission_attempts SET app_id='retained',source_message_id=?,updated_at=? WHERE task_id=?",
+                        (safe_source, now, job_id),
+                    )
+                    result["context_admissions_scrubbed"] += 1
+
+            stats_cutoff = now - STATISTICS_RETENTION_SECONDS
+            old_admissions = store.connection.execute(
+                "SELECT task_id FROM admission_attempts WHERE plan_revision=2 AND created_at<? ORDER BY created_at,task_id",
+                (stats_cutoff,),
+            ).fetchall()
+            _set_meta(store, "retention_mode", "purge")
+            for admission in old_admissions:
+                job_id = admission["task_id"]
+                row = store.connection.execute(
+                    "SELECT lease_expires_at FROM jobs WHERE job_id=?", (job_id,),
+                ).fetchone()
+                if row and row["lease_expires_at"] is not None and float(row["lease_expires_at"]) > now:
+                    result["context_statistics_active_rows_preserved"] += 1
+                    continue
+                if row:
+                    result["context_job_directories_removed"] += int(
+                        _safe_remove_tree(state_dir / "jobs", job_id)
+                    )
+                    store.connection.execute("DELETE FROM events WHERE job_id=?", (job_id,))
+                    store.connection.execute("DELETE FROM effects WHERE job_id=?", (job_id,))
+                    store.connection.execute("DELETE FROM artifacts WHERE job_id=?", (job_id,))
+                    store.connection.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+                store.connection.execute("DELETE FROM admission_attempts WHERE task_id=?", (job_id,))
+                result["context_statistics_rows_removed"] += 1
+            store.connection.execute("DELETE FROM workflow_meta WHERE key='retention_mode'")
+        result["context_snapshots_removed"] = _remove_orphan_snapshots(state_dir, _active_snapshot_refs(store))
+    return result
 
 
 def apply_retention(state_dir: Path, *, now: float | None = None) -> dict:
