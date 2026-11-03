@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the core-content image for a finished long-read document via the ChatGPT web bridge."""
+"""Legacy image runner; direct CLI only observes a matching existing Bridge Run."""
 from __future__ import annotations
 
 import argparse
@@ -167,12 +167,25 @@ def _reuse_image(output: Path, summary: dict, source_hash: str, request_id: str 
     return {**summary, "reused": True}
 
 
-def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None, prompt_fetcher=None, request_id: str | None = None, context_pack_delivery=None) -> dict:
+def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, conversation_url: str | None = None, prompt_fetcher=None, request_id: str | None = None, context_pack_delivery=None, *, _allow_legacy_bridge_submit: bool = False) -> dict:
     doc = _read_regular(source_path, "source")
     source_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()
     prepared_summary = None
     if output_path.exists() or output_path.is_symlink():
         return _reuse_image(output_path, _load_existing_summary(summary_path), source_hash, request_id, conversation_url)
+    if not _allow_legacy_bridge_submit:
+        if request_id is not None and summary_path is not None and summary_path.is_file() and not summary_path.is_symlink():
+            try:
+                return recover(source_path, output_path, summary_path, request_id=request_id)
+            except Exception as exc:
+                return {"status": "needs_review", "reason_code": "legacy-image-observation-rejected",
+                        "reason": str(exc), "runId": request_id}
+        return {
+            "status": "needs_review",
+            "reason_code": "legacy-direct-entry-disabled",
+            "manual_handoff_required": True,
+            "message": "核心图人工图片适配器尚未实现；该旧入口不提交新网页请求，任务保持待处理。",
+        }
     if request_id is not None and summary_path is not None and (summary_path.exists() or summary_path.is_symlink()):
         previous = _load_existing_summary(summary_path)
         if previous.get("runId") == request_id:
@@ -344,12 +357,25 @@ def main() -> int:
     parser.add_argument("--bridge", type=Path)
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--conversation-url", type=str, help="复用已有 ChatGPT 会话链接，不传则开新窗口")
-    parser.add_argument("--request-id", type=str, help="已持久化的 Bridge 请求 UUID；禁用隐藏重试")
+    parser.add_argument("--request-id", type=str, help="已有 Bridge Run UUID；仅结合 --summary 只读观察，不会创建请求")
     args = parser.parse_args()
-    try:
-        result = run(args.source, args.output, args.bridge, args.summary, args.conversation_url, request_id=args.request_id)
-    except Exception as exc:
-        result = {"status": "needs_review", "reason": str(exc)}
+    if args.request_id and args.summary:
+        try:
+            result = recover(args.source, args.output, args.summary, request_id=args.request_id)
+        except Exception as exc:
+            result = {"status": "needs_review", "reason_code": "legacy-image-observation-rejected",
+                      "reason": str(exc), "runId": args.request_id}
+    else:
+        result = {
+            "status": "needs_review",
+            "reason_code": "legacy-direct-entry-disabled",
+            "manual_handoff_required": True,
+            "message": (
+                "此入口不再生成新图片。核心图的人工图片适配器尚未实现，任务需停在待处理；"
+                "请通过持久工作流继续。旧 Run 只能携带匹配的 --request-id 和 --summary 只读观察。"
+            ),
+            "next_step": "long_read_workflow_cli.py resume --job-id <id>",
+        }
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result["status"] == "succeeded" else 2
 

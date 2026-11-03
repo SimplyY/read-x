@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run article-decode and selected text ljg skills in isolated ChatGPT web-bridge conversations."""
+"""Prepare isolated long-read analysis prompts; direct CLI no longer submits Bridge runs."""
 from __future__ import annotations
 
 import argparse
@@ -214,8 +214,11 @@ def record_attempt(result: dict) -> dict:
     return {key: result.get(key) for key in ("status", "reason", "retryAfterSeconds")}
 
 
-def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: float, request_id: str | None = None) -> dict:
+def run_task(task: AnalysisTask, source: str, evidence: str, max_wait_seconds: float, request_id: str | None = None, *, _allow_legacy_bridge_submit: bool = False) -> dict:
     """One bridge conversation per task; uncertain submissions are never auto-resent."""
+    if not _allow_legacy_bridge_submit:
+        return {"task": task.name, "status": "needs_review",
+                "reason_code": "legacy-direct-entry-disabled", "manual_handoff_required": True}
     started = time.perf_counter()
     digests = {
         "skill_sha256": task.skill_sha256,
@@ -341,7 +344,17 @@ def run(
     article_skill_path: Path = ARTICLE_SKILL,
     skill_roots: list[Path] | None = None,
     request_ids: dict[str, str] | None = None,
+    *,
+    _allow_legacy_bridge_submit: bool = False,
 ) -> dict:
+    if not _allow_legacy_bridge_submit:
+        return {
+            "status": "needs_review",
+            "reason_code": "legacy-direct-entry-disabled",
+            "manual_handoff_required": True,
+            "message": "独立分析脚本不创建持久任务或网页请求；请从 long_read_workflow_cli.py submit 进入人工交接。旧 Run 通过原任务 resume 观察。",
+            "tasks": [],
+        }
     if not 1 <= max_workers <= MAX_TASKS:
         raise ValueError(f"max_workers must be between 1 and {MAX_TASKS}")
     if timeout <= 0:
@@ -358,7 +371,8 @@ def run(
     by_name = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
         futures = {
-            pool.submit(run_task, task, source, evidence, timeout, request_ids.get(task.name) if request_ids else None): task.name
+            pool.submit(run_task, task, source, evidence, timeout, request_ids.get(task.name) if request_ids else None,
+                        _allow_legacy_bridge_submit=True): task.name
             for task in tasks
         }
         for future in as_completed(futures):
@@ -385,25 +399,19 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=360)
     parser.add_argument("--summary-file", type=Path)
     args = parser.parse_args()
-    try:
-        summary = run(
-            args.source,
-            args.evidence,
-            args.output_dir,
-            [(name, Path(question)) for name, question in args.task],
-            args.max_workers,
-            args.timeout,
-        )
-    except Exception as exc:
-        print(json.dumps({"status": "failed", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
-        return 1
-    summary_json = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
-    if args.summary_file:
-        args.summary_file.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(args.summary_file, summary_json + "\n")
-    print(summary_json)
-    article = next(item for item in summary["tasks"] if item["task"] == "article-decode")
-    return 0 if article["status"] == "completed" else 1
+    summary = {
+        "status": "needs_review",
+        "reason_code": "legacy-direct-entry-disabled",
+        "manual_handoff_required": True,
+        "message": (
+            "该独立脚本不再提交新的 ChatGPT 请求，也不能创建带任务身份的交接包。"
+            "请使用 long_read_workflow_cli.py submit 后运行 Worker；已有 Run 通过原任务 resume 只读观察。"
+        ),
+        "next_step": "long_read_workflow_cli.py submit → run-worker → resume --job-id <id>",
+        "requested_tasks": ["article-decode", *[name for name, _ in args.task]],
+    }
+    print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    return 2
 
 
 if __name__ == "__main__":

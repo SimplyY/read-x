@@ -46,7 +46,7 @@ Fast 不调用文字 ljg。内容短时可直接发卡片；需要承载完整 `
 - `ljg-word` 独立使用；
 - 不为凑数量选择同一问题的不同写法。
 
-核心内容图不属于本表，也不是文字 ljg；它由 `run_chatgpt_core_image.py` 基于拼接完成的全文生成，每篇必产出。
+核心内容图不属于本表，也不是文字 ljg；业务目标仍要求每篇必产出。持久 Worker 为新图像步骤准备 `core-image` 人工交接；原始 PNG 回填后，须通过任务/来源绑定与 PNG 结构校验，才能进入原有图片插入、私聊发送和读回门禁。人工来源不产生 Bridge 浏览器证据。旧图片 Run 仍只观察和恢复原请求；不得用 `run_chatgpt_core_image.py` 直接提交网页请求。
 
 ## 4. 持久接管与隔离生成
 
@@ -111,4 +111,4 @@ Evidence Schema 与逐字引文在提交前校验。确定性输出校验失败�
 
 ## 8. 旧临时路径
 
-`run_long_read_pipeline.py` 和直接的 `lark-cli docs +media-insert`、`lark-cli im +messages-send` 命令只保留作历史实现或局部测试，不是生产接管和交付入口。不得把旧流水线的完成状态当作持久工作流完成状态，也不得从旧临时目录推断本轮任务成功。
+`run_long_read_pipeline.py`、`run_isolated_analyses.py`、`run_chatgpt_munger.py`、`run_chatgpt_core_image.py` 的直接 CLI 仅保留历史实现或局部测试，并对新网页提交失败关闭；它们不是生产接管或人工交接入口。Worker 仍复用两个文字脚本的 Prompt 准备和校验函数。旧文本 Run 通过持久任务 `resume` 只读观察，旧图片 Run 只通过与 Run 身份绑定的摘要调用 `run_chatgpt_core_image.py --request-id ... --summary ...` 观察。不得把旧流水线的完成状态当作持久工作流完成状态，也不得从旧临时目录推断本轮任务成功。直接写飞书的 `lark-cli docs +media-insert`、`lark-cli im +messages-send` 同样不是生产交付入口。

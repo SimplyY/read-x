@@ -8,12 +8,13 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+import uuid
 
 from long_read_workflow_retention import (
     CONTENT_RETENTION_SECONDS, STATISTICS_RETENTION_SECONDS, _FAILURE_STAGES, _REASON_CODES,
-    apply_retention, assert_report_window_retained,
+    apply_context_retention, apply_retention, assert_report_window_retained,
 )
-from long_read_workflow_store import StoreConflict, WorkflowStore
+from long_read_workflow_store import CONTEXT_ARTIFACTS, CONTEXT_WORKFLOW_CONTRACT_VERSION, StoreConflict, WorkflowStore
 
 
 class Clock:
@@ -108,6 +109,27 @@ class RetentionTests(unittest.TestCase):
         self.store.release_lease(lease)
         return job
 
+    def submit_context_fixture(self, *, revision: int = 2, source_id: str = "om_context") -> dict:
+        job_id = str(uuid.uuid4())
+        self.store.record_context_admission(task_id=job_id, app_id="app-private", source_message_id=source_id,
+                                            status="accepted", plan_revision=revision)
+        payload = {
+            "schema": "read-x-context-submission/v1",
+            "workflow_contract_version": CONTEXT_WORKFLOW_CONTRACT_VERSION,
+            "delivery_plan_revision": revision,
+            "context_expires_at": self.clock.value + CONTENT_RETENTION_SECONDS,
+            "route": "context", "title": "private context title", "title_source": "agent",
+            "snapshot_sha256": hashlib.sha256(b"context snapshot").hexdigest(),
+            "source": "private original text",
+        }
+        job = self.store.submit(payload, app_id="app-private", source_message_id=source_id,
+                                artifacts=[{"key": key, "kind": "file", "required": True}
+                                           for key in CONTEXT_ARTIFACTS], job_id=job_id)
+        job_dir = self.root / "jobs" / job_id
+        job_dir.mkdir(parents=True)
+        (job_dir / "private.txt").write_text("private context material", encoding="utf-8")
+        return job
+
     def write_content(self, job: dict):
         payload = job["payload"]
         digest = payload["snapshot_sha256"]
@@ -153,6 +175,45 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.store.connection.execute(
             "SELECT COUNT(*) FROM jobs WHERE job_id=?", (job["job_id"],)
         ).fetchone()[0], 1)
+
+    def test_context_retention_expires_only_revision_two_and_preserves_180_day_sample(self):
+        context = self.submit_context_fixture(revision=2, source_id="om_context_new")
+        legacy = self.submit_context_fixture(revision=1, source_id="om_context_legacy")
+        legacy_admission_before = dict(self.store.connection.execute(
+            "SELECT * FROM admission_attempts WHERE task_id=?", (legacy["job_id"],)
+        ).fetchone())
+
+        before_deadline = apply_context_retention(self.root, now=self.clock.value + CONTENT_RETENTION_SECONDS - 1)
+        self.assertEqual(before_deadline["context_jobs_expired"], 0)
+        self.assertEqual(self.store.get_job(context["job_id"])["payload"]["title"], "private context title")
+
+        after_deadline = apply_context_retention(self.root, now=self.clock.value + CONTENT_RETENTION_SECONDS + 1)
+        self.assertEqual(after_deadline["context_jobs_expired"], 1)
+        retained = self.store.get_job(context["job_id"])
+        self.assertEqual(retained["status"], "expired")
+        self.assertNotIn("private context title", json.dumps(retained["payload"]))
+        self.assertNotIn("private original text", json.dumps(retained["payload"]))
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE job_id=?", (context["job_id"],)
+        ).fetchone()[0], 3)
+        legacy_admission_after = dict(self.store.connection.execute(
+            "SELECT * FROM admission_attempts WHERE task_id=?", (legacy["job_id"],)
+        ).fetchone())
+        self.assertEqual(legacy_admission_after, legacy_admission_before)
+        self.assertEqual(self.store.get_job(legacy["job_id"])["payload"]["title"], "private context title")
+
+    def test_context_statistics_are_removed_after_180_days(self):
+        context = self.submit_context_fixture(revision=2, source_id="om_context_old")
+
+        result = apply_context_retention(
+            self.root, now=self.clock.value + STATISTICS_RETENTION_SECONDS + 1,
+        )
+
+        self.assertEqual(result["context_statistics_rows_removed"], 1)
+        self.assertIsNone(self.store.get_job(context["job_id"]))
+        self.assertEqual(self.store.connection.execute(
+            "SELECT COUNT(*) FROM admission_attempts WHERE task_id=?", (context["job_id"],)
+        ).fetchone()[0], 0)
 
     def test_unresolved_job_and_its_content_are_never_pruned(self):
         job = self.submit(status="pending")

@@ -58,6 +58,118 @@ def report_window(period: str, *, now: datetime | None = None) -> tuple[str, dat
     return f"monthly:{start.strftime('%Y-%m')}", start, end
 
 
+def create_context_delivery_snapshot(state_dir: Path, *, days: int = 30,
+                                     now: datetime | None = None) -> dict:
+    """Aggregate only the revision-2 default context-pack cohort; never return task identifiers."""
+    if type(days) is not int or not 1 <= days <= 180:
+        raise ValueError("context metrics days must be between 1 and 180")
+    now = (now or datetime.now(REPORT_TZ)).astimezone(REPORT_TZ)
+    start = now - timedelta(days=days)
+    start_epoch, end_epoch = _epoch(start), _epoch(now)
+    from long_read_workflow_retention import apply_context_retention
+    apply_context_retention(Path(state_dir), now=end_epoch)
+    with WorkflowStore(Path(state_dir)) as store:
+        admissions = store.connection.execute(
+            "SELECT task_id,status,created_at FROM admission_attempts "
+            "WHERE plan_revision=2 AND created_at>=? AND created_at<? ORDER BY created_at,task_id",
+            (start_epoch, end_epoch),
+        ).fetchall()
+        counts = {key: 0 for key in (
+            "N", "delivered", "preparing", "preparation_failed", "pending",
+            "unknown", "needs_review", "failed", "expired", "missing_task", "remote_name_mismatch_packages",
+        )}
+        local_ready_ms: list[float] = []
+        delivery_ms: list[float] = []
+        ready_tasks = 0
+        title_reviews = {"samples": 0, "correct": 0, "incorrect": 0}
+        for admission in admissions:
+            task_id = admission["task_id"]
+            job = store.get_job(task_id)
+            if job and (job.get("payload") or {}).get("delivery_plan_revision") != 2:
+                job = None
+            if not job:
+                if admission["status"] == "blocked":
+                    counts["preparation_failed"] += 1
+                elif admission["status"] == "preparing":
+                    counts["preparing"] += 1
+                else:
+                    counts["missing_task"] += 1
+                counts["N"] += 1
+                continue
+            artifacts = store.artifacts(task_id)
+            required = [item for item in artifacts if item["required"]]
+            counts["remote_name_mismatch_packages"] += sum(
+                item.get("metadata", {}).get("remote_name_status") == "mismatch" for item in required
+            )
+            complete = len(required) == 2 and all(item["status"] == "confirmed" for item in required)
+            status = job["status"]
+            if complete:
+                bucket = "delivered"
+            elif any(item["status"] == "uncertain" for item in required):
+                bucket = "unknown"
+            elif status == "needs_review":
+                bucket = "needs_review"
+            elif status == "failed":
+                bucket = "failed"
+            elif status == "expired":
+                bucket = "expired"
+            else:
+                bucket = "pending"
+            counts["N"] += 1
+            counts[bucket] += 1
+            events = store.connection.execute(
+                "SELECT event_type,details_json,at FROM events WHERE job_id=? "
+                "AND event_type IN ('context_packs_ready','context_title_review','artifact_status') "
+                "ORDER BY at,seq", (task_id,),
+            ).fetchall()
+            ready_at = None
+            confirmed_at = []
+            for event in events:
+                details = json.loads(event["details_json"])
+                if event["event_type"] == "context_packs_ready":
+                    ready_at = float(event["at"])
+                    duration = details.get("duration_ms")
+                    if (isinstance(duration, (int, float)) and not isinstance(duration, bool)
+                            and math.isfinite(duration) and duration >= 0):
+                        local_ready_ms.append(float(duration))
+                elif event["event_type"] == "artifact_status" and details.get("status") == "confirmed":
+                    if details.get("artifact_key") in {item["artifact_key"] for item in required}:
+                        confirmed_at.append(float(event["at"]))
+                elif event["event_type"] == "context_title_review":
+                    result = details.get("title_result")
+                    if result in {"correct", "incorrect"}:
+                        title_reviews["samples"] += 1
+                        title_reviews[result] += 1
+            if ready_at is not None:
+                ready_tasks += 1
+                if complete and len(confirmed_at) >= 2:
+                    delivery_ms.append(max(0.0, max(confirmed_at) * 1000 - ready_at * 1000))
+        delivered = counts["delivered"]
+        return {
+            "schemaVersion": 1,
+            "cohort": "read-x-context-delivery/revision-2",
+            "window": {"start": start.isoformat(), "end": now.isoformat(), "days": days},
+            "counts": counts,
+            "doublePackageDeliveryRate": {
+                "numerator": delivered, "denominator": counts["N"],
+                "rate": delivered / counts["N"] if counts["N"] else None,
+            },
+            "fileValidation": {"verifiedTasks": ready_tasks, "eligibleTasks": counts["N"],
+                               "rate": ready_tasks / counts["N"] if counts["N"] else None},
+            "titleCorrectnessSample": {
+                **title_reviews,
+                "accuracy": title_reviews["correct"] / title_reviews["samples"] if title_reviews["samples"] else None,
+            },
+            "durationMs": {
+                "inputToLocalPackagesReady": {"samples": len(local_ready_ms),
+                    "p50": _percentile(local_ready_ms, .50), "p90": _percentile(local_ready_ms, .90)},
+                "localPackagesToDeliveryConfirmed": {"samples": len(delivery_ms),
+                    "p50": _percentile(delivery_ms, .50), "p90": _percentile(delivery_ms, .90)},
+            },
+            "unfinished": counts["N"] - delivered,
+        }
+
+
 def _percentile(values: list[float], fraction: float) -> float | None:
     if not values:
         return None

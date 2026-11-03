@@ -125,10 +125,10 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `.agents/skills/long-read/scripts/long_read_workflow_retention.py` | 终态内容清理、统计脱敏与 180 天留存边界 |
 | `.agents/skills/long-read/scripts/long_read_workflow_worker.py` | 长文工作流检查点、分析编排、装配、主文档及图片交付状态机 |
 | `.agents/skills/long-read/scripts/long_read_workflow_reports.py` | 固定窗口周/月统计快照、指标和报告正文 |
-| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | 经 ChatGPT web-bridge 并行运行独立 article-decode 与文字 ljg 会话 |
-| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | 调用 ChatGPT Bridge 生成芒格洞察原稿（每篇必跑） |
-| `.agents/skills/long-read/scripts/run_chatgpt_core_image.py` | 调用 ChatGPT Bridge image 模式对完整精读 markdown 生成核心内容图 PNG |
-| `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 旧临时流水线，仅供历史兼容和局部测试；不作为持久交付入口 |
+| `.agents/skills/long-read/scripts/run_isolated_analyses.py` | Worker 复用其 Prompt/校验准备函数；直接 CLI 对新网页提交失败关闭 |
+| `.agents/skills/long-read/scripts/run_chatgpt_munger.py` | Worker 复用其 Prompt 构建；直接 CLI 对新网页提交失败关闭 |
+| `.agents/skills/long-read/scripts/run_chatgpt_core_image.py` | 直接 CLI 不生成新图片；仅支持携带匹配摘要的旧 Run 只读观察。Worker 图片人工适配器待实现 |
+| `.agents/skills/long-read/scripts/run_long_read_pipeline.py` | 已停用的旧临时流水线；直接调用返回待处理提示，不作为生产入口 |
 | `.agents/skills/long-read/scripts/long_read_workflow_scheduler.py` | 固定周/月报告周期与漏跑周期补处理；由常驻 Worker 调用 |
 | `.agents/skills/long-read/scripts/markdown_to_feishu_xml.py` | 共享 Feishu Markdown→XML 渲染器的 read-x 兼容入口 |
 | `/Users/yuwei/.codex/skills/feishu-doc-renderer` | 跨仓库复用的纯 Markdown→Feishu XML 排版 Skill |

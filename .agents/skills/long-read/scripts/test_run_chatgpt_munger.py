@@ -34,6 +34,14 @@ PROMPT_ASSETS = {
 for _asset in PROMPT_ASSETS.values():
     _asset["prompt_sha256"] = hashlib.sha256(_asset["content"].encode("utf-8")).hexdigest()
 runner.fetch_prompt_asset = lambda prompt_id: PROMPT_ASSETS[prompt_id]
+_original_run = runner.run
+
+
+def _legacy_run_for_contract_tests(*args, **kwargs):
+    return _original_run(*args, **kwargs, _allow_legacy_bridge_submit=True)
+
+
+runner.run = _legacy_run_for_contract_tests
 
 ANALYSIS = "# 全文总结\n这是一份忠实的全文总结，区分事实、推断与未知。\n\n" + "洞察内容。" * 250
 
@@ -376,9 +384,11 @@ def test_cli_boundary_with_fake_node_bridge():
              "--bridge", str(bridge)],
             env=env, capture_output=True, text=True, check=False,
         )
-        assert completed.returncode == 0, completed.stderr or completed.stdout
+        assert completed.returncode == 2, completed.stderr or completed.stdout
         result = json.loads(completed.stdout)
-        assert result["status"] == "succeeded" and output.is_file()
+        assert result["reason_code"] == "legacy-direct-entry-disabled"
+        assert result["manual_handoff_required"] is True
+        assert not output.exists()
 
 
 def main():

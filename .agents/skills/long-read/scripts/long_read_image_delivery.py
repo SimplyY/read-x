@@ -11,6 +11,7 @@ import time
 import uuid
 
 import run_chatgpt_core_image as core_image
+import long_read_manual_handoff as manual_handoff
 from chatgpt_bridge import verify_result_evidence
 from feishu_long_read_delivery import (
     DeliveryError, FeishuLongReadDelivery, RetryableDeliveryError, UnknownRemoteResult,
@@ -180,6 +181,280 @@ def _round_paths(root: Path, image_name: str, round_number: int) -> tuple[Path, 
     return output, summary, request
 
 
+def _manual_image_paths(root: Path, image_name: str) -> tuple[Path, Path, Path]:
+    output = root / "images" / f"{_safe_name(image_name)}.png"
+    return (output, output.with_suffix(output.suffix + ".manual.receipt.json"),
+            output.with_suffix(output.suffix + ".manual-candidate.json"))
+
+
+def _manual_image_package(prepared: dict) -> dict:
+    record = prepared.get("record") or {}
+    return {
+        "status": "awaiting_manual", "source": "manual-handoff",
+        "handoff_id": prepared.get("handoffId"),
+        "task_id": record.get("taskId"), "stage": record.get("stage"),
+        "artifact_id": record.get("artifactId"), "origin_event_id": record.get("originEventId"),
+        "prompt_path": (prepared.get("privatePaths") or {}).get("prompt"),
+        "attachment_paths": [item.get("path") for item in (prepared.get("privatePaths") or {}).get("attachments", [])],
+        "prompt_sha256": prepared.get("promptSha256") or record.get("promptSha256"),
+        "input_version": record.get("inputVersion"),
+        "source_requirements": record.get("sourceRequirements"),
+        "expires_at": record.get("expiresAt"),
+        "history_dependency": prepared.get("historyDependency"),
+        "full_flow": prepared.get("fullFlow"),
+        "continuation_choice": prepared.get("continuationChoice"),
+        "manual_instructions": prepared.get("manualInstructions"),
+    }
+
+
+def _manual_image_result(*, store: WorkflowStore, lease, image_key: str,
+                         image_name: str, source_path: Path, root: Path,
+                         prompt_fetcher) -> dict:
+    """Prepare or validate a task-bound PNG candidate without Bridge evidence."""
+    job = store.get_job(lease.job_id)
+    if not job:
+        return {"status": "needs_review", "reason_code": "manual-image-task-unavailable"}
+    output, receipt_path, pointer_path = _manual_image_paths(root, image_name)
+    effect = store.find_effect(lease.job_id, image_key, manual_handoff.MANUAL_ACTION)
+    try:
+        source_text = core_image._read_regular(source_path, "source")
+    except (OSError, ValueError):
+        return {"status": "needs_review", "reason_code": "manual-image-source-unavailable"}
+    if core_image.visible_chars(source_text) < core_image.MIN_DOC_VISIBLE_CHARS:
+        return {"status": "needs_review", "reason_code": "manual-image-source-too-short"}
+
+    if effect is None:
+        try:
+            asset = prompt_fetcher(core_image.PROMPT_GOVERNANCE_ID)
+            request, _ = _prompt_request(
+                source_path=source_path, conversation_url=None,
+                request_id=str(uuid.uuid4()), prompt_asset=asset,
+            )
+            prompt_bytes = core_image.build_prompt(
+                source_text, str(asset.get("content") or ""),
+            ).encode("utf-8")
+            prompt_sha = _sha(prompt_bytes)
+            if prompt_sha != request["input_sha256"]:
+                raise ValueError("image Prompt changed between request preparation and handoff")
+            prompt_assets = [{
+                "promptId": core_image.PROMPT_GOVERNANCE_ID,
+                "source": asset.get("prompt_source"),
+                "revision": asset.get("prompt_revision"),
+                "sha256": asset.get("prompt_sha256"),
+                "fetchedAt": asset.get("prompt_fetched_at"),
+            }]
+            prepared = manual_handoff.prepare_branch(
+                state_dir=store.state_dir, job=job, artifact_key=image_key,
+                prompt_bytes=prompt_bytes, source_sha=request["source_sha256"],
+                prompt_assets=prompt_assets,
+            )
+            if prepared.get("status") != "prepared":
+                return {"status": "needs_review", "reason_code": prepared.get("reason") or prepared.get("status")}
+            effect = store.prepare_effect(
+                lease, image_key, manual_handoff.MANUAL_ACTION, prompt_sha,
+                request_id=prepared["handoffId"],
+            )
+            if effect["request_id"] != prepared["handoffId"] or effect["request_sha256"] != prompt_sha:
+                return {"status": "needs_review", "reason_code": "manual-image-effect-binding-mismatch"}
+            return {"artifact": image_key, "reason_code": "manual-image-handoff-prepared",
+                    **_manual_image_package(prepared)}
+        except (OSError, ValueError, manual_handoff.ManualHandoffError):
+            return {"status": "needs_review", "reason_code": "manual-image-package-invalid"}
+
+    if effect["status"] == "failed":
+        return {"status": "failed", "reason_code": "manual-image-previous-known-failure"}
+    if effect["status"] not in {"prepared", "attempting", "uncertain", "confirmed"}:
+        return {"status": "needs_review", "reason_code": "manual-image-effect-state-unsupported"}
+
+    try:
+        job = store.get_job(lease.job_id)
+        binding = manual_handoff.binding_for_job(
+            job, image_key, prompt_sha=effect["request_sha256"],
+        )
+        source = core_image._read_regular(source_path, "source")
+        if core_image.visible_chars(source) < core_image.MIN_DOC_VISIBLE_CHARS:
+            return {"status": "needs_review", "reason_code": "manual-image-source-too-short"}
+        source_sha = _sha(source.encode("utf-8"))
+    except (OSError, ValueError, manual_handoff.ManualHandoffError):
+        return {"status": "needs_review", "reason_code": "manual-image-source-unavailable"}
+
+    if effect["status"] == "confirmed":
+        try:
+            receipt = _read_json(receipt_path)
+            if output.is_symlink() or not output.is_file():
+                raise ValueError("validated manual image output is missing or unsafe")
+            payload = output.read_bytes()
+            core_image._validate_png(payload)
+            image_sha = _sha(payload)
+            if (receipt.get("schema") != "read-x-manual-image-receipt/v1"
+                    or receipt.get("status") != "business-validated"
+                    or receipt.get("handoffId") != effect["request_id"]
+                    or receipt.get("promptSha256") != effect["request_sha256"]
+                    or receipt.get("sourceSha256") != source_sha
+                    or receipt.get("imageSha256") != image_sha
+                    or receipt.get("imageBytes") != len(payload)
+                    or receipt.get("evidenceLevel") != "user-asserted"
+                    or any(receipt.get(key) != value for key, value in binding.items())
+                    or any(key in receipt for key in (
+                        "verification", "submissionConfirmed", "conversationUrl", "conversation_url",
+                    ))):
+                raise ValueError("manual image receipt mismatch")
+            store.set_artifact(lease, image_key, "confirmed", metadata={
+                "source": "manual-handoff", "evidence_level": "user-asserted",
+                "business_validation": receipt.get("businessValidation"),
+                "content_sha256": image_sha,
+            })
+            result = {"status": "candidate_validated", "source": "manual-handoff",
+                      "evidence_level": "user-asserted", "image_sha256": image_sha,
+                      "image_bytes": len(payload), "candidate_id": receipt.get("candidateId")}
+            return {"status": "confirmed", "source": "manual-handoff", "result": result,
+                    "effect": effect, "output": output, "summary": receipt, "reused": True}
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {"status": "needs_review", "reason_code": "manual-image-validated-output-mismatch"}
+
+    try:
+        handoff = manual_handoff.read_handoff(
+            state_dir=store.state_dir, handoff_id=effect["request_id"], binding=binding,
+        )
+    except manual_handoff.ManualHandoffError as exc:
+        return {"status": "needs_review", "reason_code": str(exc), "handoff_id": effect["request_id"]}
+    source_requirements = handoff["record"].get("sourceRequirements") or {}
+    if (hashlib.sha256(handoff["promptBytes"]).hexdigest() != effect["request_sha256"]
+            or source_requirements.get("branchSourceSha256") != source_sha):
+        return {"status": "needs_review", "reason_code": "manual-image-input-version-mismatch",
+                "handoff_id": effect["request_id"]}
+
+    if not pointer_path.exists() and not pointer_path.is_symlink():
+        pointer = None
+    else:
+        try:
+            pointer = _read_json(pointer_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {"status": "needs_review", "reason_code": "manual-image-candidate-pointer-invalid",
+                    "handoff_id": effect["request_id"]}
+    if pointer is None:
+        if effect["status"] in {"attempting", "uncertain"}:
+            return {"status": "needs_review", "reason_code": "manual-image-candidate-not-recoverable",
+                    "handoff_id": effect["request_id"]}
+        prepared = {"status": "prepared", "handoffId": effect["request_id"],
+                    "record": handoff["record"], "privatePaths": handoff["privatePaths"],
+                    "promptSha256": effect["request_sha256"]}
+        requirements = handoff["record"].get("sourceRequirements", {})
+        prepared.update({
+            "historyDependency": requirements.get("historyDependency"),
+            "fullFlow": requirements.get("fullFlow"),
+            "continuationChoice": requirements.get("continuationChoice"),
+            "manualInstructions": manual_handoff.instructions_for_record(store.state_dir, handoff["record"]),
+        })
+        return {"artifact": image_key, "reason_code": "manual-image-candidate-missing",
+                **_manual_image_package(prepared)}
+    if (pointer.get("schema") != "read-x-manual-candidate-pointer/v1"
+            or pointer.get("handoffId") != effect["request_id"]
+            or any(pointer.get(key) != value for key, value in binding.items())):
+        return {"status": "needs_review", "reason_code": "manual-image-candidate-binding-mismatch",
+                "handoff_id": effect["request_id"]}
+    if pointer.get("selectionRequired") is True:
+        cli = Path(__file__).resolve().parents[4] / ".agents" / "skills" / "long-read" / "scripts" / "long_read_workflow_cli.py"
+        return {"status": "awaiting_manual", "source": "manual-handoff",
+                "reason_code": "manual-image-candidate-selection-required",
+                "handoff_id": effect["request_id"], "candidate_ids": pointer.get("candidateIds", []),
+                "candidate_selection_command": (
+                    f'python3 "{cli}" --state-dir "{store.state_dir}" select-manual-candidate '
+                    f'--job-id {lease.job_id} --artifact {image_key} --candidate-id <candidate-id>'
+                )}
+
+    try:
+        candidate = manual_handoff.read_candidate(
+            state_dir=store.state_dir, handoff_id=effect["request_id"],
+            candidate_id=pointer.get("candidateId"), binding=binding,
+        )
+    except manual_handoff.ManualHandoffError as exc:
+        return {"status": "needs_review", "reason_code": str(exc),
+                "handoff_id": effect["request_id"], "candidate_id": pointer.get("candidateId")}
+    png_candidates = []
+    if candidate["resultBytes"].startswith(core_image.PNG_SIGNATURE):
+        png_candidates.append((candidate["resultBytes"], candidate["candidate"].get("rawSha256"), "result"))
+    for item in candidate["files"]:
+        if (item["bytes"].startswith(core_image.PNG_SIGNATURE)
+                or item.get("mimeType") == "image/png" or item.get("name", "").lower().endswith(".png")):
+            png_candidates.append((item["bytes"], item["sha256"], item.get("name")))
+    if len(png_candidates) != 1:
+        return {"status": "needs_review" if png_candidates else "awaiting_manual",
+                "reason_code": "manual-image-candidate-ambiguous" if png_candidates
+                else "manual-image-candidate-missing",
+                "handoff_id": effect["request_id"], "candidate_id": candidate["candidate"].get("candidateId")}
+    payload, candidate_image_sha, candidate_image_name = png_candidates[0]
+    try:
+        core_image._validate_png(payload)
+    except ValueError:
+        return {"status": "needs_review", "reason_code": "manual-image-png-validation-failed",
+                "handoff_id": effect["request_id"], "candidate_id": candidate["candidate"].get("candidateId")}
+
+    image_sha = _sha(payload)
+    if candidate_image_sha != image_sha:
+        return {"status": "needs_review", "reason_code": "manual-image-candidate-hash-mismatch",
+                "handoff_id": effect["request_id"], "candidate_id": candidate["candidate"].get("candidateId")}
+    try:
+        if output.exists() or output.is_symlink():
+            existing = output.read_bytes() if output.is_file() and not output.is_symlink() else b""
+            if _sha(existing) != image_sha:
+                return {"status": "needs_review", "reason_code": "manual-image-existing-output-conflict",
+                        "handoff_id": effect["request_id"]}
+        else:
+            _write_private(output, payload)
+        manual_handoff.write_candidate_files(
+            output=output, candidate_id=candidate["candidate"]["candidateId"],
+            files=candidate["files"], atomic_write=_write_private,
+        )
+        receipt = {
+            "schema": "read-x-manual-image-receipt/v1", "status": "business-validated",
+            **binding, "handoffId": effect["request_id"],
+            "candidateId": candidate["candidate"]["candidateId"],
+            "eventId": candidate["candidate"].get("eventId"),
+            "inputSha256": handoff["record"].get("inputSha256"),
+            "promptSha256": effect["request_sha256"], "sourceSha256": source_sha,
+            "candidateRawSha256": candidate["candidate"].get("rawSha256"),
+            "candidateResultSha256": candidate["candidate"].get("resultSha256"),
+            "candidateImageSha256": candidate_image_sha,
+            "candidateImageName": candidate_image_name,
+            "imageSha256": image_sha, "imageBytes": len(payload),
+            "evidenceLevel": "user-asserted", "businessValidation": "png-structure-and-source-binding",
+            "files": [{"name": item["name"], "mimeType": item["mimeType"], "sha256": item["sha256"]}
+                      for item in candidate["files"]],
+            "validatedAt": time.time(),
+        }
+        _write_private(receipt_path, _canonical(receipt) + b"\n")
+        if effect["status"] == "prepared":
+            attempt = store.begin_effect(lease, effect["op_key"])
+            if not attempt["execute"]:
+                raise RuntimeError("prepared manual image effect unexpectedly was not executable")
+            store.finish_effect(lease, effect["op_key"], "confirmed", metadata={
+                "source": "manual-handoff", "evidence_level": "user-asserted",
+                "candidate_id": receipt["candidateId"], "content_sha256": image_sha,
+                "business_validation": receipt["businessValidation"],
+            })
+        else:
+            store.reconcile_effect(lease, effect["op_key"], "confirmed", metadata={
+                "source": "manual-handoff", "evidence_level": "user-asserted",
+                "candidate_id": receipt["candidateId"], "content_sha256": image_sha,
+                "business_validation": receipt["businessValidation"],
+            })
+        store.set_artifact(lease, image_key, "confirmed", metadata={
+            "source": "manual-handoff", "evidence_level": "user-asserted",
+            "business_validation": receipt["businessValidation"], "content_sha256": image_sha,
+        })
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {"status": "needs_review", "reason_code": "manual-image-candidate-materialization-failed",
+                "failure_type": type(exc).__name__,
+                "handoff_id": effect["request_id"], "candidate_id": candidate["candidate"].get("candidateId")}
+    result = {"status": "candidate_validated", "source": "manual-handoff",
+              "evidence_level": "user-asserted", "image_sha256": image_sha,
+              "image_bytes": len(payload), "candidate_id": receipt["candidateId"]}
+    return {"status": "confirmed", "source": "manual-handoff", "result": result,
+            "effect": store.get_effect(effect["op_key"]), "output": output,
+            "summary": receipt}
+
+
 def _materialize_recovered_image(*, image_runner, source_path: Path, output: Path,
                                  summary: Path, request: dict, effect, observe_fn) -> dict:
     if not summary.exists():
@@ -200,6 +475,11 @@ def _prepare_generation(*, store: WorkflowStore, lease, image_key: str, image_na
                         source_path: Path, root: Path, round_number: int,
                         conversation_url: str | None, prompt_fetcher, image_runner, pack_target=None) -> dict:
     effect, action = _select_effect(store, lease.job_id, image_key, "image-generate", round_number)
+    if image_runner is core_image and (effect is None or effect["status"] in {"prepared", "failed"}):
+        return _manual_image_result(
+            store=store, lease=lease, image_key=image_key, image_name=image_name,
+            source_path=source_path, root=root, prompt_fetcher=prompt_fetcher,
+        )
     effect_round = _action_round(effect["action"]) if effect else round_number
     output, summary, request_path = _round_paths(root, image_name, effect_round)
 

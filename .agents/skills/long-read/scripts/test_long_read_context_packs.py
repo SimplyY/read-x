@@ -1,13 +1,16 @@
 """Context-only admission and recovery, entirely in private temporary fixtures."""
 import hashlib
 import json
+from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from contextlib import redirect_stdout
 
 import long_read_context_packs as packs
 import long_read_workflow_cli as cli
+from long_read_workflow_reports import create_context_delivery_snapshot
 import long_read_workflow_worker as worker
 from long_read_workflow_store import CONTEXT_ARTIFACTS, WorkflowStore, StoreConflict
 import run_isolated_analyses as isolated
@@ -253,6 +256,71 @@ class ContextTaskTests(unittest.TestCase):
         self.assertEqual(status["context_packages"]["completed"], 0)
         self.assertEqual(status["automatic_artifacts"]["requested"], [])
         self.assertEqual(before, self.state.joinpath("workflow.sqlite3").read_bytes())
+
+    def test_pre_revision_two_context_task_is_not_migrated_or_resumed(self):
+        result = self.submit()
+        with WorkflowStore(self.state) as store:
+            job = store.get_job(result["job_id"])
+            legacy_payload = dict(job["payload"])
+            legacy_payload.pop("delivery_plan_revision")
+            legacy_payload.pop("context_expires_at")
+            store.connection.execute("UPDATE jobs SET payload_json=? WHERE job_id=?",
+                                     (json.dumps(legacy_payload), result["job_id"]))
+            store.connection.execute("UPDATE admission_attempts SET plan_revision=1 WHERE task_id=?",
+                                     (result["job_id"],))
+            before_payload = store.connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id=?", (result["job_id"],),
+            ).fetchone()[0]
+
+        outcome = worker.run_once(self.state, context_only=True, owner="legacy-context-test")
+
+        self.assertEqual(outcome["status"], "idle")
+        with WorkflowStore(self.state) as store:
+            self.assertEqual(store.connection.execute(
+                "SELECT payload_json FROM jobs WHERE job_id=?", (result["job_id"],),
+            ).fetchone()[0], before_payload)
+            admission = store.connection.execute(
+                "SELECT app_id,source_message_id,plan_revision,status FROM admission_attempts WHERE task_id=?",
+                (result["job_id"],),
+            ).fetchone()
+            self.assertEqual(tuple(admission), ("cli_test", "om_source", 1, "accepted"))
+        self.assertFalse(self.transport.calls)
+
+    def test_context_cohort_metrics_include_only_delivered_tasks_and_human_title_samples(self):
+        result = self.submit()
+        delivered = self.process(result["job_id"])
+        self.assertTrue(delivered["delivery_complete"])
+        with WorkflowStore(self.state) as store:
+            self.assertEqual(store.record_context_title_review(result["job_id"], "correct"),
+                             {"status": "recorded", "result": "correct"})
+            self.assertEqual(store.record_context_title_review(result["job_id"], "correct"),
+                             {"status": "reused", "result": "correct"})
+            with self.assertRaisesRegex(StoreConflict, "conflicting human review"):
+                store.record_context_title_review(result["job_id"], "incorrect")
+
+        metrics = create_context_delivery_snapshot(self.state, days=30)
+        self.assertEqual(metrics["cohort"], "read-x-context-delivery/revision-2")
+        self.assertEqual(metrics["counts"]["N"], 1)
+        self.assertEqual(metrics["counts"]["delivered"], 1)
+        self.assertEqual(metrics["doublePackageDeliveryRate"]["rate"], 1)
+        self.assertEqual(metrics["fileValidation"]["verifiedTasks"], 1)
+        self.assertEqual(metrics["counts"]["remote_name_mismatch_packages"], 0)
+        self.assertEqual(metrics["titleCorrectnessSample"], {
+            "samples": 1, "correct": 1, "incorrect": 0, "accuracy": 1,
+        })
+        self.assertNotIn(result["job_id"], json.dumps(metrics))
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main([
+                "--state-dir", str(self.state), "context-title-review",
+                "--job-id", result["job_id"], "--result", "correct",
+            ]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {"status": "reused", "result": "correct"})
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["--state-dir", str(self.state), "context-metrics", "--days", "30"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["counts"]["delivered"], 1)
 
 
 class PromptCompatibilityTests(unittest.TestCase):

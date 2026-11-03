@@ -764,7 +764,15 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual([item[0] for item in calls], ["worker", "reports", "worker"])
         self.assertEqual(calls[1][1], target)
         self.assertEqual(calls[2][1], "worker-a")
-        self.assertEqual(result, {"status": "tick", "reports": {"status": "checked"}, "worker": {"status": "idle"}})
+        self.assertEqual(result, {
+            "status": "tick", "reports": {"status": "checked"}, "worker": {"status": "idle"},
+            "context_retention": {
+                "context_jobs_expired": 0, "context_job_directories_removed": 0,
+                "context_snapshots_removed": 0, "context_admissions_scrubbed": 0,
+                "context_jobs_active_at_expiry": 0, "context_statistics_rows_removed": 0,
+                "context_statistics_active_rows_preserved": 0,
+            },
+        })
         patrol_run.assert_not_called()
 
     def test_worker_service_tick_runs_voice_x_patrol_only_when_exactly_enabled(self):

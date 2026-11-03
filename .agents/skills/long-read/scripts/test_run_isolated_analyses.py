@@ -17,6 +17,14 @@ runner = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+_original_run = runner.run
+
+
+def _legacy_run_for_contract_tests(*args, **kwargs):
+    return _original_run(*args, **kwargs, _allow_legacy_bridge_submit=True)
+
+
+runner.run = _legacy_run_for_contract_tests
 
 
 def skill(name: str) -> str:

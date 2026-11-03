@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Thin deterministic orchestration entry for the long-read analysis branches.
+"""Retired non-durable long-read pipeline.
 
-并行独立启动三条分支；任何前置失败都不得阻断或丢弃其他分支：
-
-- article-decode + 文字 ljg（run_isolated_analyses，独立 ChatGPT web-bridge 会话）；
-- ChatGPT Bridge 芒格精读（run_chatgpt_munger，route=long_read 即启动，分数不再设门内门槛）。
-
-阈值与触发条件只来自 content_scoring 的 scoring_result；本脚本不复制阈值、不重算路由。
-article-decode 失败不阻断 ChatGPT，也不丢弃已成功的 ljg 输出；汇总逐分支记录状态与错误，
-本脚本只完成内容生成，不能确认飞书文档、图片插入或私聊发送。成功时仅返回“内容生成完成，等待交付核验”，不得报告精读最终成功。
+Direct execution now fails closed. New tasks must enter the persistent workflow,
+which prepares manual handoffs and retains business validation and delivery gates.
 """
 from __future__ import annotations
 
@@ -111,39 +105,31 @@ def delivery_state(analyses: dict, chatgpt: dict) -> dict:
 
 
 def run(args: argparse.Namespace) -> dict:
-    started = time.monotonic()
-    scoring = load_scoring_result(args.scoring_result)
-    # route=long_read 即启动芒格分支；chatgpt_munger_doc 只作为评分信息随 summary 留档。
-    chatgpt_required = True
-    results: dict = {"analyses": None, "chatgpt_munger": {"status": "not_required"}}
-    threads = [threading.Thread(target=_run_analyses, args=(args, results), daemon=True)]
-    if chatgpt_required:
-        threads.append(threading.Thread(target=_run_chatgpt, args=(args, results), daemon=True))
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    chatgpt = results["chatgpt_munger"]
-    delivery = delivery_state(results["analyses"], chatgpt)
+    """Keep the retired, non-durable pipeline from submitting new Bridge runs."""
     return {
         "schema_version": SCHEMA_VERSION,
-        "elapsed_seconds": round(time.monotonic() - started, 3),
-        "scoring": {
-            "score_status": scoring.get("score_status"),
-            "route": scoring.get("route"),
-            "decision_score": scoring.get("decision_score"),
-            "chatgpt_munger_doc": bool(scoring.get("chatgpt_munger_doc")),
+        "status": "needs_review",
+        "reason_code": "legacy-direct-entry-disabled",
+        "manual_handoff_required": True,
+        "message": (
+            "旧临时流水线没有持久任务身份，不能安全创建人工交接或提交新的 ChatGPT 请求。"
+            "请使用 long_read_workflow_cli.py submit 创建任务，再由 run-worker 准备交接包。"
+        ),
+        "next_step": "long_read_workflow_cli.py submit → run-worker",
+        "delivery": {
+            "state": STATE_CHATGPT_NEEDS_REVIEW,
+            "label": "旧入口已停止新提交；请从持久工作流继续",
+            "delivery_complete": False,
+            "missing_branches": ["article-decode", "text-analysis", "chatgpt-munger"],
+            "chatgpt_state": "needs_review",
         },
-        "branches": {
-            "analyses": results["analyses"],
-            "chatgpt_munger": chatgpt,
-        },
-        "delivery": delivery,
     }
 
 
 def exit_code(summary: dict) -> int:
     """0 content stage ready; 1 incomplete content; 2 analysis preflight failed."""
+    if summary.get("reason_code") == "legacy-direct-entry-disabled":
+        return 2
     if summary["delivery"]["state"] == STATE_CONTENT_READY:
         return 0
     analyses = summary["branches"]["analyses"]
@@ -174,8 +160,9 @@ def main() -> int:
     except Exception as exc:
         print(json.dumps({"status": "failed", "error": f"{type(exc).__name__}: {exc}"}, ensure_ascii=False))
         return 2
-    args.summary_file.parent.mkdir(parents=True, exist_ok=True)
-    isolated.atomic_write(args.summary_file, json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+    if summary.get("reason_code") != "legacy-direct-entry-disabled":
+        args.summary_file.parent.mkdir(parents=True, exist_ok=True)
+        isolated.atomic_write(args.summary_file, json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
     return exit_code(summary)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sys
@@ -28,19 +29,34 @@ def _code(value) -> str:
 def context_result(job: dict, artifacts: list[dict]) -> dict:
     by_key = {item["artifact_key"]: item for item in artifacts}
     completed = sum(by_key.get(key, {}).get("status") == "confirmed" for key in CONTEXT_ARTIFACTS)
+    payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    expired = job.get("status") == "expired"
     unresolved = [{"artifact": key, "status": by_key.get(key, {}).get("status", "pending"),
                    "reason_code": by_key.get(key, {}).get("metadata", {}).get("reason_code", "context-pack-pending")}
                   for key in CONTEXT_ARTIFACTS if by_key.get(key, {}).get("status") != "confirmed"
                   or by_key.get(key, {}).get("metadata", {}).get("remote_name_status") == "mismatch"]
-    return {"job_status": job["status"], "delivery_complete": completed == 2,
+    if expired and unresolved:
+        for item in unresolved:
+            if item["reason_code"] == "context-pack-pending":
+                item["reason_code"] = "context-task-expired"
+    return {"job_status": job["status"], "delivery_complete": completed == 2 and not expired,
+            "context_expires_at": payload.get("context_expires_at"),
             "context_packages": {"required": 2, "completed": completed,
                                  "summary": f"上下文包：已完成 {completed}/2。", "unresolved": unresolved},
             "automatic_artifacts": {"status": "not_requested", "requested": []}}
 
 
 def context_job_due(store, job: dict, now: float) -> bool:
-    if job["status"] in {"succeeded", "failed"}:
+    if job["status"] in {"succeeded", "failed", "expired"}:
         return False
+    if (job.get("payload") or {}).get("delivery_plan_revision") != 2:
+        return False
+    expires_at = (job.get("payload") or {}).get("context_expires_at")
+    # Pre-retention context tasks are intentionally not migrated or resumed.
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool) or not math.isfinite(expires_at):
+        return False
+    if now >= float(expires_at):
+        return True
     for artifact in store.artifacts(job["job_id"]):
         metadata = artifact.get("metadata", {})
         if artifact["status"] != "confirmed" and metadata.get("retry_allowed") is not False:
@@ -101,6 +117,34 @@ def advance_context_job(store, lease, state_dir: Path, *, pack_fn=run_context_pa
     payload = job["payload"]
     if payload.get("workflow_contract_version") != CONTEXT_WORKFLOW_CONTRACT_VERSION:
         raise ValueError("not a context-only task")
+    expires_at = payload.get("context_expires_at")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool) or not math.isfinite(expires_at):
+        store.set_status(lease, "needs_review")
+        return {"status": "needs_review", "job_id": lease.job_id, "delivery_complete": False,
+                "reason_code": "context-task-retention-unset"}
+    if float(clock()) >= float(expires_at):
+        expired_artifacts = store.artifacts(lease.job_id)
+        required = [artifact for artifact in expired_artifacts if artifact["required"]]
+        if required and all(artifact["status"] == "confirmed" for artifact in required):
+            needs_review = any(artifact.get("metadata", {}).get("remote_name_status") == "mismatch"
+                               for artifact in required)
+            store.set_status(lease, "needs_review" if needs_review else "succeeded")
+            job = store.get_job(lease.job_id)
+            return {"status": job["status"], "job_id": lease.job_id,
+                    **context_result(job, store.artifacts(lease.job_id))}
+        for artifact in expired_artifacts:
+            if artifact["status"] == "pending":
+                for effect in store.effects_for(lease.job_id, artifact["artifact_key"]):
+                    if effect["status"] == "prepared":
+                        store.finish_effect(lease, effect["op_key"], "failed",
+                                            metadata={"failure_stage": "context-pack-delivery",
+                                                      "reason_code": "context-task-expired"})
+                store.set_artifact(lease, artifact["artifact_key"], "failed",
+                                   metadata={"failure_stage": "context-pack-delivery",
+                                             "reason_code": "context-task-expired", "retry_allowed": False})
+        store.set_status(lease, "expired")
+        job = store.get_job(lease.job_id)
+        return {"status": "expired", "job_id": lease.job_id, **context_result(job, store.artifacts(lease.job_id))}
     files = _frozen_inputs(payload, state_dir)
     target = context_pack_delivery(payload["trigger"], store)
     if target.get("invalid"):
@@ -109,6 +153,8 @@ def advance_context_job(store, lease, state_dir: Path, *, pack_fn=run_context_pa
     receipt_dir = _artifact_root(state_dir, lease.job_id) / "context-packs"
     store.set_status(lease, "running")
     receipts = []
+    prepared = {}
+    preparation_failed = False
     for pack in payload["context_packs"]:
         key = pack["artifact_key"]
         artifact = next(item for item in store.artifacts(lease.job_id) if item["artifact_key"] == key)
@@ -117,6 +163,7 @@ def advance_context_job(store, lease, state_dir: Path, *, pack_fn=run_context_pa
         prompt = files[pack["prompt_file"]]
         if _hash(prompt) != pack["prompt_sha256"]:
             raise ValueError("frozen business Prompt hash changed")
+        prepare_started = float(clock())
         result = pack_fn("prepare", pack_id=pack["pack_id"], root=root, prompt=prompt.decode("utf-8"),
                          metadata={"caller_label": CALLER, "title": payload["title"], "pack_type": pack["pack_type"],
                                    "title_source": payload["title_source"], "task_id": lease.job_id, "artifact_id": key,
@@ -128,7 +175,38 @@ def advance_context_job(store, lease, state_dir: Path, *, pack_fn=run_context_pa
             code = _code(result.get("errorCode") or "context-pack-receipt-invalid")
             store.set_artifact(lease, key, "pending", metadata={"failure_stage": "context-pack-prepare", "reason_code": code,
                                "retry_allowed": False})
+            preparation_failed = True
             continue
+        prepared[key] = (pack, prompt)
+        store._event(lease.job_id, "context_pack_prepared", {"artifact_key": key, "status": "ready",
+                                                             "duration_ms": max(0, (float(clock()) - prepare_started) * 1000)})
+
+    required = [item["artifact_key"] for item in payload["context_packs"]]
+    prepared_or_delivered = all(key in prepared or next(item for item in store.artifacts(lease.job_id)
+                                                        if item["artifact_key"] == key)["status"] == "confirmed"
+                                for key in required)
+    if preparation_failed or not prepared_or_delivered:
+        store.set_status(lease, "needs_review" if preparation_failed else "waiting")
+        job = store.get_job(lease.job_id)
+        return {"status": job["status"], "job_id": lease.job_id,
+                **context_result(job, store.artifacts(lease.job_id)), "packages": []}
+    if not store.connection.execute(
+            "SELECT 1 FROM events WHERE job_id=? AND event_type='context_packs_ready' LIMIT 1",
+            (lease.job_id,),
+    ).fetchone():
+        admission = store.connection.execute(
+            "SELECT created_at FROM admission_attempts WHERE task_id=?", (lease.job_id,),
+        ).fetchone()
+        submitted_at = float(admission["created_at"]) if admission else float(job["created_at"])
+        store._event(lease.job_id, "context_packs_ready", {
+            "status": "ready", "duration_ms": max(0, (float(clock()) - submitted_at) * 1000),
+        })
+
+    for pack in payload["context_packs"]:
+        key = pack["artifact_key"]
+        if key not in prepared:
+            continue
+        pack, prompt = prepared[key]
         effect = store.find_effect(lease.job_id, key, "context-pack-deliver")
         if effect is None:
             effect = store.prepare_effect(lease, key, "context-pack-deliver", pack["prompt_sha256"])

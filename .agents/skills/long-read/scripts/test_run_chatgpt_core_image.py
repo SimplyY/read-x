@@ -19,6 +19,14 @@ image_runner = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 sys.modules[SPEC.name] = image_runner
 SPEC.loader.exec_module(image_runner)
+_original_run = image_runner.run
+
+
+def _legacy_run_for_contract_tests(*args, **kwargs):
+    return _original_run(*args, **kwargs, _allow_legacy_bridge_submit=True)
+
+
+image_runner.run = _legacy_run_for_contract_tests
 
 
 REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000"

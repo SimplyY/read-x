@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the optional ChatGPT Bridge + munger-soul analysis for a long-read."""
+"""Legacy munger runner; its direct CLI no longer submits new ChatGPT requests."""
 from __future__ import annotations
 
 import argparse
@@ -172,7 +172,14 @@ def _record_attempt(attempts: list[dict], result: dict) -> None:
     })
 
 
-def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, prompt_fetcher=None, request_id: str | None = None) -> dict:
+def run(source_path: Path, output_path: Path, bridge_path: Path | None = None, summary_path: Path | None = None, prompt_fetcher=None, request_id: str | None = None, *, _allow_legacy_bridge_submit: bool = False) -> dict:
+    if not _allow_legacy_bridge_submit:
+        return {
+            "status": "needs_review",
+            "reason_code": "legacy-direct-entry-disabled",
+            "manual_handoff_required": True,
+            "message": "独立芒格脚本不创建持久任务或网页请求；请从 long_read_workflow_cli.py submit 进入人工交接。旧 Run 通过原任务 resume 观察。",
+        }
     if output_path.exists():
         raise FileExistsError(f"output already exists: {output_path}")
     source = _read_regular(source_path, "source")
@@ -246,14 +253,21 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--bridge", type=Path)
     parser.add_argument("--summary", type=Path)
-    parser.add_argument("--request-id", help="预先持久化的 Bridge 请求 UUID；禁用隐藏重试与内存冷却等待")
+    parser.add_argument("--request-id", help="旧请求标识；新请求不再从此入口提交，旧任务请用持久工作流 resume")
     args = parser.parse_args()
-    try:
-        result = run(args.source, args.output, args.bridge, args.summary, request_id=args.request_id)
-    except Exception as exc:
-        result = {"status": "needs_review", "reason": str(exc)}
+    result = {
+        "status": "needs_review",
+        "reason_code": "legacy-direct-entry-disabled",
+        "manual_handoff_required": True,
+        "message": (
+            "该独立脚本不再提交新的 ChatGPT 请求，也不能创建带任务身份的交接包。"
+            "请使用 long_read_workflow_cli.py submit 后运行 Worker；已有 Run 通过原任务 resume 只读观察。"
+        ),
+        "next_step": "long_read_workflow_cli.py submit → run-worker → resume --job-id <id>",
+        "request_id": args.request_id,
+    }
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["status"] == "succeeded" else 2
+    return 2
 
 
 if __name__ == "__main__":

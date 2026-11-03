@@ -26,9 +26,10 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from chatgpt_bridge import record_business_outcome
 from long_read_document_assembler import validate_scoring_fields
 from render_long_read_delivery_card import _load_score_evidence
+import long_read_manual_handoff as manual_handoff
 from long_read_workflow_store import (
     StoreConflict, WORKFLOW_CONTRACT_VERSION, CONTEXT_WORKFLOW_CONTRACT_VERSION,
-    CONTEXT_ARTIFACTS, WorkflowStore, is_valid_source_created_at,
+    CONTEXT_ARTIFACTS, CONTEXT_TASK_RETENTION_SECONDS, WorkflowStore, is_valid_source_created_at,
     state_lock, workflow_payload_issue,
 )
 from run_isolated_analyses import validate_evidence
@@ -467,7 +468,8 @@ def submit_context_inputs(**options) -> dict:
     state_dir = Path(options.get("state_dir", DEFAULT_STATE_DIR)).absolute()
     _reject_symlink_path(state_dir)
     task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"read-x:context:{app_id}:{source_id}"))
-    fields = {"task_id": task_id, "app_id": app_id, "source_message_id": source_id}
+    fields = {"task_id": task_id, "app_id": app_id, "source_message_id": source_id,
+              "plan_revision": 2}
     with WorkflowStore(state_dir) as store:
         store.record_context_admission(**fields, status="preparing")
     try:
@@ -604,7 +606,15 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
                     os.rename(temporary, snapshot)
                     _fsync_directory(artifacts_dir)
                 _verify_snapshot(snapshot, files, manifest)
+                admission = store.connection.execute(
+                    "SELECT created_at FROM admission_attempts WHERE task_id=?", (task_id,),
+                ).fetchone()
+                if not admission:
+                    raise StoreConflict("context admission disappeared before snapshot freeze")
+                created_at = float(admission["created_at"])
                 payload = {"schema": "read-x-context-submission/v1", "workflow_contract_version": CONTEXT_WORKFLOW_CONTRACT_VERSION,
+                           "delivery_plan_revision": 2,
+                           "context_expires_at": created_at + CONTEXT_TASK_RETENTION_SECONDS,
                            "admission_sha256": admission_sha, "snapshot_sha256": digest,
                            "inputs": {name: {"path": str(snapshot / name), "sha256": _hash(value)} for name, value in files.items()},
                            "title": title, "title_source": title_source, "source_status": source_status, "route": route,
@@ -680,11 +690,11 @@ def inspect_jobs(state_dir: Path = DEFAULT_STATE_DIR, *, job_id: str | None = No
             if chat_id is not None:
                 if not isinstance(payload, dict) or payload.get("trigger", {}).get("chatId") != chat_id:
                     continue
-                if row["status"] in {"succeeded", "failed"}:
+                if row["status"] in {"succeeded", "failed", "expired"}:
                     continue
                 chat_nonterminal_count += 1
                 continue
-            if resume and row["status"] in {"succeeded", "failed"}:
+            if resume and row["status"] in {"succeeded", "failed", "expired"}:
                 continue
             job = dict(row)
             job.pop("payload_json", None)
@@ -714,11 +724,19 @@ def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict, inc
     """Run scheduled report delivery and advance one job in the same worker."""
     from long_read_workflow_scheduler import run_due_reports
     from long_read_workflow_worker import run_once
+    from long_read_workflow_retention import apply_context_retention
+
+    try:
+        context_retention = apply_context_retention(Path(state_dir))
+    except Exception:
+        # A corrupt historical row must not prevent new context or long-read work.
+        context_retention = {"status": "needs_review", "reason_code": "context-retention-failed"}
 
     # New context tasks get an independent turn before legacy reports or recovery.
     context_job = run_once(Path(state_dir), owner=owner, context_only=True)
     if context_job.get("status") != "idle":
-        result = {"status": "tick", "reports": {"status": "deferred", "reason_code": "context-task-priority"},
+        result = {"status": "tick", "context_retention": context_retention,
+                  "reports": {"status": "deferred", "reason_code": "context-task-priority"},
                   "worker": context_job}
         patrol = _voice_x_patrol_tick() if include_patrol else None
         if patrol is not None:
@@ -734,13 +752,213 @@ def worker_service_tick(state_dir: Path, *, owner: str, report_target: dict, inc
     except Exception:
         reports = {"status": "needs_review", "reason_code": "legacy-report-unavailable"}
     job = run_once(Path(state_dir), owner=owner, outcome_recorder=record_business_outcome)
-    result = {"status": "tick", "reports": reports, "worker": job}
+    result = {"status": "tick", "context_retention": context_retention, "reports": reports, "worker": job}
     if unadmitted:
         result["legacy_jobs_skipped"] = len(unadmitted)
     patrol = _voice_x_patrol_tick() if include_patrol else None
     if patrol is not None:
         result["voice_x_patrol"] = patrol
     return result
+
+
+def import_manual_result(*, state_dir: Path, job_id: str, artifact_key: str,
+                         result_path: Path, file_paths: list[Path] | None = None,
+                         event_id: str | None = None, source_claim: str | None = None) -> dict:
+    """Persist a manual result candidate and a task-bound pointer; never mark business success."""
+    from long_read_workflow_worker import (
+        _artifact_root, _atomic_bytes, _load_job_inputs, _manual_candidate_path,
+    )
+
+    state_dir = Path(state_dir).absolute()
+    _reject_symlink_path(state_dir)
+    try:
+        job_id = str(uuid.UUID(job_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("manual import requires a valid Read-X job id") from exc
+    if result_path == Path("-"):
+        result_bytes = sys.stdin.buffer.read()
+    else:
+        result_bytes = manual_handoff.inspect_source_file(Path(result_path))["bytes"]
+    files = [manual_handoff.inspect_source_file(Path(path)) for path in (file_paths or [])]
+    event_id = event_id or f"codex-import:{uuid.uuid4()}"
+    source_claim = source_claim or "User reports that these result bytes were returned from ChatGPT in the original Codex task."
+
+    with WorkflowStore(state_dir) as store:
+        job = store.get_job(job_id)
+        if not job:
+            raise ValueError("manual import task was not found")
+        if job["status"] in {"succeeded", "failed", "expired"}:
+            raise ValueError("manual import cannot change a terminal Read-X task")
+        effect = store.find_effect(job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+        if effect is None:
+            raise ValueError("this task branch has no registered manual handoff")
+        if effect["status"] == "confirmed":
+            return {"status": "needs_review", "reason": "branch-already-business-validated",
+                    "job_id": job_id, "artifact": artifact_key,
+                    "business_completed": False}
+        if effect["status"] == "uncertain":
+            return {"status": "needs_review", "reason": "resume-the-persisted-candidate-before-importing-another",
+                    "job_id": job_id, "artifact": artifact_key, "handoff_id": effect["request_id"],
+                    "business_completed": False}
+        if effect["status"] != "prepared":
+            raise ValueError("manual import requires a handoff waiting for its first business validation")
+        _load_job_inputs(job)
+        binding = manual_handoff.binding_for_job(
+            job, artifact_key, prompt_sha=effect["request_sha256"],
+        )
+        handoff = manual_handoff.read_handoff(
+            state_dir=state_dir, handoff_id=effect["request_id"], binding=binding,
+        )
+        if hashlib.sha256(handoff["promptBytes"]).hexdigest() != effect["request_sha256"]:
+            raise ValueError("manual handoff Prompt hash does not match the persisted workflow effect")
+        imported = manual_handoff.import_result(
+            state_dir=state_dir, handoff_id=effect["request_id"], binding=binding,
+            event_id=event_id, source_claim=source_claim,
+            result_bytes=result_bytes, files=files,
+        )
+        candidate = imported.get("candidate") or {}
+        if imported.get("status") in {"received", "duplicate"} and candidate.get("candidateId"):
+            root = _artifact_root(state_dir, job_id)
+            if artifact_key in manual_handoff.IMAGE_ARTIFACTS:
+                output = root / "images" / f"{artifact_key}.png"
+            elif artifact_key.startswith("analysis:"):
+                output = root / "analysis" / f"{artifact_key.split(':', 1)[1]}.md"
+            else:
+                raise ValueError("manual import artifact is not a supported Read-X output")
+            pointer_path = _manual_candidate_path(output)
+            previous = None
+            if pointer_path.exists() or pointer_path.is_symlink():
+                _reject_symlink_path(pointer_path)
+                previous = json.loads(pointer_path.read_text(encoding="utf-8"))
+                if (not isinstance(previous, dict)
+                        or previous.get("schema") != "read-x-manual-candidate-pointer/v1"
+                        or previous.get("handoffId") != effect["request_id"]):
+                    raise ValueError("existing manual candidate pointer is invalid")
+            pointer = {
+                "schema": "read-x-manual-candidate-pointer/v1",
+                **binding,
+                "handoffId": effect["request_id"],
+                "candidateId": candidate["candidateId"],
+                "rawSha256": candidate.get("rawSha256"),
+                "resultSha256": candidate.get("resultSha256"),
+                "evidenceLevel": candidate.get("evidenceLevel"),
+                "receivedStatus": imported["status"],
+            }
+            if artifact_key in manual_handoff.IMAGE_ARTIFACTS and previous:
+                prior_ids = previous.get("candidateIds") or ([previous["candidateId"]]
+                                                               if previous.get("candidateId") else [])
+                prior_hashes = previous.get("candidateHashes") or {}
+                prior_hashes = dict(prior_hashes)
+                for prior_id in prior_ids:
+                    if prior_id == previous.get("candidateId") and prior_id not in prior_hashes:
+                        prior_hashes[prior_id] = previous.get("resultSha256")
+                prior_id = candidate.get("duplicateOf")
+                same_bytes = (candidate.get("resultSha256") in prior_hashes.values()
+                              or prior_id in prior_ids)
+                if prior_ids and candidate["candidateId"] not in prior_ids and not same_bytes:
+                    candidate_ids = list(dict.fromkeys([*prior_ids, candidate["candidateId"]]))
+                    prior_hashes[candidate["candidateId"]] = candidate.get("resultSha256")
+                    pointer.pop("candidateId", None)
+                    pointer["candidateIds"] = candidate_ids
+                    pointer["candidateHashes"] = prior_hashes
+                    pointer["selectionRequired"] = True
+                elif previous.get("selectionRequired") is True:
+                    pointer.pop("candidateId", None)
+                    pointer["candidateIds"] = list(dict.fromkeys([*prior_ids, candidate["candidateId"]]))
+                    prior_hashes[candidate["candidateId"]] = candidate.get("resultSha256")
+                    pointer["candidateHashes"] = prior_hashes
+                    pointer["selectionRequired"] = True
+                elif same_bytes and previous.get("candidateId"):
+                    pointer["candidateId"] = previous["candidateId"]
+                    pointer["rawSha256"] = previous.get("rawSha256")
+                    pointer["resultSha256"] = previous.get("resultSha256")
+            _atomic_bytes(
+                pointer_path,
+                (json.dumps(pointer, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+            )
+        return {
+            "status": "candidate_received" if imported.get("status") in {"received", "duplicate"} else imported.get("status"),
+            "reason": imported.get("reason"),
+            "job_id": job_id,
+            "artifact": artifact_key,
+            "handoff_id": effect["request_id"],
+            "candidate_id": candidate.get("candidateId"),
+            "raw_sha256": candidate.get("rawSha256"),
+            "result_sha256": candidate.get("resultSha256"),
+            "evidence_level": candidate.get("evidenceLevel"),
+            "candidate_selection_required": bool(
+                artifact_key in manual_handoff.IMAGE_ARTIFACTS
+                and pointer_path.exists() and json.loads(pointer_path.read_text(encoding="utf-8")).get("selectionRequired") is True
+            ) if imported.get("status") in {"received", "duplicate"} and candidate.get("candidateId") else False,
+            "candidate_ids": json.loads(pointer_path.read_text(encoding="utf-8")).get("candidateIds", [])
+            if imported.get("status") in {"received", "duplicate"} and candidate.get("candidateId")
+            and artifact_key in manual_handoff.IMAGE_ARTIFACTS else [],
+            "files": candidate.get("files", []),
+            "business_completed": False,
+            "execution_status": "awaiting_business_validation" if imported.get("status") in {"received", "duplicate"} else "needs_review",
+        }
+
+
+def select_manual_candidate(*, state_dir: Path, job_id: str, artifact_key: str,
+                            candidate_id: str) -> dict:
+    """Resolve an ambiguous image handoff by selecting one already-imported candidate."""
+    if artifact_key not in manual_handoff.IMAGE_ARTIFACTS:
+        raise ValueError("candidate selection is currently supported for Read-X image artifacts")
+    from long_read_workflow_worker import (
+        _artifact_root, _atomic_bytes, _load_job_inputs, _manual_candidate_path,
+    )
+
+    state_dir = Path(state_dir).absolute()
+    _reject_symlink_path(state_dir)
+    try:
+        job_id = str(uuid.UUID(job_id))
+        candidate_id = str(uuid.UUID(candidate_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("candidate selection requires valid Read-X job and candidate ids") from exc
+    with WorkflowStore(state_dir) as store:
+        job = store.get_job(job_id)
+        if not job or job["status"] in {"succeeded", "failed", "expired"}:
+            raise ValueError("candidate selection requires a non-terminal Read-X task")
+        effect = store.find_effect(job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+        if not effect or effect["status"] != "prepared":
+            raise ValueError("candidate selection requires a prepared image handoff")
+        _load_job_inputs(job)
+        binding = manual_handoff.binding_for_job(job, artifact_key, prompt_sha=effect["request_sha256"])
+        manual_handoff.read_handoff(state_dir=state_dir, handoff_id=effect["request_id"], binding=binding)
+        root = _artifact_root(state_dir, job_id)
+        output = root / "images" / f"{artifact_key}.png"
+        pointer_path = _manual_candidate_path(output)
+        _reject_symlink_path(pointer_path)
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        candidate_ids = pointer.get("candidateIds") or ([pointer.get("candidateId")]
+                                                         if pointer.get("candidateId") else [])
+        if (pointer.get("schema") != "read-x-manual-candidate-pointer/v1"
+                or pointer.get("handoffId") != effect["request_id"]
+                or any(pointer.get(key) != value for key, value in binding.items())
+                or candidate_id not in candidate_ids):
+            raise ValueError("candidate id is not an eligible candidate for this task image")
+        candidate = manual_handoff.read_candidate(
+            state_dir=state_dir, handoff_id=effect["request_id"],
+            candidate_id=candidate_id, binding=binding,
+        )["candidate"]
+        pointer.update({
+            "candidateId": candidate_id,
+            "rawSha256": candidate.get("rawSha256"),
+            "resultSha256": candidate.get("resultSha256"),
+            "evidenceLevel": candidate.get("evidenceLevel"),
+            "receivedStatus": candidate.get("status"),
+            "selectionRequired": False,
+            "selectedCandidateId": candidate_id,
+            "selectedAt": datetime.now().astimezone().isoformat(),
+        })
+        pointer.pop("candidateHashes", None)
+        _atomic_bytes(
+            pointer_path,
+            (json.dumps(pointer, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        )
+        return {"status": "candidate_selected", "job_id": job_id, "artifact": artifact_key,
+                "handoff_id": effect["request_id"], "candidate_id": candidate_id,
+                "business_completed": False}
 
 
 def _voice_x_patrol_tick() -> dict | None:
@@ -857,7 +1075,30 @@ def main(argv=None) -> int:
     ))
     record_event.add_argument("--details-json", required=True,
                               help="符合该事件类型字段契约的 JSON 对象；禁止包含文章正文或凭据")
-    for command in (submit, context_submit, status, resume, worker, report, due_reports, configure_target, record_event):
+    context_metrics = commands.add_parser("context-metrics", help="汇总 revision-2 双上下文包 cohort，不输出任务标识")
+    context_metrics.add_argument("--days", type=int, default=30, help="统计窗口 1–180 天，默认 30 天")
+    title_review = commands.add_parser("context-title-review", help="记录一个人工标题语义抽样结果")
+    title_review.add_argument("--job-id", required=True)
+    title_review.add_argument("--result", required=True, choices=("correct", "incorrect"))
+    manual_import = commands.add_parser(
+        "import-manual-result", help="在原 Codex 任务导入 ChatGPT 文本候选及原始附件；不直接确认业务成功",
+    )
+    manual_import.add_argument("--job-id", required=True)
+    manual_import.add_argument("--artifact", required=True, help="精确分支键，例如 analysis:article-decode")
+    manual_import.add_argument("--result", type=Path, required=True,
+                               help="候选结果文件；图像任务可直接使用原始 PNG 字节")
+    manual_import.add_argument("--file", type=Path, action="append", default=[],
+                               help="附加原始结果文件，可重复指定；按原字节保存")
+    manual_import.add_argument("--event-id", help="Codex 回填事件标识；缺省时生成本地导入标识")
+    manual_import.add_argument("--source-claim", help="用户声明的来源说明；只作为未验证输入记录")
+    manual_select = commands.add_parser(
+        "select-manual-candidate", help="在多个 Read-X 图片候选中记录用户明确选择",
+    )
+    manual_select.add_argument("--job-id", required=True)
+    manual_select.add_argument("--artifact", required=True, choices=sorted(manual_handoff.IMAGE_ARTIFACTS))
+    manual_select.add_argument("--candidate-id", required=True)
+    for command in (submit, context_submit, status, resume, worker, report, due_reports, configure_target,
+                    record_event, context_metrics, title_review, manual_import, manual_select):
         command.add_argument("--state-dir", type=Path, default=argparse.SUPPRESS)
         if command is status:
             command.add_argument("--job-id")
@@ -933,6 +1174,47 @@ def main(argv=None) -> int:
                     if value is not None and value != target[key]:
                         raise ValueError(f"--{key.replace('_', '-')} does not match persisted report target")
             result = run_due_reports(args.state_dir, now=scheduler_now, delivery_target=target)
+        elif args.command == "context-metrics":
+            from long_read_workflow_reports import create_context_delivery_snapshot
+            result = create_context_delivery_snapshot(args.state_dir, days=args.days)
+        elif args.command == "context-title-review":
+            with WorkflowStore(args.state_dir) as store:
+                result = store.record_context_title_review(args.job_id, args.result)
+        elif args.command == "import-manual-result":
+            candidate_result = import_manual_result(
+                state_dir=args.state_dir, job_id=args.job_id, artifact_key=args.artifact,
+                result_path=args.result, file_paths=args.file, event_id=args.event_id,
+                source_claim=args.source_claim,
+            )
+            if candidate_result.get("status") == "candidate_received":
+                from long_read_workflow_worker import run_once
+                worker_result = run_once(
+                    args.state_dir, job_id=args.job_id, owner="read-x-manual-import",
+                    outcome_recorder=record_business_outcome,
+                )
+                result = {
+                    "status": worker_result.get("status", "needs_review"),
+                    "candidate_import": candidate_result,
+                    "worker": worker_result,
+                    "business_completed": worker_result.get("delivery_complete") is True,
+                }
+            else:
+                result = candidate_result
+        elif args.command == "select-manual-candidate":
+            selection = select_manual_candidate(
+                state_dir=args.state_dir, job_id=args.job_id, artifact_key=args.artifact,
+                candidate_id=args.candidate_id,
+            )
+            from long_read_workflow_worker import run_once
+            worker_result = run_once(
+                args.state_dir, job_id=args.job_id, owner="read-x-manual-candidate-selection",
+                outcome_recorder=record_business_outcome,
+            )
+            result = {
+                "status": worker_result.get("status", "needs_review"),
+                "candidate_selection": selection, "worker": worker_result,
+                "business_completed": worker_result.get("delivery_complete") is True,
+            }
         elif args.command == "run-worker" and args.serve:
             if args.job_id:
                 raise ValueError("--serve cannot be combined with --job-id")
@@ -966,7 +1248,7 @@ def main(argv=None) -> int:
                               owner=args.owner if args.command == "run-worker" else "read-x-resume",
                               manual_document_id=args.document_id if args.command == "resume" else None,
                               outcome_recorder=record_business_outcome)
-    except (ValueError, OSError, StoreConflict, sqlite3.Error) as exc:
+    except (ValueError, OSError, StoreConflict, sqlite3.Error, manual_handoff.ManualHandoffError) as exc:
         failure = {"status": "blocked", "reason_code": type(exc).__name__, "message": str(exc)}
         if args.command == "submit-context-packs":
             failure.update(task_id=getattr(exc, "task_id", None),
@@ -975,6 +1257,18 @@ def main(argv=None) -> int:
         print(json.dumps(failure, ensure_ascii=False))
         return 2
     print(json.dumps(result, ensure_ascii=False))
+    def waiting_for_human(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        if value.get("status") in {"candidate_received", "awaiting_manual"} or value.get("awaiting_manual") is True:
+            return True
+        if "worker" in value:
+            return waiting_for_human(value.get("worker"))
+        return any(waiting_for_human(item) for item in value.values() if isinstance(item, dict))
+    if waiting_for_human(result):
+        return 75
+    if args.command == "import-manual-result" and result.get("status") in {"needs_review", "blocked", "failed"}:
+        return 2
     return 0
 
 

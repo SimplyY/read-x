@@ -325,6 +325,35 @@ class WorkerTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def test_new_long_read_branches_wait_for_manual_results_before_any_document_publish(self):
+        compiler = FakeDocumentCompiler()
+        with patch.object(worker, "_run_bridge_text_branch",
+                          wraps=worker._run_bridge_text_branch) as bridge_path:
+            result = worker.process_job(
+                self.state, self.job_id, prompt_fetcher=asset_fetcher,
+                document_compiler=compiler, notification_fn=fake_notifications,
+            )
+        self.assertEqual(result["status"], "needs_review", result)
+        self.assertTrue(result["awaiting_manual"])
+        self.assertEqual(result["next_stage"], "await_manual_result")
+        self.assertIsNone(result["document_candidate"])
+        self.assertIsNone(result["document_delivery"])
+        self.assertEqual(compiler.publish_calls, 0)
+        bridge_path.assert_not_called()
+        manual_branches = [item for item in result["content_branches"]
+                           if item.get("status") == "awaiting_manual"]
+        self.assertGreaterEqual(len(manual_branches), 2)
+        self.assertTrue(all(Path(item["prompt_path"]).is_file() for item in manual_branches))
+        self.assertTrue(all(item["full_flow"] and item["continuation_choice"]["finalConfirmationRequired"]
+                            for item in manual_branches))
+        with WorkflowStore(self.state) as store:
+            self.assertEqual(store.get_job(self.job_id)["status"], "needs_review")
+            self.assertIsNone(store.find_effect(self.job_id, "main-document", "document-publish"))
+            for item in manual_branches:
+                effect = store.find_effect(self.job_id, item["artifact"], "manual-handoff")
+                self.assertEqual(effect["status"], "prepared")
+                self.assertIsNone(store.find_effect(self.job_id, item["artifact"], "bridge-submit"))
+
     def test_v2_receipts_preserve_evidence_and_resume_without_fabricating_legacy_verification(self):
         bridge = FakeBridge()
 
@@ -890,6 +919,32 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["document_delivery"]["document_id"], "doc_test_123")
         for path in (self.state / "jobs" / self.job_id / "analysis").iterdir():
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_manual_image_wait_is_pending_and_not_business_success(self):
+        def awaiting_image(**_kwargs):
+            return {"status": "awaiting_manual", "source": "manual-handoff",
+                    "reason_code": "manual-image-candidate-missing"}
+
+        with WorkflowStore(self.state) as store:
+            lease = store.acquire_lease(self.job_id, "manual-image-wait-test")
+            job = store.get_job(self.job_id)
+            snapshot = Path(job["payload"]["inputs"]["source.md"]["path"]).parent
+            root = worker._artifact_root(self.state, self.job_id)
+            result = worker._advance_delivery(
+                store=store, lease=lease, payload=job["payload"], root=root,
+                snapshot=snapshot, candidate={"status": "candidate_ready"},
+                document_delivery={"status": "confirmed", "document_id": "doc_test_123"},
+                image_delivery_fn=awaiting_image, notification_fn=fake_notifications,
+            )
+            self.assertEqual(result["status"], "waiting", result)
+            self.assertFalse(result["delivery_complete"])
+            self.assertEqual(result["awaiting_manual"]["status"], "awaiting_manual")
+            self.assertEqual(result["stage"], "image-generation")
+            job = store.get_job(self.job_id)
+            self.assertEqual(job["status"], "waiting")
+            self.assertEqual(next(item for item in store.artifacts(self.job_id)
+                                  if item["artifact_key"] == "core-image")["status"], "pending")
+            self.assertIsNone(store.find_effect(self.job_id, "core-image", "image-generate"))
 
     def test_sequential_bridge_waits_renew_lease_before_a_competing_worker_can_take_over(self):
         now = [1000.0]

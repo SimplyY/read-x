@@ -29,6 +29,7 @@ import run_isolated_analyses as isolated
 import long_read_document_supplement as document_supplement
 import long_read_document_assembler as document_assembler
 import long_read_workflow_notifications as workflow_notifications
+import long_read_manual_handoff as manual_handoff
 
 
 CALLER = "read-x:long-read-text"
@@ -224,6 +225,69 @@ def _store_receipt(output: Path, receipt_path: Path, body: str, *, request_id: s
     return record
 
 
+def _manual_receipt_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".manual.receipt.json")
+
+
+def _manual_candidate_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".manual-candidate.json")
+
+
+def _read_manual_receipt(output: Path, effect: dict, *, prompt_sha: str,
+                         source_sha: str, binding: dict) -> tuple[str, dict] | None:
+    try:
+        body_bytes = _read_bytes(output)
+        record = json.loads(_read_bytes(_manual_receipt_path(output)).decode("utf-8"))
+    except (FileNotFoundError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    body_sha = hashlib.sha256(body_bytes).hexdigest()
+    if (record.get("schema") != "read-x-manual-branch-receipt/v1"
+            or record.get("status") != "business-validated"
+            or record.get("handoffId") != effect["request_id"]
+            or record.get("promptSha256") != prompt_sha
+            or record.get("sourceSha256") != source_sha
+            or record.get("normalizedSha256") != body_sha
+            or record.get("evidenceLevel") != "user-asserted"
+            or record.get("callerLabel") != manual_handoff.CALLER_LABEL
+            or any(record.get(key) != value for key, value in binding.items())
+            or any(key in record for key in ("verification", "submissionConfirmed", "conversationUrl", "conversation_url"))):
+        return None
+    for item in record.get("files", []):
+        try:
+            path = Path(item["path"])
+            candidate_id = record.get("candidateId")
+            expected_dir = (output.parent / "manual-results" / output.stem / str(candidate_id)).absolute()
+            if path.parent.absolute() != expected_dir:
+                return None
+            raw = _read_bytes(path)
+        except (KeyError, FileNotFoundError, ValueError):
+            return None
+        if hashlib.sha256(raw).hexdigest() != item.get("sha256"):
+            return None
+    return body_bytes.decode("utf-8"), record
+
+
+def _branch_effect(store: WorkflowStore, job_id: str, artifact_key: str) -> dict | None:
+    manual = store.find_effect(job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+    if manual is not None:
+        return manual
+    return store.find_effect(job_id, artifact_key, "bridge-submit")
+
+
+def _read_branch_receipt(store: WorkflowStore, job_id: str, artifact_key: str,
+                         output: Path, source_sha: str, effect: dict) -> tuple[str, dict] | None:
+    if effect.get("action") == manual_handoff.MANUAL_ACTION:
+        job = store.get_job(job_id)
+        binding = manual_handoff.binding_for_job(job, artifact_key, prompt_sha=effect["request_sha256"])
+        return _read_manual_receipt(
+            output, effect, prompt_sha=effect["request_sha256"],
+            source_sha=source_sha, binding=binding,
+        )
+    return _read_local_receipt(
+        *_receipt_paths(output), effect["request_id"], effect["request_sha256"], source_sha,
+    )
+
+
 def _write_document_candidate(*, store: WorkflowStore, job_id: str, root: Path,
                               input_sha: str, markdown: str, xml: str) -> dict:
     directory = root / "document"
@@ -287,7 +351,7 @@ def _mark_artifact(store: WorkflowStore, lease: Lease, artifact_key: str, status
     store.set_artifact(lease, artifact_key, status, metadata=metadata)
 
 
-def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
+def _run_bridge_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
                      artifact_key: str, output: Path, source_sha: str, prompt: str,
                      validate, prompt_assets: list[dict] | None = None, prompt_sha: str | None = None,
                      bridge_fn=run_bridge, observe_fn=observe_bridge, context_pack_delivery=None) -> dict:
@@ -447,9 +511,287 @@ def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLoc
             "business_validation_status": "succeeded", "human_confirmed": bridge_result.get("humanConfirmed") is True}
 
 
+def _manual_package_result(artifact_key: str, prepared: dict) -> dict:
+    record = prepared.get("record") or {}
+    return {
+        "artifact": artifact_key,
+        "status": "awaiting_manual",
+        "source": "manual-handoff",
+        "handoff_id": prepared.get("handoffId"),
+        "task_id": record.get("taskId"),
+        "stage": record.get("stage"),
+        "artifact_id": record.get("artifactId"),
+        "origin_event_id": record.get("originEventId"),
+        "prompt_path": (prepared.get("privatePaths") or {}).get("prompt"),
+        "attachment_paths": [item.get("path") for item in (prepared.get("privatePaths") or {}).get("attachments", [])],
+        "prompt_sha256": prepared.get("promptSha256") or record.get("promptSha256"),
+        "input_version": record.get("inputVersion"),
+        "source_requirements": record.get("sourceRequirements"),
+        "expires_at": record.get("expiresAt"),
+        "history_dependency": prepared.get("historyDependency"),
+        "full_flow": prepared.get("fullFlow"),
+        "continuation_choice": prepared.get("continuationChoice"),
+        "manual_instructions": prepared.get("manualInstructions"),
+    }
+
+
+def _run_manual_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
+                            state_dir: Path, artifact_key: str, output: Path,
+                            source_sha: str, prompt: str | None, validate,
+                            prompt_assets: list[dict] | None = None,
+                            prompt_sha: str | None = None) -> dict:
+    with lock:
+        job = store.get_job(lease.job_id)
+    if not job:
+        raise ValueError("manual-handoff workflow task is unavailable")
+    with lock:
+        effect = store.find_effect(lease.job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+    prompt_sha = prompt_sha or (effect["request_sha256"] if effect else None)
+    if prompt_sha is None and prompt is not None:
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if prompt_sha is None:
+        raise ValueError(f"manual-handoff Prompt hash is unavailable: {artifact_key}")
+    binding = manual_handoff.binding_for_job(job, artifact_key, prompt_sha=prompt_sha)
+    if prompt is not None and hashlib.sha256(prompt.encode("utf-8")).hexdigest() != prompt_sha and effect:
+        raise ValueError(f"persisted Prompt hash changed for {artifact_key}")
+
+    if effect is None:
+        if prompt is None:
+            return {"artifact": artifact_key, "status": "needs_review",
+                    "source": "manual-handoff", "reason": "manual-prompt-unavailable"}
+        prepared = manual_handoff.prepare_branch(
+            state_dir=state_dir, job=job, artifact_key=artifact_key,
+            prompt_bytes=prompt.encode("utf-8"), source_sha=source_sha,
+            prompt_assets=prompt_assets,
+        )
+        if prepared.get("status") != "prepared":
+            return {"artifact": artifact_key, "status": "needs_review",
+                    "source": "manual-handoff", "reason": prepared.get("reason") or prepared.get("status"),
+                    "handoff_id": prepared.get("handoffId")}
+        handoff_id = prepared["handoffId"]
+        with lock:
+            effect = store.prepare_effect(
+                lease, artifact_key, manual_handoff.MANUAL_ACTION, prompt_sha,
+                request_id=handoff_id,
+            )
+        if effect["request_id"] != handoff_id:
+            raise ValueError("manual-handoff record and workflow effect identities differ")
+        return _manual_package_result(artifact_key, prepared)
+
+    if effect["request_sha256"] != prompt_sha:
+        raise ValueError(f"persisted Prompt hash changed for {artifact_key}")
+    if effect["status"] == "confirmed":
+        receipt = _read_manual_receipt(
+            output, effect, prompt_sha=prompt_sha, source_sha=source_sha, binding=binding,
+        )
+        if receipt is None:
+            return {"artifact": artifact_key, "status": "needs_review",
+                    "source": "manual-handoff", "reason": "manual-validated-receipt-unavailable",
+                    "handoff_id": effect["request_id"]}
+        body, record = receipt
+        validate(body)
+        with lock:
+            _mark_artifact(store, lease, artifact_key, "confirmed")
+        return {"artifact": artifact_key, "status": "confirmed", "source": "manual-handoff",
+                "handoff_id": effect["request_id"], "candidate_id": record["candidateId"],
+                "output_sha256": record["normalizedSha256"], "evidence_level": "user-asserted",
+                "business_validation_status": "succeeded", "human_confirmed": False,
+                "reused": True}
+    if effect["status"] == "uncertain":
+        receipt = _read_manual_receipt(
+            output, effect, prompt_sha=prompt_sha, source_sha=source_sha, binding=binding,
+        )
+        if receipt is not None:
+            body, record = receipt
+            validate(body)
+            success_metadata = {
+                "source": "manual-handoff", "evidence_level": "user-asserted",
+                "candidate_id": record["candidateId"], "raw_sha256": record["rawSha256"],
+                "normalized_sha256": record["normalizedSha256"], "business_validation": "passed",
+            }
+            with lock:
+                store.reconcile_effect(lease, effect["op_key"], "confirmed", metadata=success_metadata)
+                _mark_artifact(store, lease, artifact_key, "confirmed")
+            return {"artifact": artifact_key, "status": "confirmed", "source": "manual-handoff",
+                    "handoff_id": effect["request_id"], "candidate_id": record["candidateId"],
+                    "output_sha256": record["normalizedSha256"], "raw_sha256": record["rawSha256"],
+                    "evidence_level": "user-asserted", "business_validation_status": "succeeded",
+                    "human_confirmed": False, "recovered": True}
+    if effect["status"] == "failed":
+        return {"artifact": artifact_key, "status": "failed", "source": "manual-handoff",
+                "reason": "previous-known-failure", "handoff_id": effect["request_id"]}
+    if effect["status"] not in {"prepared", "uncertain"}:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "manual-effect-state-unsupported", "handoff_id": effect["request_id"]}
+
+    try:
+        handoff = manual_handoff.read_handoff(
+            state_dir=state_dir, handoff_id=effect["request_id"], binding=binding,
+        )
+    except manual_handoff.ManualHandoffError as exc:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": str(exc), "handoff_id": effect["request_id"]}
+    if hashlib.sha256(handoff["promptBytes"]).hexdigest() != prompt_sha:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "manual-handoff-prompt-hash-mismatch", "handoff_id": effect["request_id"]}
+
+    pointer_path = _manual_candidate_path(output)
+    try:
+        pointer = json.loads(_read_bytes(pointer_path).decode("utf-8"))
+    except FileNotFoundError:
+        pointer = None
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "manual-candidate-pointer-invalid", "handoff_id": effect["request_id"]}
+    if pointer is None:
+        waiting = {
+            "status": "prepared", "handoffId": effect["request_id"],
+            "record": handoff["record"], "privatePaths": handoff["privatePaths"],
+        }
+        requirements = handoff["record"].get("sourceRequirements", {})
+        waiting.update({
+            "promptSha256": prompt_sha,
+            "historyDependency": requirements.get("historyDependency"),
+            "fullFlow": requirements.get("fullFlow"),
+            "continuationChoice": requirements.get("continuationChoice"),
+            "manualInstructions": manual_handoff.instructions_for_record(state_dir, handoff["record"]),
+        })
+        return _manual_package_result(artifact_key, waiting)
+    if (pointer.get("schema") != "read-x-manual-candidate-pointer/v1"
+            or pointer.get("handoffId") != effect["request_id"]
+            or any(pointer.get(key) != value for key, value in binding.items())):
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "manual-candidate-binding-mismatch", "handoff_id": effect["request_id"]}
+    try:
+        candidate = manual_handoff.read_candidate(
+            state_dir=state_dir, handoff_id=effect["request_id"],
+            candidate_id=pointer.get("candidateId"), binding=binding,
+        )
+    except manual_handoff.ManualHandoffError as exc:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": str(exc), "handoff_id": effect["request_id"],
+                "candidate_id": pointer.get("candidateId")}
+    raw_bytes = candidate["resultBytes"]
+    if not raw_bytes.strip() and candidate["files"]:
+        return {"artifact": artifact_key, "status": "awaiting_manual", "source": "manual-handoff",
+                "reason": "raw-image-result-awaiting-image-stage-adapter",
+                "handoff_id": effect["request_id"],
+                "candidate_id": candidate["candidate"]["candidateId"],
+                "candidate_files": [{"name": item["name"], "mimeType": item["mimeType"],
+                                     "sha256": item["sha256"]} for item in candidate["files"]],
+                "evidence_level": "user-asserted"}
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "manual-result-not-utf8", "handoff_id": effect["request_id"],
+                "candidate_id": pointer.get("candidateId")}
+    try:
+        body = validate(raw_text)
+    except Exception as exc:
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "business-validation-failed", "validation_error": type(exc).__name__,
+                "handoff_id": effect["request_id"], "candidate_id": pointer.get("candidateId"),
+                "evidence_level": "user-asserted"}
+    if not isinstance(body, str) or not body.strip():
+        return {"artifact": artifact_key, "status": "needs_review", "source": "manual-handoff",
+                "reason": "business-validation-empty-result", "handoff_id": effect["request_id"],
+                "candidate_id": pointer.get("candidateId")}
+
+    if effect["status"] == "prepared":
+        with lock:
+            attempt = store.begin_effect(lease, effect["op_key"])
+        if not attempt["execute"]:
+            raise RuntimeError("prepared manual-handoff effect unexpectedly was not executable")
+    saved_files = manual_handoff.write_candidate_files(
+        output=output, candidate_id=candidate["candidate"]["candidateId"],
+        files=candidate["files"], atomic_write=_atomic_bytes,
+    )
+    body_bytes = body.encode("utf-8")
+    raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+    normalized_sha = hashlib.sha256(body_bytes).hexdigest()
+    receipt = {
+        "schema": "read-x-manual-branch-receipt/v1",
+        "status": "business-validated",
+        **binding,
+        "handoffId": effect["request_id"],
+        "candidateId": candidate["candidate"]["candidateId"],
+        "eventId": candidate["candidate"].get("eventId"),
+        "inputSha256": handoff["record"]["inputSha256"],
+        "promptSha256": prompt_sha,
+        "sourceSha256": source_sha,
+        "rawSha256": raw_sha,
+        "normalizedSha256": normalized_sha,
+        "evidenceLevel": "user-asserted",
+        "sourceClaimSha256": candidate["candidate"].get("sourceClaimSha256"),
+        "files": saved_files,
+        "businessValidation": "passed",
+        "validatedAt": time.time(),
+    }
+    _atomic_bytes(output, body_bytes)
+    _atomic_bytes(_manual_receipt_path(output), (json.dumps(receipt, ensure_ascii=False,
+                  sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    success_metadata = {
+        "source": "manual-handoff", "evidence_level": "user-asserted",
+        "candidate_id": receipt["candidateId"], "raw_sha256": raw_sha,
+        "normalized_sha256": normalized_sha, "business_validation": "passed",
+    }
+    with lock:
+        if effect["status"] == "prepared":
+            store.finish_effect(lease, effect["op_key"], "confirmed", metadata=success_metadata)
+        else:
+            store.reconcile_effect(lease, effect["op_key"], "confirmed", metadata=success_metadata)
+        _mark_artifact(store, lease, artifact_key, "confirmed")
+    return {"artifact": artifact_key, "status": "confirmed", "source": "manual-handoff",
+            "handoff_id": effect["request_id"], "candidate_id": receipt["candidateId"],
+            "output_sha256": normalized_sha, "raw_sha256": raw_sha,
+            "evidence_level": "user-asserted", "business_validation_status": "succeeded",
+            "human_confirmed": False}
+
+
+def _run_text_branch(*, store: WorkflowStore, lease: Lease, lock: threading.RLock,
+                     artifact_key: str, output: Path, source_sha: str, prompt: str | None,
+                     validate, prompt_assets: list[dict] | None = None,
+                     prompt_sha: str | None = None, bridge_fn=run_bridge,
+                     observe_fn=observe_bridge, context_pack_delivery=None,
+                     state_dir: Path | None = None) -> dict:
+    with lock:
+        manual_effect = store.find_effect(lease.job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+        bridge_effect = store.find_effect(lease.job_id, artifact_key, "bridge-submit")
+    # Existing submitted or uncertain browser work remains observation-only.
+    # A merely prepared Bridge request has crossed no external boundary, so a
+    # new task can safely continue through the manual handoff path.
+    if manual_effect is None and bridge_effect is not None and bridge_effect["status"] != "prepared":
+        return _run_bridge_text_branch(
+            store=store, lease=lease, lock=lock, artifact_key=artifact_key,
+            output=output, source_sha=source_sha, prompt=prompt, validate=validate,
+            prompt_assets=prompt_assets, prompt_sha=prompt_sha, bridge_fn=bridge_fn,
+            observe_fn=observe_fn, context_pack_delivery=context_pack_delivery,
+        )
+    if manual_effect is None and bridge_fn is not run_bridge:
+        return _run_bridge_text_branch(
+            store=store, lease=lease, lock=lock, artifact_key=artifact_key,
+            output=output, source_sha=source_sha, prompt=prompt, validate=validate,
+            prompt_assets=prompt_assets, prompt_sha=prompt_sha, bridge_fn=bridge_fn,
+            observe_fn=observe_fn, context_pack_delivery=context_pack_delivery,
+        )
+    if state_dir is None:
+        raise ValueError("manual-handoff requires the durable Read-X state directory")
+    return _run_manual_text_branch(
+        store=store, lease=lease, lock=lock, state_dir=state_dir,
+        artifact_key=artifact_key, output=output, source_sha=source_sha,
+        prompt=prompt, validate=validate, prompt_assets=prompt_assets,
+        prompt_sha=prompt_sha,
+    )
+
+
 def _record_read_x_text_outcome(outcome_recorder, result: dict, duration_ms: int, *,
                                 store: WorkflowStore | None = None, lease: Lease | None = None,
                                 lock: threading.RLock | None = None) -> bool:
+    if result.get("source") == "manual-handoff":
+        # Manual candidates are not Bridge runs and must never enter the
+        # browser-run outcome journal as if a DOM or session receipt existed.
+        return False
     request_id = result.get("request_id")
     if outcome_recorder is None or not request_id:
         return False
@@ -798,17 +1140,25 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
     branches = []
     for name, task in task_map.items():
         output = root / "analysis" / f"{name}.md"
-        effect = store.find_effect(job_id, f"analysis:{name}", "bridge-submit")
-        prompt = isolated.build_task_prompt(task, source, evidence) if effect is None or effect["status"] == "prepared" else None
+        artifact_key = f"analysis:{name}"
+        manual_effect = store.find_effect(job_id, artifact_key, manual_handoff.MANUAL_ACTION)
+        bridge_effect = store.find_effect(job_id, artifact_key, "bridge-submit")
+        effect = manual_effect or (bridge_effect if bridge_effect and bridge_effect["status"] != "prepared" else None)
+        prompt = isolated.build_task_prompt(task, source, evidence) if effect is None else None
         branches.append({"name": name, "artifact_key": f"analysis:{name}", "output": output,
                          "prompt": prompt, "validate": lambda text, task=task: isolated.validate_task_text(task, text),
-                         "prompt_sha": effect["request_sha256"] if effect and prompt is None else None,
-                         "prompt_assets": []})
+                         "prompt_sha": effect["request_sha256"] if effect else None,
+                         "prompt_assets": [{"assetType": "skill", "name": task.name,
+                                            "sha256": task.skill_sha256}]})
     munger_output = root / "analysis" / "munger-analysis.md"
-    munger_effect = store.find_effect(job_id, "analysis:munger-analysis", "bridge-submit")
+    munger_manual_effect = store.find_effect(job_id, "analysis:munger-analysis", manual_handoff.MANUAL_ACTION)
+    munger_bridge_effect = store.find_effect(job_id, "analysis:munger-analysis", "bridge-submit")
+    munger_effect = munger_manual_effect or (
+        munger_bridge_effect if munger_bridge_effect and munger_bridge_effect["status"] != "prepared" else None
+    )
     munger_prompt_error = None
-    if munger_effect and munger_effect["status"] != "prepared":
-        # Recovery observes the exact prior request without fetching or resending live Prompt assets.
+    if munger_effect:
+        # Resume the exact frozen handoff or observe the exact prior Bridge run.
         munger_prompt = None
         assets = []
     else:
@@ -834,19 +1184,23 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                          "error_type": munger_prompt_error})
     elif munger_effect:
         prompt_sha = munger_effect["request_sha256"]
-        local = _read_local_receipt(*_receipt_paths(munger_output), munger_effect["request_id"], prompt_sha, source_sha)
+        local = _read_branch_receipt(
+            store, job_id, "analysis:munger-analysis", munger_output, source_sha, munger_effect,
+        )
         if local:
             body, receipt = local
-            # _read_local_receipt already verifies the persisted original evidence
-            # and the transformed business artifact; do not fabricate a legacy observation.
+            # Reuse only the exact validated artifact and its real source contract.
             _mark_artifact(store, lease, "analysis:munger-analysis", "confirmed")
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
                              "reuse": True, "output": str(munger_output), "status": "confirmed",
-                             "request_id": munger_effect["request_id"]})
+                             "request_id": (munger_effect["request_id"]
+                                            if munger_effect.get("action") == "bridge-submit" else None),
+                             "source": "manual-handoff" if munger_effect.get("action") == manual_handoff.MANUAL_ACTION else None,
+                             "receipt": receipt})
         else:
             branches.append({"name": "munger-analysis", "artifact_key": "analysis:munger-analysis",
                              "output": munger_output,
-                             "prompt": munger_prompt if munger_effect["status"] == "prepared" else None,
+                             "prompt": munger_prompt,
                              "prompt_sha": prompt_sha,
                              "validate": lambda text: text + "\n", "prompt_assets": assets})
     else:
@@ -872,6 +1226,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                 prompt_sha=branch.get("prompt_sha"),
                 bridge_fn=bridge_fn, observe_fn=observe_fn,
                 context_pack_delivery=context_pack_delivery,
+                state_dir=state_dir,
             )
         _record_read_x_text_outcome(
             outcome_recorder, result, round((time.monotonic() - started) * 1000),
@@ -888,7 +1243,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
                 outcomes.append({"name": future_map[future], "status": "needs_review",
                                  "reason": f"{type(exc).__name__}: {exc}"})
     outcomes.sort(key=lambda item: item["name"])
-    unresolved = any(item["status"] == "needs_review" for item in outcomes)
+    unresolved = any(item["status"] in {"needs_review", "awaiting_manual"} for item in outcomes)
     unresolved |= bool(store.connection.execute(
         "SELECT 1 FROM effects WHERE job_id=? AND artifact_key LIKE 'analysis:%' "
         "AND status IN ('attempting','uncertain') LIMIT 1", (job_id,)
@@ -911,13 +1266,12 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             artifact_status = current_artifacts.get(key, {}).get("status")
             if artifact_status == "failed" and name != "article-decode":
                 continue
-            effect = store.find_effect(job_id, key, "bridge-submit")
+            effect = _branch_effect(store, job_id, key)
             if effect is None or effect["status"] != "confirmed":
                 text_inputs_ready = False
                 break
             output = root / "analysis" / f"{name}.md"
-            local = _read_local_receipt(*_receipt_paths(output), effect["request_id"],
-                                        effect["request_sha256"], source_sha)
+            local = _read_branch_receipt(store, job_id, key, output, source_sha, effect)
             if local is None:
                 text_inputs_ready = False
                 break
@@ -928,7 +1282,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         supplement_prompt, supplement_input_sha = document_supplement.build_prompt(
             source=source, evidence=json.loads(evidence), analyses=analysis_texts,
         )
-        supplement_effect = store.find_effect(job_id, "analysis:document-supplement", "bridge-submit")
+        supplement_effect = _branch_effect(store, job_id, "analysis:document-supplement")
         supplement_output = root / "analysis" / "document-supplement.md"
         if supplement_effect and supplement_effect["status"] != "prepared":
             supplement_prompt = None
@@ -941,6 +1295,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             validate=document_supplement.validate_supplement,
             bridge_fn=bridge_fn, observe_fn=observe_fn,
             context_pack_delivery=context_pack_delivery,
+            state_dir=state_dir,
         )
         _record_read_x_text_outcome(
             outcome_recorder, supplement_outcome,
@@ -961,7 +1316,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
             unresolved = True
 
     artifacts = store.artifacts(job_id)
-    unresolved |= any(item["status"] == "needs_review" for item in outcomes)
+    unresolved |= any(item["status"] in {"needs_review", "awaiting_manual"} for item in outcomes)
     retryable_governance_failure = any(
         item["artifact_key"].startswith("analysis:")
         and item["status"] == "failed"
@@ -985,16 +1340,16 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
     if (article_status == "confirmed" and supplement_state == "confirmed" and content_states_resolved
             and munger_resolved and not unresolved_effects):
         article_decode = analysis_texts.get("article-decode")
-        supplement_effect = store.find_effect(job_id, "analysis:document-supplement", "bridge-submit")
+        supplement_effect = _branch_effect(store, job_id, "analysis:document-supplement")
         if article_decode is None or supplement_effect is None or supplement_effect["status"] != "confirmed":
             raise ValueError("verified article or document-supplement receipt is missing")
         supplement_input_sha = document_supplement.input_sha256(
             source=source, evidence=json.loads(evidence),
             analyses={name: body for name, body in analysis_texts.items()},
         )
-        supplement_local = _read_local_receipt(
-            *_receipt_paths(root / "analysis" / "document-supplement.md"),
-            supplement_effect["request_id"], supplement_effect["request_sha256"], supplement_input_sha,
+        supplement_local = _read_branch_receipt(
+            store, job_id, "analysis:document-supplement",
+            root / "analysis" / "document-supplement.md", supplement_input_sha, supplement_effect,
         )
         if supplement_local is None:
             raise ValueError("verified document-supplement local receipt is missing")
@@ -1007,13 +1362,13 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
 
         munger_text = None
         munger_receipt = None
-        munger_effect = store.find_effect(job_id, "analysis:munger-analysis", "bridge-submit")
+        munger_effect = _branch_effect(store, job_id, "analysis:munger-analysis")
         if munger_state == "confirmed":
             if munger_effect is None or munger_effect["status"] != "confirmed":
-                raise ValueError("Munger branch confirmation has no matching Bridge effect")
-            munger_local = _read_local_receipt(
-                *_receipt_paths(root / "analysis" / "munger-analysis.md"),
-                munger_effect["request_id"], munger_effect["request_sha256"], source_sha,
+                raise ValueError("Munger branch confirmation has no matching verified source effect")
+            munger_local = _read_branch_receipt(
+                store, job_id, "analysis:munger-analysis",
+                root / "analysis" / "munger-analysis.md", source_sha, munger_effect,
             )
             if munger_local is None:
                 raise ValueError("confirmed Munger branch has no matching local receipt")
@@ -1092,6 +1447,7 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
     needs_review = unresolved or retryable_governance_failure or required_analysis_unresolved
     store.set_status(lease, "needs_review" if needs_review else "waiting")
     if needs_review:
+        awaiting_manual = any(item.get("status") == "awaiting_manual" for item in outcomes)
         document_review_notification = None
         if document_delivery and document_delivery.get("status") in {"needs_review", "uncertain"}:
             document_review_notification = _notify(
@@ -1128,7 +1484,8 @@ def _advance_claimed_job(store: WorkflowStore, lease: Lease, state_dir: Path, *,
         return {
             "status": "needs_review", "job_id": job_id, "delivery_complete": False,
             "content_branches": outcomes, "elapsed_seconds": round(time.monotonic() - started, 3),
-            "next_stage": "resolve_content_recovery", "document_candidate": candidate_result,
+            "next_stage": "await_manual_result" if awaiting_manual else "resolve_content_recovery",
+            "awaiting_manual": awaiting_manual, "document_candidate": candidate_result,
             "document_delivery": document_delivery,
             "document_review_notification": document_review_notification,
             "content_review_notification": content_review_notification,
@@ -1394,6 +1751,12 @@ def _advance_delivery(*, store: WorkflowStore, lease: Lease, payload: dict, root
                 image_index=image_index, image_delivery_fn=image_delivery_fn, clock=clock,
             )
             state = outcome.get("status")
+            if state == "awaiting_manual":
+                store.set_status(lease, "waiting")
+                return _delivery_result(
+                    store, job_id, "waiting", stage="image-generation", image=image_key,
+                    awaiting_manual=outcome,
+                )
             if state in {"retry_scheduled", "failed"}:
                 latest = next(item for item in store.artifacts(job_id) if item["artifact_key"] == image_key)
                 metadata = latest.get("metadata", {})
@@ -1516,7 +1879,7 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
             return {"status": "blocked", "job_id": job_id, "delivery_complete": False,
                     "reason_code": admission_issue}
         context_only = payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION
-        if context_only and job["status"] in {"succeeded", "failed"}:
+        if context_only and job["status"] in {"succeeded", "failed", "expired"}:
             from long_read_context_packs import context_result
             return {"status": job["status"], "job_id": job_id, **context_result(job, store.artifacts(job_id))}
         lease = store.acquire_lease(job_id, owner, lease_seconds)
@@ -1558,15 +1921,20 @@ def process_job(state_dir: Path, job_id: str, *, owner: str = "read-x-worker", l
 def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x-worker",
              manual_document_id: str | None = None, outcome_recorder=None, context_only: bool = False) -> dict:
     state_dir = Path(state_dir).absolute()
+    retention = _sweep_manual_handoff_retention(state_dir)
+
+    def with_retention(result: dict) -> dict:
+        return {**result, **retention}
+
     if job_id:
-        return process_job(state_dir, job_id, owner=owner, manual_document_id=manual_document_id,
-                           outcome_recorder=outcome_recorder)
+        return with_retention(process_job(state_dir, job_id, owner=owner, manual_document_id=manual_document_id,
+                                          outcome_recorder=outcome_recorder))
     if manual_document_id is not None:
-        return {"status": "blocked", "delivery_complete": False,
-                "reason_code": "manual-document-id-requires-job-id"}
+        return with_retention({"status": "blocked", "delivery_complete": False,
+                               "reason_code": "manual-document-id-requires-job-id"})
     db = state_dir / "workflow.sqlite3"
     if not db.is_file() or db.is_symlink():
-        return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
+        return with_retention({"status": "idle", "jobs_processed": 0, "delivery_complete": False})
     with WorkflowStore(state_dir) as store:
         now = time.time()
         jobs = store.list_jobs()
@@ -1576,8 +1944,25 @@ def run_once(state_dir: Path, *, job_id: str | None = None, owner: str = "read-x
         candidates = context_jobs if context_only else context_jobs + [job for job in jobs if job["job_id"] not in context_ids]
         selected = next((job["job_id"] for job in candidates if _job_is_due(store, job, now)), None)
     if selected is None:
-        return {"status": "idle", "jobs_processed": 0, "delivery_complete": False}
-    return process_job(state_dir, selected, owner=owner, outcome_recorder=outcome_recorder)
+        return with_retention({"status": "idle", "jobs_processed": 0, "delivery_complete": False})
+    return with_retention(process_job(state_dir, selected, owner=owner, outcome_recorder=outcome_recorder))
+
+
+def _sweep_manual_handoff_retention(state_dir: Path) -> dict:
+    try:
+        retention = manual_handoff.prune_handoffs(state_dir=state_dir)
+        if not isinstance(retention, dict) or any(type(retention.get(key)) is not int or retention[key] < 0
+                                                   for key in ("pruned", "skipped")):
+            raise ValueError("manual-handoff-retention-result-invalid")
+        status = "incomplete" if retention["skipped"] else "complete"
+        if status == "incomplete":
+            print(json.dumps({"event": "manual-handoff-retention-sweep-incomplete",
+                              "skipped": retention["skipped"]}), file=sys.stderr)
+        return {"retention_status": status, "retention_pruned": retention["pruned"],
+                "retention_skipped": retention["skipped"]}
+    except Exception:
+        print('{"event":"manual-handoff-retention-sweep-failed"}', file=sys.stderr)
+        return {"retention_status": "failed", "retention_pruned": 0, "retention_skipped": 0}
 
 
 def _job_is_due(store: WorkflowStore, job: dict, now: float) -> bool:
@@ -1587,7 +1972,7 @@ def _job_is_due(store: WorkflowStore, job: dict, now: float) -> bool:
             payload, app_id=admitted.get("app_id") if admitted else None,
             source_message_id=admitted.get("source_message_id") if admitted else None):
         return False
-    if job["status"] in {"succeeded", "failed"}:
+    if job["status"] in {"succeeded", "failed", "expired"}:
         return False
     row = store.connection.execute(
         "SELECT lease_expires_at FROM jobs WHERE job_id=?", (job["job_id"],)
