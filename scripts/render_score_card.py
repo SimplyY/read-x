@@ -15,53 +15,6 @@ DIMENSIONS = (
     ("insight_explanatory", "洞察解释"),
     ("transfer_durability", "长期迁移"),
 )
-IMPORTANCE_LABEL = "权威性与大问题思考"
-
-AUTHORITY_STATUS_LABELS = {
-    "verified": "已核验",
-    "corroborated": "搜索交叉",
-    "inferred": "基于常识推断（上限 8）",
-    "not_run": "搜索未执行",
-    "search_unavailable": "搜索不可用",
-    "insufficient_evidence": "证据不足",
-    "source_missing": "未提供出处",
-    "fetch_failed": "暂不可达",
-    "mismatch": "未匹配",
-    "rejected": "已拒绝",
-}
-
-AUTHORITY_REASON_DEFAULTS = {
-    "entity_missing": "身份包没有可消歧实体",
-    "entity_or_topic_mismatch": "搜索证据显示实体或主题不匹配",
-    "insufficient_authority_evidence": "身份或主题信息存在，但核验证据不足",
-    "search_not_run": "搜索未执行，没有可核验证据",
-    "search_no_results": "搜索已执行但没有返回结果",
-    "search_unavailable": "搜索桥不可用，未产生可核验证据",
-    "evidence_insufficient_inferred": "搜索证据不足以核验，按保守推断处理",
-    "source_account_only_inferred": "来源只是账号署名，未确认人物或机构身份",
-    "invalid_identity_packet": "身份包不符合受控契约",
-    "invalid_search_observation": "搜索观察不符合受控契约",
-    "authority_artifact_missing": "未提供权威核验产物",
-    "invalid_artifact": "权威核验产物不合法",
-    "model_knowledge_inferred": "只有常识推断，没有可核验出处",
-}
-
-AUTHORITY_REMEDIATION = {
-    "entity_missing": "已尝试从来源标题、作者和发布机构提取身份；未臆造实体，权威分保持不可用",
-    "entity_or_topic_mismatch": "已完成受限核验；不采用不匹配结果",
-    "insufficient_authority_evidence": "已完成受限核验；不把证据不足当作权威",
-    "search_not_run": "已失败关闭；需重新执行权威搜索",
-    "search_no_results": "已执行真实搜索；结果为空时不冒充核验",
-    "search_unavailable": "已尝试搜索；服务恢复后可重试",
-    "evidence_insufficient_inferred": "已保留真实结果；证据级别不足时保持低置信推断",
-    "source_account_only_inferred": "来源账号未提升为人物或机构；分数保持保守上限",
-    "invalid_identity_packet": "已失败关闭；需重新生成身份包",
-    "invalid_search_observation": "已失败关闭；需重新生成搜索观察",
-    "authority_artifact_missing": "已阻止交付；需先完成权威核验",
-    "invalid_artifact": "已失败关闭；需重新生成合法核验产物",
-    "model_knowledge_inferred": "已使用知识兜底；按规则保持低置信度并限制上限",
-}
-
 ISSUE_REMEDIATION = {
     "source_status is not complete": "补充完整正文后重试",
     "isolated_retry_required": "按规则重新执行一次隔离重评",
@@ -96,22 +49,9 @@ def _dimension_text(result: dict, keys: tuple[tuple[str, str], ...]) -> str:
 
 def _importance_text(result: dict) -> str:
     dimensions = result.get("importance_dimensions") or {}
-    authority = dimensions.get("authority_score")
     problem = dimensions.get("problem_significance_score")
     fmt = lambda value: f"{value:.1f}" if isinstance(value, (int, float)) else "不可用"
-    if isinstance(authority, (int, float)) and not isinstance(authority, bool):
-        authority_text = fmt(authority)
-    else:
-        status = dimensions.get("authority_status") or result.get("authority_status")
-        authority_text = AUTHORITY_STATUS_LABELS.get(status, "待核验")
-    status = dimensions.get("authority_status") or result.get("authority_status")
-    status_text = AUTHORITY_STATUS_LABELS.get(status, "待核验")
-    suffix = "" if authority_text == status_text else f"（{status_text}）"
-    return f"**权威性**  {authority_text}{suffix}\n**大问题思考**  {fmt(problem)}"
-
-
-def _importance_label(result: dict) -> str:
-    return IMPORTANCE_LABEL if isinstance((result.get("importance_dimensions") or {}).get("authority_score"), (int, float)) else "大问题思考"
+    return f"**大问题思考**  {fmt(problem)}"
 
 
 def _compact(value: object, limit: int = 240) -> str:
@@ -148,19 +88,6 @@ def _status_notes(result: dict) -> str:
         else:
             notes.append(f"兴趣 {result.get('interest_label') or '不可用'}：没有可用的兴趣评分")
 
-    dimensions = result.get("importance_dimensions") or {}
-    status = dimensions.get("authority_status") or result.get("authority_status")
-    if status not in {"verified", "corroborated"}:
-        code = dimensions.get("authority_reason_code") or result.get("authority_reason_code") or ""
-        reason = _compact(dimensions.get("authority_rationale") or result.get("authority_rationale"))
-        reason = reason or AUTHORITY_REASON_DEFAULTS.get(code, "权威核验证据不足")
-        remediation = AUTHORITY_REMEDIATION.get(code, "已失败关闭；需补充证据后重试")
-        observation = dimensions.get("search_observation") or {}
-        attempt = ""
-        if isinstance(observation, dict) and isinstance(observation.get("query_count"), int) and isinstance(observation.get("result_count"), int):
-            attempt = f"；核验记录：搜索 {observation['query_count']} 次，得到 {observation['result_count']} 条结果"
-        notes.append(f"权威性 {AUTHORITY_STATUS_LABELS.get(status, '待核验')}：{reason}；{remediation}{attempt}")
-
     return "**情况说明**\n" + "\n".join(f"- {note}" for note in notes) if notes else ""
 
 
@@ -184,9 +111,6 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
         raise ValueError("needs_relevance is internal and cannot be rendered")
     if status not in {"scored", "needs_full_text", "needs_review"}:
         raise ValueError(f"unsupported score_status: {status}")
-    if status == "scored" and result.get("authority_reason_code") == "authority_artifact_missing":
-        raise ValueError("authority verification artifact is required before rendering a score card")
-
     subtitle = " · ".join(value for value in (author, date) if value)
     if status != "scored":
         message = "需要完整正文后才能评分。" if status == "needs_full_text" else "评分证据或校准冲突，需要人工复核。"
@@ -211,7 +135,7 @@ def render_card(result: dict, *, title: str, author: str, date: str, url: str, s
             "margin": "0px 0px 12px 0px",
             "columns": [
                 _metric("质量", f"{result['quality_score']:.1f}"),
-                _metric(_importance_label(result), importance_value),
+                _metric("大问题思考", importance_value),
                 _metric(relevance_label, relevance_value),
                 _metric(interest_label, interest_value),
                 _metric("决策", f"{result['decision_score']:.1f}"),

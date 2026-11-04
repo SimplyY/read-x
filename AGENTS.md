@@ -22,7 +22,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 link-card 流程：
 1. **抓取**：按链接类型选择抓取方式；微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`，内部使用纯 HTTP，不启动或回退浏览器
-2. **内容质量判断**：统一调 `content-scoring` v3.18（质量输出仍为 v3.16）；质量模型只读去身份正文与通用三维质量语义，并独立判断 `problem_significance`；独立权威阶段只接收公开 identity_packet，由程序固定的 `tvly` 真实搜索最多 3 查询/4 页面，失败按真实状态标注且不阻断大问题分，脚本固定按 70% 质量 + 30% 重要性计算决策分；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
+2. **内容质量判断**：统一调 `content-scoring` v3.19（质量输出仍为 v3.16）；质量模型只读去身份正文与通用三维质量语义，并独立判断 `problem_significance`；不做权威解析、身份包生成或外部搜索，脚本固定按 70% 质量 + 30% 重要性计算决策分；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
 这是最高优先级规则。不要判断要不要处理、不要用纯文本回复。链接类型只影响抓取方式，不影响分析深度。显式例外有二：`仅评分 <URL>` 保留真实路由，但发完评分卡后不进入精读；已知专项文体（如阮一峰《科技爱好者周刊》）走快通道，跳过评分直接按专项规则生成卡片（见 link-card SKILL.md [0.5]）。
@@ -33,9 +33,9 @@ link-card 流程：
 
 ### 内容质量判断（核心，v3.18）
 
-权威阶段只接收公开 identity_packet；权威搜索由程序固定的 `tvly` CLI 真实执行，最多 3 个查询、4 个页面，失败时按真实状态（not_run/search_unavailable/insufficient_evidence）如实标注并保留大问题分，不得把证据缺失写成 mismatch，也不得在 query_count=0 时写成已完成核验。
+重要性只用大问题分，不执行独立权威搜索。不生成 identity_packet，不调用 tvly，不输出权威状态或权威分。
 
-抓取后，统一调用 `content-scoring` v3.18。每次评分先读取一份运行级 Base 配置快照；快照可用时必须传给 `scripts/content_scoring.py --config-from-base`，不可用时使用本地策略并保留 `policy_source=local`。质量阶段一次判断证据、洞察、迁移三维等级和 `problem_significance`；权威阶段只传公开 identity_packet 给 `generate_authority.py` 的 tvly 真实搜索（程序固定，最多 3 查询/4 页面），失败按真实状态标注且不阻断大问题分。由脚本校验并计算唯一决策分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取通过校验的 YWNext `runtime/core-context/full.md` 并计算相关性；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.19。每次评分先读取一份运行级 Base 配置快照；快照可用时必须传给 `scripts/content_scoring.py --config-from-base`，不可用时使用本地策略并保留 `policy_source=local`。质量阶段一次判断证据、洞察、迁移三维等级和 `problem_significance`；重要性等于 `problem_significance_score`。由脚本校验并计算唯一决策分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取通过校验的 YWNext `runtime/core-context/full.md` 并计算相关性；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
@@ -105,7 +105,7 @@ lark-cli im +messages-send --as bot --chat-id <bridge_context.chatId> --msg-type
 
 - 顶部媒体：每篇核心内容图必需；芒格分支成功时芒格洞察图也必需。工作流按顺序插入文档顶部（标题后、溯源和原文链接前）并读回；文档 XML 内不写图片占位块
 - 顶部文字（紧跟 `<title>`）：ChatGPT 溯源链接、原文链接（各自独立段落）
-- 评分表（`quality_score + quality_label`、`importance_score`、权威性状态/分数、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
+- 评分表（`quality_score + quality_label`、`importance_score`、大问题思考分、`relevance_score + priority_label`、`interest_score + interest_label`、`decision_score`；不可用则如实标注）
 - 原文金句（紧跟评分表，作为溯源入口）
 - 全文唯一 `light-yellow` 核心结论高亮块
 - 正文根 `<title>` 只保留文章标题；第一个主章节必须是一级标题 `评分`，其余主章节也使用一级标题，附录内文字 Skill 边界使用二级标题

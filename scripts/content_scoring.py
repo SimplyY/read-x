@@ -3,7 +3,6 @@
 
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
-    --importance-output importance.json \
     [--retry-quality-output retry.json] \
     [--relevance-output relevance.json --context context.md] \
     [--config-from-base <base-config.json>]
@@ -310,98 +309,6 @@ def _validate_problem_significance(item, claim_ids: set[str]) -> list[str]:
     return errors
 
 
-def _validate_importance_output(output: dict) -> tuple[dict | None, list[str]]:
-    """Validate optional provenance evidence without blocking problem significance."""
-    if output is None:
-        return {
-            "authority_score": None,
-            "evidence": [],
-            "confidence": "partial",
-            "authority_confidence": "partial",
-            "authority_status": "source_missing",
-            "reason_code": "authority_artifact_missing",
-            "rationale": "未提供权威核验产物",
-        }, ["authority_artifact_missing"]
-    if not isinstance(output, dict):
-        return {
-            "authority_score": None,
-            "evidence": [],
-            "confidence": "partial",
-            "authority_confidence": "partial",
-            "authority_status": "rejected",
-            "reason_code": "invalid_artifact",
-            "rationale": "权威核验产物不是对象",
-        }, ["authority_artifact_rejected"]
-    errors = []
-    if output.get("schema_version") != SCORE_VERSION:
-        errors.append(f"importance schema_version must be {SCORE_VERSION}")
-    authority = output.get("authority_score")
-    if authority is not None and (isinstance(authority, bool) or not isinstance(authority, (int, float)) or Decimal(str(authority)) not in DIMENSION_SCORES):
-        errors.append("authority_score is invalid")
-    status = output.get("authority_status")
-    if status not in {"verified", "corroborated", "inferred", "not_run", "search_unavailable", "insufficient_evidence", "source_missing", "fetch_failed", "mismatch", "rejected"}:
-        errors.append("authority_status is invalid")
-    if status in {"verified", "corroborated", "inferred"} and authority is None:
-        errors.append(f"{status} authority requires authority_score")
-    if status not in {"verified", "corroborated", "inferred"} and authority is not None:
-        errors.append(f"{status} authority must not include authority_score")
-    if status == "inferred" and authority is not None and authority > 8:
-        errors.append("inferred authority_score must be <= 8")
-    reason_code = output.get("reason_code")
-    if not _nonempty(reason_code):
-        errors.append("authority reason_code is required")
-    evidence = output.get("evidence")
-    if not isinstance(evidence, list) or any(not isinstance(item, dict) for item in evidence):
-        errors.append("importance evidence must be an array")
-        evidence = []
-    else:
-        # v3.18 uses evidence_kind/title; normalize once at this trust boundary
-        # so old v3.17 consumers cannot reject the new authority artifact.
-        evidence = [
-            {**item, "kind": item.get("kind", item.get("evidence_kind")), "label": item.get("label") or item.get("title", "")}
-            for item in evidence
-        ]
-    verified = [item for item in evidence if item.get("verified") is True]
-    for index, item in enumerate(evidence):
-        if item.get("kind") not in {"publisher", "author", "interview", "primary_source", "self_assertion", "identity", "expertise", "event", "provenance"}:
-            errors.append(f"importance evidence[{index}].kind is invalid")
-        if not _nonempty(item.get("label", item.get("title", ""))):
-            errors.append(f"importance evidence[{index}].label is required")
-        parsed_url = urlparse(str(item.get("url", "")))
-        if item.get("verified") is True and (parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc):
-            errors.append(f"importance evidence[{index}].url is required for verified evidence")
-    if isinstance(authority, (int, float)) and not isinstance(authority, bool):
-        if authority >= 9 and (len(verified) < 2 or not any(item.get("kind") in {"interview", "primary_source", "event"} or item.get("source_level") == "official" for item in verified)):
-            errors.append("authority_score>=9 requires two verified sources including interview or primary_source")
-        elif authority > 6 and not verified and status != "inferred":
-            errors.append("authority_score>6 requires verified evidence")
-    if output.get("confidence") not in {"high", "medium", "low", "partial", "unavailable"}:
-        errors.append("importance confidence is invalid")
-    if not _nonempty(output.get("rationale")):
-        errors.append("importance rationale is required")
-    if errors:
-        return {
-            "authority_score": None,
-            "evidence": evidence,
-            "confidence": "unavailable",
-            "authority_status": "rejected",
-            "reason_code": "invalid_artifact",
-            "rationale": "；".join(errors),
-        }, errors + ["authority_artifact_rejected"]
-    return {
-        "authority_score": round1(authority) if authority is not None else None,
-        "evidence": evidence,
-        "confidence": output.get("authority_confidence", output["confidence"]),
-        "authority_confidence": output.get("authority_confidence", output["confidence"]),
-        "rationale": output["rationale"],
-        "authority_status": status,
-        "reason_code": reason_code,
-        "entity": output.get("entity"),
-        "topic_match": output.get("topic_match", "unknown"),
-        "search_observation": output.get("search_observation", {}),
-    }, []
-
-
 def _quality_attempt(output: dict, source_text: str) -> dict:
     if not isinstance(output, dict):
         raise ValueError("quality output must be an object")
@@ -596,7 +503,6 @@ def score(
     relevance_output=None,
     context_text=None,
     relevance_unavailable=False,
-    importance_output=None,
 ):
     if not isinstance(source_text, str):
         return _needs_result("needs_review", content_fingerprint(""), ["source text must be a string"])
@@ -653,43 +559,12 @@ def score(
     threshold = float(POLICY["route"]["long_read_threshold"])
     chatgpt_threshold = float(POLICY["route"].get("chatgpt_munger_threshold", 8.3))
     relevance_needed = quality_score >= floor
-    authority, importance_issues = _validate_importance_output(importance_output)
     importance_score = problem["score"]
-    importance_confidence = "partial"
+    importance_confidence = "high"
     importance_dimensions = {
-        "authority_score": None,
         "problem_significance_score": problem["score"],
-        "evidence": [],
-        "authority_rationale": authority.get("rationale"),
-        "authority_status": authority["authority_status"],
-        "authority_reason_code": authority["reason_code"],
-        "authority_confidence": authority.get("authority_confidence", authority.get("confidence", "partial")),
-        "entity": authority.get("entity"),
-        "topic_match": authority.get("topic_match", "unknown"),
-        "search_observation": authority.get("search_observation", {}),
         "problem_significance_rationale": problem["rationale"],
     }
-    issues += importance_issues
-    if authority is not None and authority["authority_score"] is not None:
-        importance_score = round1((Decimal(str(authority["authority_score"])) + Decimal(str(problem["score"]))) / Decimal("2"))
-        # The combined importance is only fully confident when both axes are
-        # backed by high-confidence authority evidence; inferred/corroborated
-        # authority remains a partial aggregate rather than leaking low/medium
-        # authority labels into the public importance contract.
-        importance_confidence = "high" if authority["confidence"] == "high" else "partial"
-        importance_dimensions = {
-            "authority_score": authority["authority_score"],
-            "problem_significance_score": problem["score"],
-            "evidence": authority["evidence"],
-            "authority_rationale": authority["rationale"],
-            "problem_significance_rationale": problem["rationale"],
-            "authority_status": authority["authority_status"],
-            "authority_reason_code": authority["reason_code"],
-            "authority_confidence": authority.get("authority_confidence", authority.get("confidence", "partial")),
-            "entity": authority.get("entity"),
-            "topic_match": authority.get("topic_match", "unknown"),
-            "search_observation": authority.get("search_observation", {}),
-        }
     if relevance_needed and relevance_output is None and not relevance_unavailable:
         return {
             "score_version": SCORE_VERSION,
@@ -704,8 +579,6 @@ def score(
             "importance_score": importance_score,
             "importance_confidence": importance_confidence,
             "importance_dimensions": importance_dimensions,
-            "authority_status": authority["authority_status"],
-            "authority_reason_code": authority["reason_code"],
             "relevance_score": None,
             "relevance_confidence": "unavailable",
             "decision_score": None,
@@ -763,8 +636,6 @@ def score(
         "quality_confidence": quality_confidence,
         "importance_score": importance_score,
         "importance_confidence": importance_confidence,
-        "authority_status": authority["authority_status"],
-        "authority_reason_code": authority["reason_code"],
         "relevance_score": relevance_score,
         "interest_score": interest_score,
         "relevance_confidence": relevance_confidence,
@@ -813,8 +684,6 @@ def main():
     parser.add_argument("quality_output", nargs="?")
     parser.add_argument("source", nargs="?")
     parser.add_argument("--retry-quality-output")
-    parser.add_argument("--importance-output",
-                        help="Required validated authority-verification artifact")
     parser.add_argument("--relevance-output")
     parser.add_argument("--context")
     parser.add_argument("--relevance-unavailable", action="store_true")
@@ -825,8 +694,6 @@ def main():
     args = parser.parse_args()
     if args.self_check:
         return 0 if self_check() else 1
-    if not args.importance_output:
-        parser.error("--importance-output is required")
     if args.config_from_base:
         try:
             _reload_policy(args.config_from_base)
@@ -846,7 +713,6 @@ def main():
         _read_json(args.relevance_output) if args.relevance_output else None,
         Path(args.context).read_text(encoding="utf-8") if args.context else None,
         args.relevance_unavailable,
-        _read_json(args.importance_output) if args.importance_output else None,
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.output:

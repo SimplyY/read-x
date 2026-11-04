@@ -242,14 +242,12 @@ def test_cli_invalid_base_config_falls_back_to_local_policy():
         source_path = root / "source.md"
         config_path = root / "base-config.json"
         output_path = root / "score.json"
-        importance_path = root / "importance.json"
         quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
         source_path.write_text(SOURCE, encoding="utf-8")
-        importance_path.write_text(json.dumps(importance(8.0), ensure_ascii=False), encoding="utf-8")
         config_path.write_text("{not-json", encoding="utf-8")
         result = subprocess.run(
             [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-             "--importance-output", str(importance_path), "--config-from-base", str(config_path),
+             "--config-from-base", str(config_path),
              "--relevance-unavailable", "--output", str(output_path)],
             capture_output=True, text=True, check=False,
         )
@@ -265,14 +263,12 @@ def test_cli_incomplete_base_config_falls_back_to_local_policy():
         source_path = root / "source.md"
         config_path = root / "base-config.json"
         output_path = root / "score.json"
-        importance_path = root / "importance.json"
         quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
         source_path.write_text(SOURCE, encoding="utf-8")
-        importance_path.write_text(json.dumps(importance(8.0), ensure_ascii=False), encoding="utf-8")
         config_path.write_text("{}", encoding="utf-8")
         result = subprocess.run(
             [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-             "--importance-output", str(importance_path), "--config-from-base", str(config_path),
+             "--config-from-base", str(config_path),
              "--relevance-unavailable", "--output", str(output_path)],
             capture_output=True, text=True, check=False,
         )
@@ -288,16 +284,14 @@ def test_cli_malformed_base_band_falls_back_to_local_policy():
         source_path = root / "source.md"
         config_path = root / "base-config.json"
         output_path = root / "score.json"
-        importance_path = root / "importance.json"
         malformed = policy_sync.rebuild_policy(valid_base_records())
         malformed["quality_bands"] = [{"minimum": "bad"}]
         quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
         source_path.write_text(SOURCE, encoding="utf-8")
-        importance_path.write_text(json.dumps(importance(8.0), ensure_ascii=False), encoding="utf-8")
         config_path.write_text(policy_sync._dump(malformed), encoding="utf-8")
         result = subprocess.run(
             [sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-             "--importance-output", str(importance_path), "--config-from-base", str(config_path),
+             "--config-from-base", str(config_path),
              "--relevance-unavailable", "--output", str(output_path)],
             capture_output=True, text=True, check=False,
         )
@@ -396,7 +390,7 @@ def test_runtime_contract_prevents_observed_shape_regressions():
     assert "直接选择第一条完整满足的合法 `level`" in runtime
     assert "#### 大问题思考分档语义" in runtime
     assert "文明/系统级影响" in runtime and "至少两条具体干预路径及其取舍" in runtime
-    assert "名人、出版物或宏大标题只影响独立的 `authority_score`" in runtime
+    assert "名人、出版物或宏大标题不能把问题本身抬档" in runtime
     assert "三维必须独立判级" in runtime and "只按自己的通用数值语义判断" in runtime
     assert "锚点只用于评分完成后的外部闭卷回归" in runtime
     assert "规则、注意力、行为" not in runtime
@@ -663,21 +657,13 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert all(quality_runtime.count(f"| {score:.1f} |") >= 3 for score in (6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10))
 
 
-def test_fixed_scoring_tail_cannot_skip_importance_verification():
+def test_fixed_scoring_tail_has_no_authority_stage():
     skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
-    start = skill.rindex("python3 /Users/yuwei/code/read-x/scripts/build_authority_identity.py")
-    end = skill.index("\n```", start)
-    fixed_tail = skill[start:end]
-    assert "verify_source_authority.py" in fixed_tail
-    assert "build_authority_identity.py" in fixed_tail
-    assert "generate_authority.py" in fixed_tail
-    # 真实 tvly 搜索必须无条件执行，不得用 jq 守卫跳过 generate_authority；
-    # 顺序固定：identity -> 真实搜索 -> 确定性核验。
-    assert fixed_tail.index("generate_authority.py") > fixed_tail.index("build_authority_identity.py")
-    assert fixed_tail.index("verify_source_authority.py") > fixed_tail.index("generate_authority.py")
+    fixed_tail = skill[skill.index("```bash"):skill.index("\n```", skill.index("```bash"))]
+    assert "verify_source_authority.py" not in fixed_tail
+    assert "build_authority_identity.py" not in fixed_tail
+    assert "generate_authority.py" not in fixed_tail
     assert "jq -e '.tool_status" not in fixed_tail
-    assert "--identity \"<run_dir>/identity.json\"" in fixed_tail
-    assert "--importance-output" in fixed_tail
 
 
 def test_quality_generator_is_closed_book_and_schema_bound():
@@ -815,7 +801,7 @@ def test_codex_model_runs_schema_bound_current_model():
 def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
     low = {key: 10.0 for key in cs.QUALITY_DIMENSIONS}
     low["evidence_quality"] = 2.0
-    result = cs.score(quality(low), SOURCE, importance_output=importance())
+    result = cs.score(quality(low), SOURCE)
     rendered = card.render_card(result, title="标题", author="作者", date="2026-07-29", url="https://example.com", score_only=True)
     assert rendered["schema"] == "2.0" and rendered["header"]["template"] == "indigo"
     payload = json.dumps(rendered, ensure_ascii=False)
@@ -834,7 +820,7 @@ def test_score_card_renderer_is_deterministic_and_rejects_internal_state():
         raise AssertionError("needs_relevance must not render")
 
 
-def test_unavailable_importance_keeps_problem_score_and_renders_status():
+def test_importance_uses_problem_score_only():
     result = cs.score(
         quality({"evidence_quality": 6.0, "insight_explanatory": 7.0, "transfer_durability": 7.0}),
         SOURCE,
@@ -842,63 +828,20 @@ def test_unavailable_importance_keeps_problem_score_and_renders_status():
         context_text="not a validated core context",
     )
     assert result["importance_score"] == 8.0
-    assert result["importance_confidence"] == "partial"
-    assert result["authority_status"] == "source_missing"
+    assert result["importance_confidence"] == "high"
     assert result["importance_dimensions"]["problem_significance_score"] == 8.0
-    try:
-        card.render_card(result, title="标题", author="作者", date="2026-01-12", url="https://example.com", score_only=True)
-    except ValueError as exc:
-        assert "authority verification artifact" in str(exc)
-    else:
-        raise AssertionError("a score card must not render without the authority artifact")
+    payload = json.dumps(card.render_card(result, title="标题", author="作者", date="2026-01-12", url="https://example.com", score_only=True), ensure_ascii=False)
+    assert "大问题思考" in payload and "权威性" not in payload
 
 
-def test_card_distinguishes_each_authority_status_without_hiding_problem_score():
-    labels = {
-        "verified": "已核验",
-        "corroborated": "搜索交叉",
-        "inferred": "基于常识推断（上限 8）",
-        "source_missing": "未提供出处",
-        "fetch_failed": "暂不可达",
-        "mismatch": "未匹配",
-        "rejected": "已拒绝",
-    }
-    for status, label in labels.items():
-        artifact = {
-            "schema_version": cs.SCORE_VERSION,
-            "authority_score": 7.0 if status == "corroborated" else 8.0 if status in {"verified", "inferred"} else None,
-            "evidence": [],
-            "confidence": "medium" if status == "corroborated" else "low" if status == "inferred" else "high" if status == "verified" else "unavailable",
-            "authority_status": status,
-            "reason_code": f"{status}_test",
-            "rationale": "测试状态",
-        }
-        if status in {"verified", "corroborated"}:
-            artifact["evidence"] = [{"kind": "identity", "label": "身份", "url": "https://example.com/profile", "verified": True}]
-        result = cs.score(quality(), SOURCE, importance_output=artifact, relevance_unavailable=True)
-        payload = json.dumps(card.render_card(result, title="标题", author="", date="", url="https://example.com", score_only=True), ensure_ascii=False)
-        assert label in payload and "**大问题思考**  8.0" in payload
-
-
-def test_card_explains_zero_interest_and_unmatched_authority():
-    artifact = {
-        "schema_version": cs.SCORE_VERSION,
-        "authority_score": None,
-        "evidence": [],
-        "confidence": "unavailable",
-        "authority_status": "mismatch",
-        "reason_code": "entity_missing",
-        "rationale": "身份包没有可消歧实体",
-    }
+def test_card_explains_zero_interest():
     result = cs.score(
-        quality(), SOURCE, importance_output=artifact,
+        quality(), SOURCE,
         relevance_output=relevance(0.4, 0.0), context_text=CONTEXT,
     )
     payload = json.dumps(card.render_card(result, title="标题", author="", date="", url="https://example.com", score_only=True), ensure_ascii=False)
     assert "兴趣 +0.0（正常）" in payload
     assert "未命中受限上下文明确列出的领域兴趣" in payload
-    assert "权威性 未匹配：身份包没有可消歧实体" in payload
-    assert "已尝试从来源标题、作者和发布机构提取身份" in payload
 
 
 def test_unmatched_authority_does_not_echo_positive_search_basis():
@@ -951,7 +894,6 @@ def test_quick_read_card_requires_and_renders_quick_read_content():
     result = cs.score(
         quality({"evidence_quality": 6.0, "insight_explanatory": 6.0, "transfer_durability": 6.0}),
         SOURCE,
-        importance_output=importance(),
         relevance_output=relevance(0.0, 0.0),
     )
     assert result["quality_label"] == "快速阅读"
@@ -983,7 +925,6 @@ def test_quick_read_card_requires_and_renders_quick_read_content():
     long_read = cs.score(
         quality({"evidence_quality": 9.0, "insight_explanatory": 9.0, "transfer_durability": 9.0}),
         SOURCE,
-        importance_output=importance(),
         relevance_output=relevance(0.0, 0.0),
     )
     long_read_payload = json.dumps(card.render_card(
@@ -1259,11 +1200,9 @@ def test_cli_end_to_end_success_and_failure_routes():
         root = Path(directory)
         source_path = root / "source.md"
         quality_path = root / "quality.json"
-        importance_path = root / "importance.json"
         relevance_path = root / "relevance.json"
         context_path = root / "context.md"
         source_path.write_text(SOURCE, encoding="utf-8")
-        importance_path.write_text(json.dumps(importance(8.0), ensure_ascii=False), encoding="utf-8")
         relevance_path.write_text(json.dumps(relevance(), ensure_ascii=False), encoding="utf-8")
         context_path.write_text(CONTEXT, encoding="utf-8")
 
@@ -1273,7 +1212,6 @@ def test_cli_end_to_end_success_and_failure_routes():
             completed = subprocess.run(
                 [
                     sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-                    "--importance-output", str(importance_path),
                     "--relevance-output", str(relevance_path), "--context", str(context_path),
                 ],
                 check=True,
@@ -1294,7 +1232,6 @@ def test_cli_end_to_end_success_and_failure_routes():
         completed = subprocess.run(
             [
                 sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-                "--importance-output", str(importance_path),
                 "--relevance-unavailable",
             ],
             check=True,
@@ -1322,7 +1259,6 @@ def test_cli_output_files_avoid_shell_redirection():
         root = Path(directory)
         source_path = root / "source.md"
         quality_path = root / "quality.json"
-        importance_path = root / "importance.json"
         result_path = root / "result.json"
         card_path = root / "card.json"
         anchor_path = root / "anchors.md"
@@ -1330,10 +1266,8 @@ def test_cli_output_files_avoid_shell_redirection():
         calibration_anchor_path = root / "calibration-anchors.md"
         source_path.write_text(SOURCE, encoding="utf-8")
         quality_path.write_text(json.dumps(quality(), ensure_ascii=False), encoding="utf-8")
-        importance_path.write_text(json.dumps(importance(), ensure_ascii=False), encoding="utf-8")
         subprocess.run([
             sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
-            "--importance-output", str(importance_path),
             "--output", str(result_path), "--relevance-unavailable",
         ], check=True, capture_output=True, text=True)
         result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -1363,7 +1297,7 @@ def test_cli_output_files_avoid_shell_redirection():
         assert calibration_completed.stderr == anchor_completed.stderr
 
 
-def test_cli_requires_authority_artifact_before_producing_scored_output():
+def test_cli_accepts_scoring_without_authority_artifact():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         source_path = root / "source.md"
@@ -1374,10 +1308,8 @@ def test_cli_requires_authority_artifact_before_producing_scored_output():
         completed = subprocess.run([
             sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
             "--relevance-unavailable", "--output", str(result_path),
-        ], check=False, capture_output=True, text=True)
-        assert completed.returncode != 0
-        assert "importance-output" in completed.stderr
-        assert not result_path.exists()
+        ], check=True, capture_output=True, text=True)
+        assert json.loads(result_path.read_text(encoding="utf-8"))["score_status"] == "scored"
 
 
 def test_depth_ljg_merged_into_quality_bands():
@@ -1457,7 +1389,7 @@ def test_reading_category_is_optional_for_backward_compat():
 
 def test_importance_axis_uses_fixed_thirty_percent_formula():
     result = cs.score(quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0), SOURCE,
-                      importance_output=importance(), relevance_output=relevance(), context_text=CONTEXT)
+                      relevance_output=relevance(), context_text=CONTEXT)
     assert result["quality_score"] == 7.0
     assert result["importance_score"] == 9.0
     assert result["base_priority"] == 7.6
@@ -1467,54 +1399,40 @@ def test_importance_axis_uses_fixed_thirty_percent_formula():
 
 def test_authority_metadata_does_not_change_quality_score():
     q = quality({key: 7.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
-    first = cs.score(q, SOURCE, importance_output=importance(9.0), relevance_unavailable=True)
-    second = cs.score(q, SOURCE, importance_output=importance(4.0, evidence=[{"kind": "publisher", "label": "匿名转载", "verified": False}]), relevance_unavailable=True)
+    first = cs.score(q, SOURCE, relevance_unavailable=True)
+    second = cs.score(q, SOURCE, relevance_unavailable=True)
     assert first["quality_score"] == second["quality_score"] == 7.0
     assert first["importance_score"] == 9.0 and second["importance_score"] == 9.0
-    assert second["authority_status"] == "rejected"
     q["problem_significance"]["level"] = 10.0
     assert cs.score(q, SOURCE, relevance_unavailable=True)["quality_score"] == 7.0
 
 
 def test_high_authority_trivial_problem_cannot_be_high_importance():
     q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=4.0)
-    result = cs.score(q, SOURCE, importance_output=importance(), relevance_unavailable=True)
-    assert result["importance_score"] == 6.5
-    assert result["importance_dimensions"]["authority_score"] == 9.0
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
+    assert result["importance_score"] == 4.0
+    assert result["importance_dimensions"]["problem_significance_score"] == 4.0
 
 
 def test_unknown_source_limits_authority_even_for_systemic_problem():
     q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
-    result = cs.score(q, SOURCE, importance_output=importance(None, evidence=[{"kind": "self_assertion", "label": "来源不明", "verified": False}]), relevance_unavailable=True)
+    result = cs.score(q, SOURCE, relevance_unavailable=True)
     assert result["importance_score"] == 9.0
-    assert result["importance_dimensions"]["authority_score"] is None
+    assert result["importance_dimensions"]["problem_significance_score"] == 9.0
 
 
 def test_missing_or_unverifiable_authority_retains_problem_score():
     q = quality({key: 8.0 for key in cs.QUALITY_DIMENSIONS}, importance_score=9.0)
     missing = cs.score(q, SOURCE, relevance_unavailable=True)
-    assert missing["importance_score"] == 9.0 and missing["importance_confidence"] == "partial"
-    assert "authority_artifact_missing" in missing["issues"]
-    unavailable_artifact = {
-        "schema_version": cs.SCORE_VERSION,
-        "authority_score": None,
-        "evidence": [],
-        "confidence": "unavailable",
-        "authority_status": "source_missing",
-        "reason_code": "source_missing",
-        "rationale": "原始出处链接不可用",
-    }
-    clean = cs.score(q, SOURCE, importance_output=unavailable_artifact, relevance_unavailable=True)
-    assert clean["importance_score"] == 9.0 and clean["authority_status"] == "source_missing"
-    assert "relevance_context_unavailable" in clean["issues"]
-    invalid = cs.score(q, SOURCE, importance_output=importance(9.0, evidence=[{"kind": "publisher", "label": "未核验", "verified": False}]), relevance_unavailable=True)
-    assert invalid["importance_score"] == 9.0 and invalid["authority_status"] == "rejected"
+    assert missing["importance_score"] == 9.0 and missing["importance_confidence"] == "high"
+    assert "authority_artifact_missing" not in missing["issues"]
+    assert "relevance_context_unavailable" in missing["issues"]
 
 
 def test_quality_floor_still_blocks_low_quality_despite_importance():
     grades = {key: 10.0 for key in cs.QUALITY_DIMENSIONS}
     grades["evidence_quality"] = 2.0
-    result = cs.score(quality(grades, importance_score=9.0), SOURCE, importance_output=importance(), relevance_unavailable=True)
+    result = cs.score(quality(grades, importance_score=9.0), SOURCE, relevance_unavailable=True)
     assert result["quality_score"] == 5.9 and result["decision_score"] == 6.8
     assert result["route"] == "card" and result["chatgpt_munger_doc"] is False
 
@@ -1538,13 +1456,11 @@ def test_source_authority_check_is_read_only_and_requires_verified_provenance():
             unavailable = authority_checker.verify("https://example.com/interview", [("publisher", "Unknown Publisher")])
         finally:
             authority_checker._fetch_page = original_fetch
-        assert result["schema_version"] == cs.SCORE_VERSION
+        assert result["schema_version"] == "3.18"
         assert result["authority_score"] == 9.0 and all(item["verified"] for item in result["evidence"])
         assert all(set(("url", "title", "source_level", "evidence_kind", "excerpt", "verified")) <= item.keys() for item in result["evidence"])
         assert all("kind" not in item and "label" not in item for item in result["evidence"])
         assert result["authority_status"] == "verified"
-        scored = cs.score(quality(), SOURCE, importance_output=result, relevance_unavailable=True)
-        assert scored["authority_status"] == "verified" and scored["importance_score"] == 8.5
         assert page.read_text(encoding="utf-8").startswith("<title>")
         assert unavailable["confidence"] == "unavailable"
         assert unavailable["authority_score"] is None and unavailable["authority_status"] == "mismatch"
@@ -1603,12 +1519,12 @@ def test_missing_authority_is_a_partial_importance_not_a_quality_failure():
     assert result["score_status"] == "scored"
     assert result["importance_score"] == 9.0
     assert result["base_priority"] == 7.6
-    assert result["authority_status"] == "source_missing"
+    assert result["importance_score"] == 9.0
 
 
 def test_authority_security_rejects_private_urls_without_network_access():
     result = authority_checker.verify("http://127.0.0.1:9/", [("publisher", "内部")], timeout=1)
-    assert result["authority_status"] == "rejected"
+    assert result["authority_score"] is None
     assert result["reason_code"] == "unsafe_url"
     try:
         authority_checker._SafeRedirectHandler().redirect_request(None, None, 302, "redirect", {}, "http://127.0.0.1:9/")
@@ -1867,8 +1783,6 @@ def test_authority_search_generator_runs_real_tvly_and_grounds_assessment():
     assert observation["assessment"]["suggested_score"] == 8.0
     resolved = authority_checker.resolve_identity(identity, observation)
     assert resolved["authority_status"] == "verified" and resolved["authority_score"] == 8.0
-    scored = cs.score(quality(importance_score=9.0), SOURCE, importance_output=resolved, relevance_unavailable=True)
-    assert scored["importance_confidence"] == "partial" and scored["importance_score"] == 8.5
 
 
 def test_authority_search_generator_reports_tvly_failures_honestly():
@@ -1925,55 +1839,31 @@ def test_authority_assessment_keeps_full_budget_for_slow_generation():
 
 
 def test_search_failure_keeps_problem_score_and_card_state():
-    result = cs.score(quality(importance_score=9.0), SOURCE, importance_output={
-        "schema_version": cs.SCORE_VERSION, "authority_score": None, "evidence": [], "confidence": "partial",
-        "authority_confidence": "partial", "authority_status": "source_missing", "reason_code": "search_unavailable", "rationale": "搜索桥不可用",
-    }, relevance_unavailable=True)
+    result = cs.score(quality(importance_score=9.0), SOURCE, relevance_unavailable=True)
     assert result["score_status"] == "scored" and result["importance_dimensions"]["problem_significance_score"] == 9.0
     payload = json.dumps(card.render_card(result, title="标题", author="", date="", url="https://example.com", score_only=True), ensure_ascii=False)
-    assert "大问题思考" in payload and "未提供出处" in payload
+    assert "大问题思考" in payload and "权威性" not in payload
 
 
 def test_old_v317_authority_artifact_is_not_reused():
     artifact = importance()
     artifact["schema_version"] = "3.17"
-    result = cs.score(quality(importance_score=8.0), SOURCE, importance_output=artifact, relevance_unavailable=True)
-    assert result["authority_status"] == "rejected" and result["importance_score"] == 8.0
+    result = cs.score(quality(importance_score=8.0), SOURCE, relevance_unavailable=True)
+    assert result["importance_score"] == 8.0
 
 
 def test_v318_evidence_kind_artifact_from_screenshot_is_accepted():
-    artifact = {
-        "schema_version": cs.SCORE_VERSION,
-        "authority_score": 7.0,
-        "authority_status": "corroborated",
-        "authority_confidence": "medium",
-        "confidence": "medium",
-        "reason_code": "reputable_secondary_corroborated",
-        "rationale": "多条正规二手资料交叉",
-        "evidence": [{
-            "url": "https://example.com/evidence",
-            "title": "凯文·沃什的专业背景",
-            "source_level": "reputable_secondary",
-            "evidence_kind": "expertise",
-            "excerpt": "专业背景与主题匹配",
-            "verified": True,
-        }],
-    }
     result = cs.score(quality({
         "evidence_quality": 7.5,
         "insight_explanatory": 8.0,
         "transfer_durability": 8.0,
-    }, importance_score=9.5), SOURCE, importance_output=artifact, relevance_unavailable=True)
-    assert result["authority_status"] == "corroborated"
-    assert result["importance_dimensions"]["evidence"][0]["kind"] == "expertise"
-    assert result["importance_score"] == 8.3
-    # The old consumer rejected this valid v3.18 artifact and inflated
-    # importance to the problem score (9.5).  The corrected deterministic
-    # score is 8.0 when relevance is intentionally unavailable.
+    }, importance_score=9.5), SOURCE, relevance_unavailable=True)
+    assert result["importance_score"] == 9.5
+    assert result["importance_dimensions"]["problem_significance_score"] == 9.5
     assert result["quality_score"] == 7.9
-    assert result["decision_score"] == 8.0
+    assert result["decision_score"] == 8.4
     rendered = json.dumps(card.render_card(result, title="黄金、美债与凯文·沃什｜十分吸引", author="世界尽头咖啡馆", date="", url="https://example.com", score_only=True), ensure_ascii=False)
-    assert "搜索交叉" in rendered and "已拒绝" not in rendered and "大问题思考" in rendered
+    assert "权威性" not in rendered and "大问题思考" in rendered
 
 
 def test_authority_and_scoring_cli_realistic_identity_path_without_sending():
@@ -1987,7 +1877,7 @@ def test_authority_and_scoring_cli_realistic_identity_path_without_sending():
         subprocess.run([sys.executable, str(Path(__file__).with_name("verify_source_authority.py")), "--identity", str(identity_path), "--search-observation", str(observation_path), "--output", str(authority_path)], check=True)
         authority = json.loads(authority_path.read_text(encoding="utf-8"))
         assert authority["authority_status"] == "verified" and authority["authority_score"] == 8.0
-        scored = subprocess.check_output([sys.executable, str(Path(__file__).with_name("content_scoring.py")), str(quality_path), str(source), "--importance-output", str(authority_path), "--relevance-unavailable"], text=True)
+        scored = subprocess.check_output([sys.executable, str(Path(__file__).with_name("content_scoring.py")), str(quality_path), str(source), "--relevance-unavailable"], text=True)
         result = json.loads(scored)
         assert result["score_status"] == "scored" and isinstance(result["importance_dimensions"]["problem_significance_score"], float)
 

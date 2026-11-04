@@ -75,7 +75,6 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
   │    └─ 未命中 -> 正常走 [1] 评分
   │
   ├─ [1] 调 content-scoring 评分（统一标准，不分来源）
-  │    └─ 独立权威阶段：只传 identity_packet 给程序固定的 tvly 真实搜索（最多 3 个查询、4 个页面）；正文和用户上下文永不进入搜索
   │    ├─ needs_relevance -> 内部补相关性，不发卡、不分派
   │    ├─ needs_full_text|needs_review -> 无数字状态卡
   │    ├─ 完整原文 -> 持久双上下文包工作流（与评分路由解耦，不提交 ChatGPT）
@@ -152,27 +151,24 @@ else:
 
 ## [1] 内容质量判断（统一标准）
 
-抓取后，不论来源，统一调用 `content-scoring` v3.18（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`；权威阶段另行生成 identity_packet，由程序固定的 `tvly` 真实搜索最多 3 个查询、4 个页面，失败时按真实状态（`search_unavailable`/`insufficient_evidence`/`inferred`）如实标注，不阻断评分。七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和经校验的 YWNext `runtime/core-context/full.md`；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
+抓取后，不论来源，统一调用 `content-scoring` v3.19（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`。不做权威解析、身份包生成或外部搜索；七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和经校验的 YWNext `runtime/core-context/full.md`；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
 
 ### 调用 content-scoring
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过当前 Codex 模型完成一次闭卷评分，传输失败时在同一个总超时内对同一模型重试。不切换模型、不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。每次尝试都必须通过同一 Schema 和脚本校验；全部尝试失败、超时或未生成文件时才失败关闭，禁止回退主上下文或启动子 Agent。
-3. 质量命令成功后，运行 `python3 scripts/build_authority_identity.py --source <source.md> --quality <quality_output.json> --output <run_dir>/identity.json`。权威搜索由程序固定执行，不由 Agent 手工搜索：`python3 scripts/generate_authority.py --identity <run_dir>/identity.json --output <run_dir>/search-observation.json` 用已安装的 `tvly` CLI 真实运行最多 3 条查询（“精确标题”“实体+primary topic”“实体+event hint”）、最多 4 条结果，查询内容不落盘（只存 hash）。只保留真实返回的 URL、标题、来源级别和不超过 200 字短证据；本地模型只判断实体匹配、主题匹配和证据解释，不得伪造 URL 或搜索结果。tvly 未认证、网络失败或超时写入 `search_unavailable` 等真实状态，没有真实搜索时 `tool_status` 永远不是 `ok`；来源账号名按 `source_account` 处理，不得自动当成人物或组织。随后执行 `python3 scripts/verify_source_authority.py --identity <run_dir>/identity.json --search-observation <run_dir>/search-observation.json --output <run_dir>/importance-output.json`，再运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --importance-output <run_dir>/importance-output.json --output <run_dir>/scoring-result.json`，拿 `scoring_result v3.18`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
+3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿 `scoring_result v3.19`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
 4. 若 `score_status=needs_relevance`，先运行 `node /Users/yuwei/code/skills/ywnext/scripts/check-find-next-core-context.mjs /Users/yuwei/code/skills/ywnext 8`；通过（含过期降级）时在独立上下文读取 `runtime/core-context/full.md`，校验失败（缺失或结构损坏）时不读取 `full-full.md` 或其他个人材料，直接使用 `--relevance-unavailable` 确定性结束。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`；相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
 第 3 步不是“先评分、下轮再发卡”。质量 JSON 之后必须在同一次 `exec_command` 内按下列固定尾部执行；只替换路径、卡片元数据和发送目标，不改分支：
 
 ```bash
-python3 /Users/yuwei/code/read-x/scripts/build_authority_identity.py --source "<source.md>" --quality "<run_dir>/quality-output.json" --output "<run_dir>/identity.json"
-python3 /Users/yuwei/code/read-x/scripts/generate_authority.py --identity "<run_dir>/identity.json" --output "<run_dir>/search-observation.json"
-python3 /Users/yuwei/code/read-x/scripts/verify_source_authority.py --identity "<run_dir>/identity.json" --search-observation "<run_dir>/search-observation.json" --output "<run_dir>/importance-output.json"
 score_config_args=()
 if [ -f "<base_config.json>" ]; then
   score_config_args=(--config-from-base "<base_config.json>")
 fi
-python3 scripts/content_scoring.py <quality_output.json> <source.md> --importance-output "<run_dir>/importance-output.json" "${score_config_args[@]}" --output <scoring-result.json>
+python3 scripts/content_scoring.py <quality_output.json> <source.md> "${score_config_args[@]}" --output <scoring-result.json>
 score_status_value=$(jq -r '.score_status' <scoring-result.json>)
 if [ "$score_status_value" = needs_relevance ]; then
   cat <scoring-result.json>
@@ -213,13 +209,13 @@ fi
 - `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
 - `score_only=true`：不论脚本 `route`，评分卡都是最终卡，显示“本次仅评分，不进入精读”后结束。
 
-正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值、权威状态和大问题思考分。权威状态区分“已核验、搜索交叉、基于常识推断（上限 8）、搜索未执行、搜索不可用、证据不足、未提供出处、暂不可达、未匹配、已拒绝”。不得展示 YWNext 私有原文。示例：
+正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值和大问题思考分。不得展示 YWNext 私有原文。示例：
 
 ```json
 {
   "schema": "2.0",
   "header": {"title": {"tag": "plain_text", "content": "评分完成"}, "template": "indigo"},
-  "body": {"elements": [{"tag": "markdown", "content": "《标题》\n\n**质量 {quality_score}/10 · {quality_label}**\n**重要性 {importance_score}** · 权威性 {authority_status/authority_score} · 大问题思考 {problem_significance_score} · 相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维质量**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n正在精读，稍后发文档。"}]}
+  "body": {"elements": [{"tag": "markdown", "content": "《标题》\n\n**质量 {quality_score}/10 · {quality_label}**\n**重要性 {importance_score}** · 大问题思考 {problem_significance_score} · 相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维质量**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n正在精读，稍后发文档。"}]}
 }
 ```
 
@@ -450,7 +446,7 @@ lark-cli im +messages-send \
    - **格式**：卡片中以 `> 原文金句` 引用块呈现，每条金句不超过 60 字
    - **英文翻译（硬）**：原文为英文时，金句以中文译文呈现并遵守信达雅（忠实原意、通顺自然、文采得体），译文后附英文原句作溯源，格式 `> 中文译文（原文：English original）`；英文附注不计入 60 字限制。禁止只贴英文不译。
    - **低质量例外**：若原文确无值得划线的内容，不强行添加；但不能因为「懒」而跳过
-10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、权威性状态或分数、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值。权威不可用时不得隐藏大问题分；`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。long-read 后续通知只由 Worker 依据持久状态生成，不重复评分。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得进入 long-read 工作流，先补算两轴再接管。
+10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值；不展示权威性。`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。long-read 后续通知只由 Worker 依据持久状态生成，不重复评分。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得进入 long-read 工作流，先补算两轴再接管。
 
 ---
 
