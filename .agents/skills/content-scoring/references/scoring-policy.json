@@ -2,7 +2,7 @@
   "versions": {
     "score": "3.19",
     "quality": "3.16",
-    "relevance": "3.0"
+    "relevance": "3.1"
   },
   "dimension_scores": [0, 2, 4, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10],
   "quality_dimensions": {

@@ -4,7 +4,7 @@
 Usage:
   python3 scripts/content_scoring.py quality.json source.md \
     [--retry-quality-output retry.json] \
-    [--relevance-output relevance.json --context context.md] \
+    [--relevance-output relevance.json --context ywcontext-p1.json] \
     [--config-from-base <base-config.json>]
   python3 scripts/content_scoring.py --self-check
 
@@ -400,11 +400,90 @@ def _needs_result(status: str, fp: str, issues: list[str], quality_output=None) 
     }
 
 
+def _parse_ywcontext_p1(context_text: str) -> dict | None:
+    if not isinstance(context_text, str):
+        return None
+    try:
+        payload = json.loads(context_text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != "yw-context-routed-context/v1":
+        return None
+    if payload.get("mode") != "full" or payload.get("level") != "P1":
+        return None
+    if payload.get("consumer_id") != "read-x.content-scoring":
+        return None
+    if not re.fullmatch(r"[a-f0-9]{40}", payload.get("snapshot_commit", "")):
+        return None
+    manifest_hash = payload.get("manifest_sha256")
+    if not isinstance(manifest_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", manifest_hash):
+        return None
+    coverage = payload.get("coverage")
+    if not isinstance(coverage, dict) or coverage.get("complete") is not True:
+        return None
+    coverage_sets = {}
+    for name in ("required_source_ids", "ready_source_ids", "blocked_source_ids"):
+        values = coverage.get(name)
+        if (not isinstance(values, list) or any(not isinstance(item, str) or not item for item in values)
+                or len(values) != len(set(values))):
+            return None
+        coverage_sets[name] = set(values)
+    required = coverage_sets["required_source_ids"]
+    if not required or not required.issubset(coverage_sets["ready_source_ids"]):
+        return None
+    if required.intersection(coverage_sets["blocked_source_ids"]):
+        return None
+    entries = payload.get("entries")
+    record_count = payload.get("record_count")
+    if (not isinstance(entries, list) or not entries or type(record_count) is not int or record_count != len(entries)
+            or any(not isinstance(entry, dict) for entry in entries)):
+        return None
+    manifest = []
+    identities = set()
+    for entry in entries:
+        source_id = entry.get("source_id")
+        logical_id = entry.get("logical_id")
+        source_version = entry.get("source_version")
+        entry_hash = entry.get("sha256")
+        content = entry.get("content")
+        if (entry.get("level") != "P1" or entry.get("current_usable") is not True
+                or entry.get("content_status") != "body_and_hash_verified"
+                or not isinstance(source_id, str) or not source_id
+                or source_id not in required or source_id not in coverage_sets["ready_source_ids"]
+                or not isinstance(logical_id, str) or not logical_id
+                or not isinstance(source_version, str) or not source_version
+                or not isinstance(content, str) or not content
+                or not isinstance(entry_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", entry_hash)):
+            return None
+        identity = (source_id, logical_id)
+        if identity in identities or hashlib.sha256(content.encode("utf-8")).hexdigest() != entry_hash:
+            return None
+        identities.add(identity)
+        manifest.append({
+            "source_id": source_id,
+            "logical_id": logical_id,
+            "level": "P1",
+            "source_version": source_version,
+            "sha256": entry_hash,
+        })
+    canonical_manifest = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical_manifest.encode("utf-8")).hexdigest() != manifest_hash:
+        return None
+    return payload
+
+
 def _validate_full_context(context_text: str) -> bool:
-    if not all(re.search(rf"^##\s+{re.escape(section)}\s*$", context_text, re.MULTILINE) for section in FULL_CONTEXT_SECTIONS):
-        return False
-    interest = re.search(r"^##\s+领域兴趣\s*$([\s\S]*?)(?=^##\s+|\Z)", context_text, re.MULTILINE)
-    return bool(interest and re.search(r"^###\s+.*(?:长期|持续关注|持久|核心兴趣)", interest.group(1), re.MULTILINE))
+    return _parse_ywcontext_p1(context_text) is not None
+
+
+def _ywcontext_p1_text(context_text: str) -> str:
+    payload = _parse_ywcontext_p1(context_text)
+    if payload is None:
+        raise ValueError("context is not a complete, hash-verified YWContext P1 route payload")
+    sections = [f"YWContext P1 snapshot {payload['snapshot_commit']} manifest {payload['manifest_sha256']}"]
+    for entry in payload["entries"]:
+        sections.append(f"## {entry['source_id']}/{entry['logical_id']} · {entry['source_version']}\n{entry['content']}")
+    return "\n\n".join(sections)
 
 
 def _validate_context(context_text: str) -> bool:
@@ -413,13 +492,18 @@ def _validate_context(context_text: str) -> bool:
 
 def _relevance_result(output, context_text: str | None):
     """双轴相关性：relevance_score（元主线命中）+ interest_score（领域兴趣），各自封顶后相加为总 bonus。"""
-    if output is None or context_text is None or not _validate_context(context_text):
+    context_route = _parse_ywcontext_p1(context_text)
+    if output is None or context_route is None:
         return None, None, "unavailable", {}, ["relevance_context_unavailable"]
     errors = []
     # 兼容历史生成侧字段名 relevance_version（契约字段为 schema_version，值须一致）
     if not isinstance(output, dict) or output.get("schema_version", output.get("relevance_version")) != RELEVANCE_VERSION:
         errors.append(f"relevance schema_version must be {RELEVANCE_VERSION}")
     else:
+        if output.get("context_snapshot_commit") != context_route["snapshot_commit"]:
+            errors.append("relevance output was generated from a different YWContext P1 commit")
+        if output.get("context_manifest_sha256") != context_route["manifest_sha256"]:
+            errors.append("relevance output was generated from a different YWContext P1 manifest")
         if any(key in output for key in ("quality_score", "decision_score")):
             errors.append("relevance output must not receive quality or decision scores")
         rel_raw = output.get("relevance_score")
@@ -458,6 +542,8 @@ def _relevance_result(output, context_text: str | None):
         "matched_mainlines": output.get("matched_mainlines", []),
         "matched_interests": output.get("matched_interests", []),
         "rationale": output.get("rationale"),
+        "context_snapshot_commit": context_route["snapshot_commit"],
+        "context_manifest_sha256": context_route["manifest_sha256"],
     }
     if output.get("context_refresh"):
         info["context_refresh"] = str(output["context_refresh"])

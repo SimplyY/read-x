@@ -30,19 +30,38 @@ import build_authority_identity as identity_builder
 
 QUOTES = [f"原文核心句{i}。" for i in range(1, 13)]
 SOURCE = "\n".join(quote + ("背景材料" * 40) for quote in QUOTES)
-CONTEXT = """# 核心上下文
-## 长期校准
-长期判断。
-## 当前主线
-当前工作。
-## 当前张力
-尚待决定。
-## 暂不做什么
-边界。
-## 领域兴趣
-### 长期兴趣
-价值投资；教育与 AI；AI 时代的人与组织。
-"""
+def context_route_payload(content="长期兴趣：价值投资；教育与 AI；AI 时代的人与组织。"):
+    entry = {
+        "source_id": "learn-x-memory-p1-content",
+        "logical_id": "memory-q4",
+        "level": "P1",
+        "source_version": "sha256:source-version",
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "current_usable": True,
+        "content_status": "body_and_hash_verified",
+        "content": content,
+    }
+    manifest = [{key: entry[key] for key in ("source_id", "logical_id", "level", "source_version", "sha256")}]
+    canonical = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "schema": "yw-context-routed-context/v1",
+        "mode": "full",
+        "level": "P1",
+        "consumer_id": "read-x.content-scoring",
+        "snapshot_commit": "a" * 40,
+        "record_count": 1,
+        "manifest_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "coverage": {
+            "complete": True,
+            "required_source_ids": ["learn-x-memory-p1-content"],
+            "ready_source_ids": ["learn-x-memory-p1-content"],
+            "blocked_source_ids": [],
+        },
+        "entries": [entry],
+    }
+
+
+CONTEXT = json.dumps(context_route_payload(), ensure_ascii=False, separators=(",", ":"))
 def dimension_input(key, score):
     value = Decimal(str(score))
     return {"level": float(value), "disqualifiers": []}
@@ -88,7 +107,8 @@ def quality(dimension_scores=None, confidence="high", source_status="complete", 
     }
 
 
-def relevance(relevance_score=0.5, interest_score=0.5, confidence="high"):
+def relevance(relevance_score=0.5, interest_score=0.5, confidence="high", context_text=CONTEXT):
+    context_route = cs._parse_ywcontext_p1(context_text)
     return {
         "schema_version": cs.RELEVANCE_VERSION,
         "relevance_score": relevance_score,
@@ -98,6 +118,8 @@ def relevance(relevance_score=0.5, interest_score=0.5, confidence="high"):
         "rationale": "命中元主线/兴趣" if relevance_score > 0 or interest_score > 0 else "未命中",
         "confidence": confidence,
         "conclusion": "相关性结论",
+        "context_snapshot_commit": context_route["snapshot_commit"] if context_route else None,
+        "context_manifest_sha256": context_route["manifest_sha256"] if context_route else None,
     }
 
 
@@ -646,8 +668,10 @@ def test_link_card_fast_path_keeps_runtime_authorities_explicit():
     assert "三维数值语义一次发送" in scoring_skill and "直接返回证据、洞察、迁移三维等级" in scoring_skill
     assert "当前 Codex 模型" in scoring_skill and "MoonBridge" not in scoring_skill
     assert "不得退回主上下文评分" in scoring_skill
-    assert "runtime/core-context/full.md" in scoring_skill
-    assert "_validate_full_context" in relevance_generator_source
+    assert "YWContext P1" in scoring_skill
+    assert "context-route.mjs" in scoring_skill
+    assert "scoring._parse_ywcontext_p1" in relevance_generator_source
+    assert "_parse_ywcontext_p1" in relevance_generator_source
     assert "_validate_repo_context" not in relevance_generator_source
     assert "三维必须正交" in quality_runtime and "只影响 `evidence_quality`" in quality_runtime
     assert "source_quote in source_text" in quality_runtime
@@ -1099,6 +1123,46 @@ def test_validated_full_context_is_accepted_for_relevance():
     assert result["relevance_score"] == 0.5 and result["context_fingerprint"] is not None
 
 
+def test_ywcontext_p1_route_requires_complete_coverage_and_matching_hashes():
+    payload = context_route_payload()
+    assert cs._validate_context(json.dumps(payload, ensure_ascii=False))
+
+    incomplete = json.loads(json.dumps(payload))
+    incomplete["coverage"]["complete"] = False
+    assert not cs._validate_context(json.dumps(incomplete, ensure_ascii=False))
+
+    missing_source = json.loads(json.dumps(payload))
+    missing_source["coverage"]["ready_source_ids"] = []
+    assert not cs._validate_context(json.dumps(missing_source, ensure_ascii=False))
+
+    wrong_manifest = json.loads(json.dumps(payload))
+    wrong_manifest["manifest_sha256"] = "0" * 64
+    assert not cs._validate_context(json.dumps(wrong_manifest, ensure_ascii=False))
+
+    changed_body = json.loads(json.dumps(payload))
+    changed_body["entries"][0]["content"] += "正文被改动"
+    assert not cs._validate_context(json.dumps(changed_body, ensure_ascii=False))
+
+    legacy = "## 当前主线\n旧版 YWNext 内容"
+    assert not cs._validate_context(legacy)
+
+    stale_relevance = relevance()
+    stale_relevance["context_manifest_sha256"] = "0" * 64
+    result = cs.score(quality(), SOURCE, relevance_output=stale_relevance, context_text=CONTEXT)
+    assert result["relevance_score"] is None and result["context_fingerprint"] is None
+
+
+def test_context_fingerprint_tracks_pinned_commit_and_manifest():
+    payload = context_route_payload()
+    first = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    payload["snapshot_commit"] = "b" * 40
+    second = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    assert cs._validate_context(first) and cs._validate_context(second)
+    result1 = cs.score(quality(), SOURCE, relevance_output=relevance(context_text=first), context_text=first)
+    result2 = cs.score(quality(), SOURCE, relevance_output=relevance(context_text=second), context_text=second)
+    assert result1["context_fingerprint"] != result2["context_fingerprint"]
+
+
 def test_fingerprints_ignore_layout_but_track_content_and_context():
     assert cs.content_fingerprint("甲 乙\n丙") == cs.content_fingerprint("甲\n乙 丙")
     assert cs.content_fingerprint("中文AI 评分") == cs.content_fingerprint("中 文 AI评分")
@@ -1109,8 +1173,8 @@ def test_fingerprints_ignore_layout_but_track_content_and_context():
         "transfer_durability": 7.0,
     }
     result1 = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=CONTEXT)
-    changed = CONTEXT.replace("当前工作", "新的当前工作")
-    result2 = cs.score(quality(grades), SOURCE, relevance_output=relevance(), context_text=changed)
+    changed = json.dumps(context_route_payload("新增长期兴趣：价值投资；教育与 AI；AI 时代的人与组织。"), ensure_ascii=False, separators=(",", ":"))
+    result2 = cs.score(quality(grades), SOURCE, relevance_output=relevance(context_text=changed), context_text=changed)
     assert result1["content_fingerprint"] == result2["content_fingerprint"]
     assert result1["context_fingerprint"] != result2["context_fingerprint"]
 
@@ -1201,7 +1265,7 @@ def test_cli_end_to_end_success_and_failure_routes():
         source_path = root / "source.md"
         quality_path = root / "quality.json"
         relevance_path = root / "relevance.json"
-        context_path = root / "context.md"
+        context_path = root / "ywcontext-p1.json"
         source_path.write_text(SOURCE, encoding="utf-8")
         relevance_path.write_text(json.dumps(relevance(), ensure_ascii=False), encoding="utf-8")
         context_path.write_text(CONTEXT, encoding="utf-8")

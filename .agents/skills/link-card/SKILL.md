@@ -151,14 +151,14 @@ else:
 
 ## [1] 内容质量判断（统一标准）
 
-抓取后，不论来源，统一调用 `content-scoring` v3.19（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`。不做权威解析、身份包生成或外部搜索；七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和经校验的 YWNext `runtime/core-context/full.md`；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
+抓取后，不论来源，统一调用 `content-scoring` v3.19（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`。不做权威解析、身份包生成或外部搜索；七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和通过完整性、来源覆盖及哈希校验的 YWContext P1；路由失败或任一 P1 来源未就绪时直接按 `--relevance-unavailable` 回到质量分，不读取旧 YWNext 文件或其他个人材料。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
 
 ### 调用 content-scoring
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过当前 Codex 模型完成一次闭卷评分，传输失败时在同一个总超时内对同一模型重试。不切换模型、不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。每次尝试都必须通过同一 Schema 和脚本校验；全部尝试失败、超时或未生成文件时才失败关闭，禁止回退主上下文或启动子 Agent。
 3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿 `scoring_result v3.19`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
-4. 若 `score_status=needs_relevance`，先运行 `node /Users/yuwei/code/skills/ywnext/scripts/check-find-next-core-context.mjs /Users/yuwei/code/skills/ywnext 8`；通过（含过期降级）时在独立上下文读取 `runtime/core-context/full.md`，校验失败（缺失或结构损坏）时不读取 `full-full.md` 或其他个人材料，直接使用 `--relevance-unavailable` 确定性结束。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`；相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
+4. 若 `score_status=needs_relevance`，从 `/Users/yuwei/code/yw-context/scripts/context-route.mjs` 获取 P1 全文 JSON，参数固定为 `--mode full --latest --consumer read-x.content-scoring`，输出存入本轮 `run_dir`。把该文件传给 `scripts/generate_relevance.py`；来源覆盖不完整、路由或哈希验证失败、远端不可读时直接用 `--relevance-unavailable` 确定性结束，不读取任何旧 YWNext 文件。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`；相关性无效或 low 时接受脚本的失败关闭结果，不重试阻塞。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
 第 3 步不是“先评分、下轮再发卡”。质量 JSON 之后必须在同一次 `exec_command` 内按下列固定尾部执行；只替换路径、卡片元数据和发送目标，不改分支：
@@ -209,7 +209,7 @@ fi
 - `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
 - `score_only=true`：不论脚本 `route`，评分卡都是最终卡，显示“本次仅评分，不进入精读”后结束。
 
-正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值和大问题思考分。不得展示 YWNext 私有原文。示例：
+正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值和大问题思考分。不得展示私有上下文原文。示例：
 
 ```json
 {

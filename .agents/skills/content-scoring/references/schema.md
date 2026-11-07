@@ -59,18 +59,20 @@
 - 质量输出禁止包含 `calibration`；锚点和目标区间只用于评分后的外部闭卷回归。
 - `domain_confidence`：`high|medium|low`。
 
-## relevance_output v3
+## relevance_output v3.1
 
 ```json
 {
-  "schema_version": "3.0",
+  "schema_version": "3.1",
   "relevance_score": 0.5,
   "interest_score": 0.4,
   "matched_mainlines": ["AI 产业认知"],
   "matched_interests": ["价值投资"],
   "rationale": "命中程度与依据",
   "confidence": "high",
-  "conclusion": "相关性结论"
+  "conclusion": "相关性结论",
+  "context_snapshot_commit": "40 位提交 SHA",
+  "context_manifest_sha256": "64 位 SHA-256"
 }
 ```
 
@@ -81,7 +83,7 @@
 - `relevance_score>0` 时 `matched_mainlines` 非空；`interest_score>0` 时 `matched_interests` 非空。
 - 判定看内容吻合度与相关性，不以作者身份/名气单独判断。
 - `confidence=low` 时脚本不采用相关性，决策分回退质量分。
-- 该输出不得接收或复述质量分；`schema_version != 3.0` 的旧输出一律拒绝。
+- 该输出不得接收或复述质量分；`schema_version != 3.1` 的旧输出一律拒绝。两个 `context_*` 字段由 `generate_relevance.py` 写入，不由模型生成；评分器必须匹配本轮 YWContext P1 路由的提交和 manifest。
 
 ## scoring_result v3.19
 
@@ -90,7 +92,7 @@
   "score_version": "3.19",
   "policy_source": "base|local",
   "quality_version": "3.16",
-  "relevance_version": "3.0",
+  "relevance_version": "3.1",
   "content_fingerprint": "sha256",
   "context_fingerprint": "sha256 或 null",
   "score_status": "scored|needs_relevance|needs_full_text|needs_review",
@@ -136,7 +138,7 @@
 
 旧版“决策分等同质量分”的描述不适用于 v3.19：重要性由大问题分承接完整 30% 权重。
 
-指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入规范化后的 YWNext `runtime/core-context/full.md` 与 `relevance_version`。只有同时持有相同版本和对应评分产物时才允许复用。
+指纹由脚本生成：正文先做 Unicode NFC、统一换行、折叠连续空白，并消除中英文相邻处的纯排版空格，再与 `quality_version` 计算 SHA-256；相关性指纹再加入 YWContext P1 路由 JSON 与 `relevance_version`。路由 JSON 含固定提交、manifest、完整覆盖声明及每条 P1 正文哈希，因此提交或来源版本变化会使缓存失效。脚本验证 P1 等级、完整覆盖、唯一逻辑身份、正文 SHA-256 和 manifest SHA-256；只有全部一致时才允许生成相关性。
 
 ## CLI
 
@@ -145,8 +147,8 @@ python3 scripts/content_scoring.py quality_output.json source.md --relevance-una
 python3 scripts/content_scoring.py quality_output.json source.md \
   --retry-quality-output retry.json \
   --relevance-output relevance_output.json \
-  --context /Users/yuwei/code/skills/ywnext/runtime/core-context/full.md \
+  --context <run_dir>/ywcontext-p1.json \
   --config-from-base <run_dir>/base-config.json
 ```
 
-`--config-from-base` 在 Base 快照存在时必须传入；`needs_relevance` 的第二次运行必须复用同一快照。`--relevance-output` 与 `--context` 必须同时提供，且不得与 `--relevance-unavailable` 同时使用。脚本不负责调用模型、刷新 YWNext 或持久化缓存。
+`--config-from-base` 在 Base 快照存在时必须传入；`needs_relevance` 的第二次运行必须复用同一快照。`--relevance-output` 与 `--context` 必须同时提供，且不得与 `--relevance-unavailable` 同时使用。`--context` 必须是本轮从 YWContext 最新路由取得的 P1 JSON，不接受旧 YWNext Markdown；脚本不负责调用模型、刷新 YWContext 或持久化缓存。

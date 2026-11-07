@@ -12,7 +12,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 ## Harness 接入
 
-- 只在任务确实需要个性化相关性时读取通过校验的 YWNext `runtime/core-context/full.md`；完整核心上下文不得进入原文忠实度、质量评分、引用或交付状态判断。
+- 只在评分结果为 `needs_relevance` 时读取通过完整性、来源覆盖和哈希校验的 YWContext P1 路由；P1 不得进入原文忠实度、质量分、引用或交付状态判断。路由不可用时按质量分安全降级，不读取旧 YWNext 文件。
 - 每次阶段转换以当前 `run_dir`、`summary.json`、哈希和来源状态为准；不以对话记忆或旧产物推断完成。
 - 文档创建、卡片发送和 ChatGPT Bridge 芒格后处理分别保留尝试与读回证据；提交不确定时停止，禁止自动重发。
 
@@ -35,7 +35,7 @@ link-card 流程：
 
 重要性只用大问题分，不执行独立权威搜索。不生成 identity_packet，不调用 tvly，不输出权威状态或权威分。
 
-抓取后，统一调用 `content-scoring` v3.19。每次评分先读取一份运行级 Base 配置快照；快照可用时必须传给 `scripts/content_scoring.py --config-from-base`，不可用时使用本地策略并保留 `policy_source=local`。质量阶段一次判断证据、洞察、迁移三维等级和 `problem_significance`；重要性等于 `problem_significance_score`。由脚本校验并计算唯一决策分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取通过校验的 YWNext `runtime/core-context/full.md` 并计算相关性；完整上下文不可用时不读取 `full-full.md` 或其他个人材料，直接回到质量分。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
+抓取后，统一调用 `content-scoring` v3.19。每次评分先读取一份运行级 Base 配置快照；快照可用时必须传给 `scripts/content_scoring.py --config-from-base`，不可用时使用本地策略并保留 `policy_source=local`。质量阶段一次判断证据、洞察、迁移三维等级和 `problem_significance`；重要性等于 `problem_significance_score`。由脚本校验并计算唯一决策分；锚点及目标分不得进入评分上下文。先运行脚本，只有返回 `needs_relevance` 时才隔离读取通过完整性、来源覆盖与哈希校验的 YWContext P1 并计算相关性；P1 路由不可用时不读取任何旧 YWNext 文件或其他个人材料，直接回到质量分。由 `scripts/content_scoring.py` 算出唯一 `scoring_result`：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
