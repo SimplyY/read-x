@@ -419,7 +419,10 @@ def _parse_ywcontext_p1(context_text: str) -> dict | None:
     if not isinstance(manifest_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", manifest_hash):
         return None
     coverage = payload.get("coverage")
-    if not isinstance(coverage, dict) or coverage.get("complete") is not True:
+    completeness_status = payload.get("completeness_status")
+    if (not isinstance(coverage, dict) or type(coverage.get("complete")) is not bool
+            or completeness_status not in {"complete", "local_base_with_external_gaps"}
+            or coverage["complete"] != (completeness_status == "complete")):
         return None
     coverage_sets = {}
     for name in ("required_source_ids", "ready_source_ids", "blocked_source_ids"):
@@ -429,9 +432,30 @@ def _parse_ywcontext_p1(context_text: str) -> dict | None:
             return None
         coverage_sets[name] = set(values)
     required = coverage_sets["required_source_ids"]
-    if not required or not required.issubset(coverage_sets["ready_source_ids"]):
+    ready = coverage_sets["ready_source_ids"]
+    blocked = coverage_sets["blocked_source_ids"]
+    if (not required or not ready.issubset(required) or not blocked.issubset(required | {"<catalog>"})
+            or ready.intersection(blocked)):
         return None
-    if required.intersection(coverage_sets["blocked_source_ids"]):
+    blocked_sources = blocked - {"<catalog>"}
+    if ready | blocked_sources != required:
+        return None
+    if coverage["complete"] and (ready != required or blocked):
+        return None
+    if not coverage["complete"] and not blocked:
+        return None
+    resolved_ids = coverage.get("resolved_entry_source_ids")
+    if (not isinstance(resolved_ids, list) or any(not isinstance(item, str) or not item for item in resolved_ids)
+            or len(resolved_ids) != len(set(resolved_ids)) or not set(resolved_ids).issubset(required)):
+        return None
+    followups = payload.get("external_followups")
+    if not isinstance(followups, list) or any(not isinstance(item, dict) for item in followups):
+        return None
+    followup_ids = [item.get("source_id") for item in followups]
+    if (any(not isinstance(item, str) or not item for item in followup_ids)
+            or len(followup_ids) != len(set(followup_ids)) or "yw-context-rule-table" not in followup_ids):
+        return None
+    if any(source_id != "<catalog>" and source_id not in followup_ids for source_id in blocked):
         return None
     entries = payload.get("entries")
     record_count = payload.get("record_count")
@@ -449,7 +473,7 @@ def _parse_ywcontext_p1(context_text: str) -> dict | None:
         if (entry.get("level") != "P1" or entry.get("current_usable") is not True
                 or entry.get("content_status") != "body_and_hash_verified"
                 or not isinstance(source_id, str) or not source_id
-                or source_id not in required or source_id not in coverage_sets["ready_source_ids"]
+                or source_id not in required
                 or not isinstance(logical_id, str) or not logical_id
                 or not isinstance(source_version, str) or not source_version
                 or not isinstance(content, str) or not content
@@ -466,6 +490,9 @@ def _parse_ywcontext_p1(context_text: str) -> dict | None:
             "source_version": source_version,
             "sha256": entry_hash,
         })
+    entry_source_ids = {item["source_id"] for item in manifest}
+    if entry_source_ids != set(resolved_ids):
+        return None
     canonical_manifest = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if hashlib.sha256(canonical_manifest.encode("utf-8")).hexdigest() != manifest_hash:
         return None
@@ -476,11 +503,49 @@ def _validate_full_context(context_text: str) -> bool:
     return _parse_ywcontext_p1(context_text) is not None
 
 
-def _ywcontext_p1_text(context_text: str) -> str:
+def _external_followup_receipt_errors(output: dict, route: dict) -> list[str]:
+    checked = output.get("external_followups_checked")
+    receipt_hash = output.get("external_followup_receipt_sha256")
+    receipts = output.get("external_followup_receipts")
+    if checked is not True:
+        return ["external followup check and receipt are required for this YWContext route"]
+    errors = []
+    if not isinstance(receipt_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", receipt_hash):
+        errors.append("external followup receipt hash is invalid")
+    expected = {item["source_id"] for item in route.get("external_followups", [])}
+    if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
+        errors.append("external followup receipt entries are invalid")
+        return errors
+    actual = [item.get("source_id") for item in receipts]
+    if (any(not isinstance(source_id, str) or not source_id for source_id in actual)
+            or len(actual) != len(set(actual)) or set(actual) != expected):
+        errors.append("external followup receipt entries do not match the routed followups")
+        return errors
+    for item in receipts:
+        if item.get("status") == "verified":
+            if (not _nonempty(item.get("source_reference")) or not _nonempty(item.get("source_version"))
+                    or not isinstance(item.get("sha256"), str)
+                    or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
+                errors.append("verified external followup receipt is incomplete")
+        elif item.get("status") in {"unavailable", "not_relevant"}:
+            if not _nonempty(item.get("reason")):
+                errors.append("unavailable external followup receipt requires a reason")
+        else:
+            errors.append("external followup receipt status is invalid")
+    return errors
+
+
+def _ywcontext_p1_text(context_text: str, *, external_followups_checked: bool = False) -> str:
     payload = _parse_ywcontext_p1(context_text)
     if payload is None:
-        raise ValueError("context is not a complete, hash-verified YWContext P1 route payload")
-    sections = [f"YWContext P1 snapshot {payload['snapshot_commit']} manifest {payload['manifest_sha256']}"]
+        raise ValueError("context is not a hash-verified YWContext P1 route payload")
+    sections = [f'YWContext P1 snapshot {payload["snapshot_commit"]} manifest {payload["manifest_sha256"]} status {payload["completeness_status"]}']
+    if payload["completeness_status"] == "local_base_with_external_gaps":
+        missing = sorted(set(payload["coverage"]["required_source_ids"]) - set(payload["coverage"]["ready_source_ids"]))
+        if external_followups_checked:
+            sections.append("Source lifecycle or remote verification is incomplete: use only the verified local P1 bodies below plus the separately listed, hash-bound external followup evidence. Affected sources remain unknown beyond verified evidence; this is not evidence of no personal interest. Affected source IDs: " + ", ".join(missing))
+        else:
+            sections.append("Source lifecycle or remote verification is incomplete: use only the verified local P1 bodies below. Affected sources remain unknown beyond this pinned local version; this is not evidence of no personal interest. External followups have not yet been checked by this payload: " + ", ".join(missing))
     for entry in payload["entries"]:
         sections.append(f"## {entry['source_id']}/{entry['logical_id']} · {entry['source_version']}\n{entry['content']}")
     return "\n\n".join(sections)
@@ -529,6 +594,7 @@ def _relevance_result(output, context_text: str | None):
         # 结论与 generate_relevance 一致：conclusion 缺失时回退 rationale（rationale 已必填）
         if not _nonempty(output.get("conclusion") or output.get("rationale")):
             errors.append("relevance conclusion is required")
+        errors.extend(_external_followup_receipt_errors(output, context_route))
     confidence = output.get("confidence") if isinstance(output, dict) else None
     if errors or confidence == "low":
         return None, None, "unavailable", {}, errors or ["low_relevance_confidence"]
@@ -544,7 +610,16 @@ def _relevance_result(output, context_text: str | None):
         "rationale": output.get("rationale"),
         "context_snapshot_commit": context_route["snapshot_commit"],
         "context_manifest_sha256": context_route["manifest_sha256"],
+        "context_completeness_status": context_route["completeness_status"],
+        "context_coverage_complete": context_route["coverage"]["complete"],
+        "context_unresolved_source_ids": sorted(set(context_route["coverage"]["required_source_ids"]) - set(context_route["coverage"]["ready_source_ids"])),
+        "external_followup_source_ids": sorted(item["source_id"] for item in context_route["external_followups"]),
+        "external_followups_checked": output.get("external_followups_checked") is True,
     }
+    external_receipt_hash = output.get("external_followup_receipt_sha256")
+    if isinstance(external_receipt_hash, str) and re.fullmatch(r"[a-f0-9]{64}", external_receipt_hash):
+        info["external_followup_receipt_sha256"] = external_receipt_hash
+        info["external_followup_receipts"] = output.get("external_followup_receipts", [])
     if output.get("context_refresh"):
         info["context_refresh"] = str(output["context_refresh"])
     return rel_bonus, int_bonus, confidence, info, []

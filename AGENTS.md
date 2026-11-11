@@ -12,7 +12,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 
 ## Harness 接入
 
-- 只在评分结果为 `needs_relevance` 时读取通过完整性、来源覆盖和哈希校验的 YWContext P1 路由；P1 不得进入原文忠实度、质量分、引用或交付状态判断。路由不可用时按质量分安全降级，不读取旧 YWNext 文件。
+- 只在评分结果为 `needs_relevance` 时读取 YWContext P1；逐条验证返回正文与 manifest 哈希。`coverage.complete=false` 表示外围来源有缺口，不使本仓哈希有效的 P1 失效；使用本仓基础并保留覆盖状态，不把缺失来源当成“没有兴趣”。按固定提交的实时规则表和 `external_followups[].lookup_hints` 检查与文章相关的来源；已查到的来源需保留来源/版本/哈希，不可读的来源记为缺口并继续可完成的评分。自动评分结果必须明确报告 `external_followups_checked`，不得把未查的来源说成已查。P1 不得进入原文忠实度、质量分、引用或交付状态判断。路由本身无效时按质量分安全降级，不读取旧 YWNext 文件。
 - 每次阶段转换以当前 `run_dir`、`summary.json`、哈希和来源状态为准；不以对话记忆或旧产物推断完成。
 - 文档创建、卡片发送和 ChatGPT Bridge 芒格后处理分别保留尝试与读回证据；提交不确定时停止，禁止自动重发。
 

@@ -51,12 +51,15 @@ def context_route_payload(content="长期兴趣：价值投资；教育与 AI；
         "snapshot_commit": "a" * 40,
         "record_count": 1,
         "manifest_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "completeness_status": "complete",
         "coverage": {
             "complete": True,
             "required_source_ids": ["learn-x-memory-p1-content"],
             "ready_source_ids": ["learn-x-memory-p1-content"],
             "blocked_source_ids": [],
+            "resolved_entry_source_ids": ["learn-x-memory-p1-content"],
         },
+        "external_followups": [{"source_id": "yw-context-rule-table", "reason_codes": ["live_rule_table_not_checked_by_route"]}],
         "entries": [entry],
     }
 
@@ -109,7 +112,7 @@ def quality(dimension_scores=None, confidence="high", source_status="complete", 
 
 def relevance(relevance_score=0.5, interest_score=0.5, confidence="high", context_text=CONTEXT):
     context_route = cs._parse_ywcontext_p1(context_text)
-    return {
+    output = {
         "schema_version": cs.RELEVANCE_VERSION,
         "relevance_score": relevance_score,
         "interest_score": interest_score,
@@ -121,6 +124,17 @@ def relevance(relevance_score=0.5, interest_score=0.5, confidence="high", contex
         "context_snapshot_commit": context_route["snapshot_commit"] if context_route else None,
         "context_manifest_sha256": context_route["manifest_sha256"] if context_route else None,
     }
+    if context_route:
+        output.update({
+            "external_followups_checked": True,
+            "external_followup_receipt_sha256": "e" * 64,
+            "external_followup_receipts": [{
+                "source_id": item["source_id"],
+                "status": "unavailable",
+                "reason": "synthetic fixture did not read this source",
+            } for item in context_route["external_followups"]],
+        })
+    return output
 
 
 def importance(authority_score=9.0, confidence="high", evidence=None):
@@ -1123,17 +1137,54 @@ def test_validated_full_context_is_accepted_for_relevance():
     assert result["relevance_score"] == 0.5 and result["context_fingerprint"] is not None
 
 
-def test_ywcontext_p1_route_requires_complete_coverage_and_matching_hashes():
+def test_ywcontext_p1_route_accepts_verified_local_base_with_external_gaps():
     payload = context_route_payload()
     assert cs._validate_context(json.dumps(payload, ensure_ascii=False))
 
     incomplete = json.loads(json.dumps(payload))
     incomplete["coverage"]["complete"] = False
-    assert not cs._validate_context(json.dumps(incomplete, ensure_ascii=False))
+    incomplete["completeness_status"] = "local_base_with_external_gaps"
+    incomplete["coverage"]["ready_source_ids"] = []
+    incomplete["coverage"]["blocked_source_ids"] = ["learn-x-memory-p1-content"]
+    incomplete["external_followups"].append({"source_id": "learn-x-memory-p1-content", "reason_codes": ["source_not_ready"]})
+    incomplete_text = json.dumps(incomplete, ensure_ascii=False)
+    assert cs._validate_context(incomplete_text)
+    partial_result = cs.score(quality(), SOURCE, relevance_output=relevance(context_text=incomplete_text), context_text=incomplete_text)
+    assert partial_result["score_status"] == "scored"
+    assert partial_result["relevance_dimensions"]["context_completeness_status"] == "local_base_with_external_gaps"
+    assert partial_result["relevance_dimensions"]["context_coverage_complete"] is False
+    assert partial_result["relevance_dimensions"]["context_unresolved_source_ids"] == ["learn-x-memory-p1-content"]
+    assert partial_result["relevance_dimensions"]["external_followups_checked"] is True
+    assert partial_result["relevance_dimensions"]["external_followup_receipts"][-1]["status"] == "unavailable"
+    assert "not evidence of no personal interest" in cs._ywcontext_p1_text(incomplete_text, external_followups_checked=True)
 
     missing_source = json.loads(json.dumps(payload))
     missing_source["coverage"]["ready_source_ids"] = []
     assert not cs._validate_context(json.dumps(missing_source, ensure_ascii=False))
+
+    inconsistent_status = json.loads(json.dumps(incomplete))
+    inconsistent_status["completeness_status"] = "complete"
+    assert not cs._validate_context(json.dumps(inconsistent_status, ensure_ascii=False))
+
+    overlapping_sources = json.loads(json.dumps(incomplete))
+    overlapping_sources["coverage"]["ready_source_ids"] = ["learn-x-memory-p1-content"]
+    assert not cs._validate_context(json.dumps(overlapping_sources, ensure_ascii=False))
+
+    wrong_resolved_sources = json.loads(json.dumps(incomplete))
+    wrong_resolved_sources["coverage"]["resolved_entry_source_ids"] = []
+    assert not cs._validate_context(json.dumps(wrong_resolved_sources, ensure_ascii=False))
+
+    missing_blocked_source = json.loads(json.dumps(incomplete))
+    missing_blocked_source["coverage"]["blocked_source_ids"] = []
+    assert not cs._validate_context(json.dumps(missing_blocked_source, ensure_ascii=False))
+
+    missing_rule_followup = json.loads(json.dumps(incomplete))
+    missing_rule_followup["external_followups"] = [item for item in missing_rule_followup["external_followups"] if item["source_id"] != "yw-context-rule-table"]
+    assert not cs._validate_context(json.dumps(missing_rule_followup, ensure_ascii=False))
+
+    missing_blocked_followup = json.loads(json.dumps(incomplete))
+    missing_blocked_followup["external_followups"] = [item for item in missing_blocked_followup["external_followups"] if item["source_id"] != "learn-x-memory-p1-content"]
+    assert not cs._validate_context(json.dumps(missing_blocked_followup, ensure_ascii=False))
 
     wrong_manifest = json.loads(json.dumps(payload))
     wrong_manifest["manifest_sha256"] = "0" * 64
@@ -1150,6 +1201,79 @@ def test_ywcontext_p1_route_requires_complete_coverage_and_matching_hashes():
     stale_relevance["context_manifest_sha256"] = "0" * 64
     result = cs.score(quality(), SOURCE, relevance_output=stale_relevance, context_text=CONTEXT)
     assert result["relevance_score"] is None and result["context_fingerprint"] is None
+
+
+def test_external_followup_receipt_is_bound_to_route_and_hashes():
+    route = context_route_payload()
+    body = "规则表行：learn-x-memory.confirmed 已批准"
+    receipt = {
+        "schema": "yw-context-external-followup-receipt/v1",
+        "snapshot_commit": route["snapshot_commit"],
+        "manifest_sha256": route["manifest_sha256"],
+        "checked_at": "2026-11-11T12:00:00+08:00",
+        "items": [{
+            "source_id": "yw-context-rule-table",
+            "status": "verified",
+            "source_reference": "https://ywhome.feishu.cn/base/example",
+            "source_version": "base-revision:10",
+            "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "content": body,
+        }],
+    }
+    validated = relevance_generator.validate_external_followup_receipt(receipt, route)
+    assert validated["items"][0]["status"] == "verified"
+    assert body in json.dumps(validated["prompt_items"], ensure_ascii=False)
+
+    unavailable = json.loads(json.dumps(receipt))
+    unavailable["items"][0] = {"source_id": "yw-context-rule-table", "status": "unavailable", "reason": "live rule table read failed"}
+    assert relevance_generator.validate_external_followup_receipt(unavailable, route)["items"][0]["status"] == "unavailable"
+
+    stale = json.loads(json.dumps(receipt))
+    stale["snapshot_commit"] = "f" * 40
+    try:
+        relevance_generator.validate_external_followup_receipt(stale, route)
+    except RuntimeError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("stale external receipt must fail")
+
+    altered = json.loads(json.dumps(receipt))
+    altered["items"][0]["content"] = body + " altered"
+    try:
+        relevance_generator.validate_external_followup_receipt(altered, route)
+    except RuntimeError as exc:
+        assert "matching SHA-256" in str(exc)
+    else:
+        raise AssertionError("external content hash mismatch must fail")
+
+
+def test_scoring_accepts_only_external_followup_metadata_bound_to_every_route_id():
+    output = relevance(context_text=CONTEXT)
+    output["external_followup_receipt_sha256"] = "b" * 64
+    output["external_followup_receipts"] = [{
+        "source_id": "yw-context-rule-table",
+        "status": "verified",
+        "source_reference": "https://ywhome.feishu.cn/base/example",
+        "source_version": "base-revision:10",
+        "sha256": "c" * 64,
+    }]
+    _, _, _, info, errors = cs._relevance_result(output, CONTEXT)
+    assert not errors
+    assert info["external_followups_checked"] is True
+    assert info["external_followup_receipt_sha256"] == "b" * 64
+
+    missing_receipt = relevance(context_text=CONTEXT)
+    del missing_receipt["external_followups_checked"]
+    del missing_receipt["external_followup_receipt_sha256"]
+    del missing_receipt["external_followup_receipts"]
+    _, _, status, _, errors = cs._relevance_result(missing_receipt, CONTEXT)
+    assert status == "unavailable"
+    assert any("required for this YWContext route" in error for error in errors)
+
+    output["external_followup_receipts"] = []
+    _, _, status, _, errors = cs._relevance_result(output, CONTEXT)
+    assert status == "unavailable"
+    assert any("do not match" in error for error in errors)
 
 
 def test_context_fingerprint_tracks_pinned_commit_and_manifest():
@@ -1852,6 +1976,7 @@ def test_authority_search_generator_runs_real_tvly_and_grounds_assessment():
 def test_authority_search_generator_reports_tvly_failures_honestly():
     identity = {"schema_version": "1", "title": "Bill Gates AI", "author": "", "publisher": "", "entities": [{"type": "person", "name": "Bill Gates", "aliases": []}], "event_hint": "AI", "topic": {"primary": "AI/技术", "secondary": ""}, "source_candidates": []}
     original_tvly = authority_generator.run_tvly
+    original_call = authority_generator._call_once
     calls = []
 
     def fake_tvly(query, timeout):
@@ -1862,13 +1987,18 @@ def test_authority_search_generator_reports_tvly_failures_honestly():
             return None, "timeout"
         return json.dumps({"results": [{"url": "https://example.com/bill", "title": "Bill Gates", "content": "profile"}]}), None
 
+    def fake_call(identity_packet, results, timeout, attempt):
+        return {"entity_match": "confirmed", "topic_match": "strong", "suggested_score": 8.0, "basis": "fixture result"}
+
     authority_generator.run_tvly = fake_tvly
+    authority_generator._call_once = fake_call
     try:
         ok_observation = authority_generator.run(identity, 1)
         auth_observation = authority_generator.run({**identity, "title": "x", "entities": [], "event_hint": ""}, 1)
         timeout_observation = authority_generator.run({**identity, "title": "y", "entities": [], "event_hint": ""}, 1)
     finally:
         authority_generator.run_tvly = original_tvly
+        authority_generator._call_once = original_call
     assert ok_observation["tool_status"] == "ok" and len(ok_observation["results"]) == 1
     assert auth_observation["tool_status"] == "unavailable" and auth_observation["results"] == []
     assert auth_observation["assessment"]["entity_match"] == "unknown"
