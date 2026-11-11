@@ -28,6 +28,7 @@ import unicodedata
 from urllib.parse import urlparse
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from ywcontext_external_receipt import validate_external_followup_receipt, verify_external_followup_sources
 
 POLICY_PATH = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/scoring-policy.json"
 
@@ -155,8 +156,11 @@ def content_fingerprint(text: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def context_fingerprint(content_fp: str, context_text: str) -> str:
-    payload = f"{content_fp}\n{normalize_text(context_text)}\n{RELEVANCE_VERSION}"
+def context_fingerprint(content_fp: str, context_text: str, external_receipts: list | None = None) -> str:
+    external_digest = hashlib.sha256(json.dumps(
+        external_receipts or [], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    payload = f"{content_fp}\n{normalize_text(context_text)}\n{external_digest}\n{RELEVANCE_VERSION}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -503,36 +507,48 @@ def _validate_full_context(context_text: str) -> bool:
     return _parse_ywcontext_p1(context_text) is not None
 
 
-def _external_followup_receipt_errors(output: dict, route: dict) -> list[str]:
+def _external_followup_receipt_errors(output: dict, route: dict, external_context_text: str | None):
     checked = output.get("external_followups_checked")
     receipt_hash = output.get("external_followup_receipt_sha256")
     receipts = output.get("external_followup_receipts")
     if checked is not True:
-        return ["external followup check and receipt are required for this YWContext route"]
+        return ["external followup check and receipt are required for this YWContext route"], None
     errors = []
     if not isinstance(receipt_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", receipt_hash):
         errors.append("external followup receipt hash is invalid")
-    expected = {item["source_id"] for item in route.get("external_followups", [])}
-    if not isinstance(receipts, list) or any(not isinstance(item, dict) for item in receipts):
-        errors.append("external followup receipt entries are invalid")
-        return errors
-    actual = [item.get("source_id") for item in receipts]
-    if (any(not isinstance(source_id, str) or not source_id for source_id in actual)
-            or len(actual) != len(set(actual)) or set(actual) != expected):
-        errors.append("external followup receipt entries do not match the routed followups")
-        return errors
-    for item in receipts:
-        if item.get("status") == "verified":
-            if (not _nonempty(item.get("source_reference")) or not _nonempty(item.get("source_version"))
-                    or not isinstance(item.get("sha256"), str)
-                    or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
-                errors.append("verified external followup receipt is incomplete")
-        elif item.get("status") in {"unavailable", "not_relevant"}:
-            if not _nonempty(item.get("reason")):
-                errors.append("unavailable external followup receipt requires a reason")
-        else:
-            errors.append("external followup receipt status is invalid")
-    return errors
+    if not isinstance(external_context_text, str):
+        errors.append("external followup receipt file is required for deterministic revalidation")
+        return errors, None
+    try:
+        external_bytes = external_context_text.encode("utf-8")
+    except UnicodeEncodeError:
+        errors.append("external followup receipt file is not valid UTF-8 text")
+        return errors, None
+    if len(external_bytes) > 2 * 1024 * 1024:
+        errors.append("external followup receipt exceeds the 2 MiB limit")
+        return errors, None
+    if isinstance(receipt_hash, str) and re.fullmatch(r"[a-f0-9]{64}", receipt_hash):
+        actual_hash = hashlib.sha256(external_bytes).hexdigest()
+        if actual_hash != receipt_hash:
+            errors.append("external followup receipt file hash does not match relevance output")
+    try:
+        receipt = json.loads(external_context_text)
+    except (json.JSONDecodeError, TypeError):
+        errors.append("external followup receipt file is not valid JSON")
+        return errors, None
+    try:
+        validated = validate_external_followup_receipt(receipt, route)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return errors, None
+    try:
+        validated = verify_external_followup_sources(validated, route)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return errors, None
+    if not isinstance(receipts, list) or receipts != validated["items"]:
+        errors.append("external followup receipt metadata does not match the validated receipt file")
+    return errors, validated
 
 
 def _ywcontext_p1_text(context_text: str, *, external_followups_checked: bool = False) -> str:
@@ -555,7 +571,7 @@ def _validate_context(context_text: str) -> bool:
     return _validate_full_context(context_text)
 
 
-def _relevance_result(output, context_text: str | None):
+def _relevance_result(output, context_text: str | None, external_context_text: str | None = None):
     """双轴相关性：relevance_score（元主线命中）+ interest_score（领域兴趣），各自封顶后相加为总 bonus。"""
     context_route = _parse_ywcontext_p1(context_text)
     if output is None or context_route is None:
@@ -594,7 +610,8 @@ def _relevance_result(output, context_text: str | None):
         # 结论与 generate_relevance 一致：conclusion 缺失时回退 rationale（rationale 已必填）
         if not _nonempty(output.get("conclusion") or output.get("rationale")):
             errors.append("relevance conclusion is required")
-        errors.extend(_external_followup_receipt_errors(output, context_route))
+        external_errors, external_receipt = _external_followup_receipt_errors(output, context_route, external_context_text)
+        errors.extend(external_errors)
     confidence = output.get("confidence") if isinstance(output, dict) else None
     if errors or confidence == "low":
         return None, None, "unavailable", {}, errors or ["low_relevance_confidence"]
@@ -619,7 +636,7 @@ def _relevance_result(output, context_text: str | None):
     external_receipt_hash = output.get("external_followup_receipt_sha256")
     if isinstance(external_receipt_hash, str) and re.fullmatch(r"[a-f0-9]{64}", external_receipt_hash):
         info["external_followup_receipt_sha256"] = external_receipt_hash
-        info["external_followup_receipts"] = output.get("external_followup_receipts", [])
+        info["external_followup_receipts"] = external_receipt["items"]
     if output.get("context_refresh"):
         info["context_refresh"] = str(output["context_refresh"])
     return rel_bonus, int_bonus, confidence, info, []
@@ -664,6 +681,7 @@ def score(
     relevance_output=None,
     context_text=None,
     relevance_unavailable=False,
+    external_context_text=None,
 ):
     if not isinstance(source_text, str):
         return _needs_result("needs_review", content_fingerprint(""), ["source text must be a string"])
@@ -766,7 +784,9 @@ def score(
     elif relevance_unavailable:
         rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = None, None, "unavailable", {}, ["relevance_context_unavailable"]
     else:
-        rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(relevance_output, context_text)
+        rel_bonus, int_bonus, relevance_confidence, relevance_info, relevance_issues = _relevance_result(
+            relevance_output, context_text, external_context_text,
+        )
     issues += relevance_issues
     base_priority = quality_score if importance_score is None else round1(
         Decimal("0.70") * Decimal(str(quality_score)) + IMPORTANCE_WEIGHT * Decimal(str(importance_score))
@@ -782,7 +802,7 @@ def score(
         decision_score = round1(Decimal(str(base_priority)) + Decimal(str(rel_eff)) + Decimal(str(int_eff)))
         relevance_score = rel_eff
         interest_score = int_eff
-        context_fp = context_fingerprint(fp, context_text)
+        context_fp = context_fingerprint(fp, context_text, relevance_info.get("external_followup_receipts"))
     route = "long_read" if quality_score >= floor and decision_score >= threshold else "card"
     depth, cast_card = _depth(decision_score)
     return {
@@ -847,6 +867,7 @@ def main():
     parser.add_argument("--retry-quality-output")
     parser.add_argument("--relevance-output")
     parser.add_argument("--context")
+    parser.add_argument("--external-context", help="Raw external-followup receipt JSON used to generate relevance-output")
     parser.add_argument("--relevance-unavailable", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--self-check", action="store_true")
@@ -865,15 +886,18 @@ def main():
         parser.error("quality_output and source are required")
     if bool(args.relevance_output) != bool(args.context):
         parser.error("--relevance-output and --context must be provided together")
-    if args.relevance_unavailable and (args.relevance_output or args.context):
+    if bool(args.relevance_output) != bool(args.external_context):
+        parser.error("--relevance-output and --external-context must be provided together")
+    if args.relevance_unavailable and (args.relevance_output or args.context or args.external_context):
         parser.error("--relevance-unavailable cannot be combined with relevance input")
     result = score(
         _read_json(args.quality_output),
         Path(args.source).read_text(encoding="utf-8"),
         _read_json(args.retry_quality_output) if args.retry_quality_output else None,
         _read_json(args.relevance_output) if args.relevance_output else None,
-        Path(args.context).read_text(encoding="utf-8") if args.context else None,
+        Path(args.context).read_bytes().decode("utf-8") if args.context else None,
         args.relevance_unavailable,
+        Path(args.external_context).read_bytes().decode("utf-8") if args.external_context else None,
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     if args.output:

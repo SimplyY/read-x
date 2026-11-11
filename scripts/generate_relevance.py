@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate relevance_output v3.1 from a verified YWContext P1 route payload."""
+"""Generate relevance_output v3.2 from a verified YWContext P1 route payload."""
 from __future__ import annotations
 
 import argparse
@@ -17,9 +17,10 @@ from pathlib import Path
 import content_scoring as scoring
 import codex_model
 from codex_model import MODEL
+from ywcontext_external_receipt import validate_external_followup_receipt, verify_external_followup_sources
 
 MODEL_CANDIDATES = (MODEL,)
-RELEVANCE_VERSION = "3.1"
+RELEVANCE_VERSION = "3.2"
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 5
 
@@ -146,70 +147,6 @@ def extract_metadata(source_text: str) -> dict:
     return {"title": title, "author": author, "pubdate": pubdate, "url": url}
 
 
-def validate_external_followup_receipt(receipt: dict, route: dict) -> dict:
-    """Bind each route followup to a source read, an explicit gap, or a relevance decision."""
-    if not isinstance(receipt, dict) or receipt.get("schema") != "yw-context-external-followup-receipt/v1":
-        raise RuntimeError("external followup receipt schema is invalid")
-    if (receipt.get("snapshot_commit") != route.get("snapshot_commit")
-            or receipt.get("manifest_sha256") != route.get("manifest_sha256")):
-        raise RuntimeError("external followup receipt does not match the pinned YWContext route")
-    checked_at = receipt.get("checked_at")
-    if not isinstance(checked_at, str):
-        raise RuntimeError("external followup receipt timestamp is missing")
-    try:
-        from datetime import datetime
-        timestamp = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise RuntimeError("external followup receipt timestamp is invalid") from exc
-    if timestamp.tzinfo is None:
-        raise RuntimeError("external followup receipt timestamp requires a timezone")
-
-    expected = {item["source_id"] for item in route.get("external_followups", [])}
-    items = receipt.get("items")
-    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
-        raise RuntimeError("external followup receipt items are invalid")
-    actual_ids = [item.get("source_id") for item in items]
-    if (any(not isinstance(source_id, str) or not source_id for source_id in actual_ids)
-            or len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected):
-        raise RuntimeError("external followup receipt must assess every routed followup exactly once")
-
-    verified = []
-    prompt_items = []
-    total_chars = 0
-    for item in items:
-        source_id = item["source_id"]
-        status = item.get("status")
-        reason = item.get("reason")
-        if status == "verified":
-            reference = item.get("source_reference")
-            version = item.get("source_version")
-            content = item.get("content")
-            digest = item.get("sha256")
-            if (not isinstance(reference, str) or not reference.strip()
-                    or not isinstance(version, str) or not version.strip()
-                    or not isinstance(content, str) or not content.strip()
-                    or len(content) > 100_000
-                    or not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest)
-                    or hashlib.sha256(content.encode("utf-8")).hexdigest() != digest):
-                raise RuntimeError("verified external followup must include source identity, version, content, and matching SHA-256")
-            total_chars += len(content)
-            verified.append({"source_id": source_id, "status": status, "source_reference": reference,
-                             "source_version": version, "sha256": digest})
-            prompt_items.append({"source_id": source_id, "status": status, "source_reference": reference,
-                                 "source_version": version, "sha256": digest, "content": content})
-        elif status in {"unavailable", "not_relevant"}:
-            body = item.get("content")
-            if not isinstance(reason, str) or not reason.strip() or (body is not None and body != ""):
-                raise RuntimeError("unavailable/not_relevant followup must include a reason and no source body")
-            verified.append({"source_id": source_id, "status": status, "reason": reason.strip()})
-            prompt_items.append({"source_id": source_id, "status": status, "reason": reason.strip()})
-        else:
-            raise RuntimeError("external followup status is invalid")
-    if total_chars > 500_000:
-        raise RuntimeError("external followup receipt content exceeds the scoring context limit")
-    return {"items": verified, "prompt_items": prompt_items}
-
-
 def acknowledge_context_read(payload: dict) -> None:
     receipt = payload.get("consumer_receipt")
     if (not isinstance(receipt, dict)
@@ -263,6 +200,7 @@ def main() -> int:
     external_receipt = validate_external_followup_receipt(
         json.loads(external_receipt_bytes.decode("utf-8")), context_route,
     )
+    external_receipt = verify_external_followup_sources(external_receipt, context_route)
     context_text = scoring._ywcontext_p1_text(context_payload_text, external_followups_checked=True)
     external_prompt_json = json.dumps(external_receipt["prompt_items"], ensure_ascii=False)
     external_prompt_json = external_prompt_json.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")

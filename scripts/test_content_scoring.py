@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import content_scoring as cs
+import ywcontext_external_receipt as external_receipt_validator
 import codex_model
 import fetch_base_config
 import generate_quality as quality_generator
@@ -65,6 +66,83 @@ def context_route_payload(content="长期兴趣：价值投资；教育与 AI；
 
 
 CONTEXT = json.dumps(context_route_payload(), ensure_ascii=False, separators=(",", ":"))
+
+
+def external_receipt_text(context_text=CONTEXT, *, items=None):
+    route = cs._parse_ywcontext_p1(context_text)
+    if route is None:
+        return None
+    if items is None:
+        items = [{
+            "source_id": item["source_id"],
+            "status": "unavailable",
+            "reason": "synthetic fixture did not read this source",
+        } for item in route["external_followups"]]
+    receipt = {
+        "schema": "yw-context-external-followup-receipt/v1",
+        "snapshot_commit": route["snapshot_commit"],
+        "manifest_sha256": route["manifest_sha256"],
+        "checked_at": "2026-11-11T12:00:00+08:00",
+        "items": items,
+    }
+    return json.dumps(receipt, ensure_ascii=False, separators=(",", ":"))
+
+
+def trusted_rule_table_fixture(context_text=CONTEXT):
+    route = context_text if isinstance(context_text, dict) else cs._parse_ywcontext_p1(context_text)
+    row = {
+        "rule_id": "rule.priority",
+        "name": "规则命中顺序",
+        "url": "https://ywhome.feishu.cn/base/QHAXbx7hGaYyQVsXJjfcPTeinmh?table=tblL21p51YdRAokP&record=rec-rule-priority",
+    }
+    rows = [row]
+    rows_sha256 = hashlib.sha256(json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    live = {
+        "schema": "yw-context-live-classification-rule-table/v1",
+        "source_id": "yw-context-rule-table",
+        "source_revision": "base-revision:10",
+        "record_count": 1,
+        "rows_sha256": rows_sha256,
+        "rows": rows,
+        "snapshot_commit": route["snapshot_commit"],
+        "pinned_policy_status": "matches_pinned_policy",
+    }
+    content = {key: live[key] for key in ("source_id", "source_revision", "record_count", "rows_sha256", "rows")}
+    content_text = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    item = {
+        "source_id": "yw-context-rule-table",
+        "status": "verified",
+        "source_reference": row["url"].split("&record=", 1)[0],
+        "source_version": live["source_revision"],
+        "sha256": hashlib.sha256(content_text.encode("utf-8")).hexdigest(),
+        "content": content_text,
+    }
+    return live, item
+
+
+def fixture_authoritative_rule_table(route):
+    live, _ = trusted_rule_table_fixture(route)
+    return live, "live_readback_matches_pinned"
+
+
+external_receipt_validator.read_authoritative_rule_table = fixture_authoritative_rule_table
+
+
+_real_score = cs.score
+
+
+def score_with_external_receipt(*args, **kwargs):
+    context_text = kwargs.get("context_text", args[4] if len(args) > 4 else None)
+    relevance_output = kwargs.get("relevance_output", args[3] if len(args) > 3 else None)
+    if ("external_context_text" not in kwargs and relevance_output is not None
+            and isinstance(context_text, str) and cs._parse_ywcontext_p1(context_text) is not None):
+        kwargs["external_context_text"] = external_receipt_text(context_text)
+    return _real_score(*args, **kwargs)
+
+
+cs.score = score_with_external_receipt
+
+
 def dimension_input(key, score):
     value = Decimal(str(score))
     return {"level": float(value), "disqualifiers": []}
@@ -125,14 +203,16 @@ def relevance(relevance_score=0.5, interest_score=0.5, confidence="high", contex
         "context_manifest_sha256": context_route["manifest_sha256"] if context_route else None,
     }
     if context_route:
+        external_text = external_receipt_text(context_text)
+        external_payload = json.loads(external_text)
+        verified_receipt = external_receipt_validator.verify_external_followup_sources(
+            relevance_generator.validate_external_followup_receipt(external_payload, context_route),
+            context_route,
+        )
         output.update({
             "external_followups_checked": True,
-            "external_followup_receipt_sha256": "e" * 64,
-            "external_followup_receipts": [{
-                "source_id": item["source_id"],
-                "status": "unavailable",
-                "reason": "synthetic fixture did not read this source",
-            } for item in context_route["external_followups"]],
+            "external_followup_receipt_sha256": hashlib.sha256(external_text.encode("utf-8")).hexdigest(),
+            "external_followup_receipts": verified_receipt["items"],
         })
     return output
 
@@ -1246,34 +1326,190 @@ def test_external_followup_receipt_is_bound_to_route_and_hashes():
     else:
         raise AssertionError("external content hash mismatch must fail")
 
+    for invalid_receipt in (
+        {**receipt, "checked_at": "2026-11-11T12:00:00"},
+        {**receipt, "items": []},
+        {**receipt, "items": [receipt["items"][0], receipt["items"][0]]},
+        {**receipt, "items": [{**receipt["items"][0], "source_id": "unexpected-source"}]},
+    ):
+        try:
+            relevance_generator.validate_external_followup_receipt(invalid_receipt, route)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("incomplete, duplicated, extra, or timezone-free receipt must fail")
+
+    oversized_route = {**route, "external_followups": [{"source_id": f"source-{i}"} for i in range(6)]}
+    oversized_items = []
+    for i in range(6):
+        oversized_body = "x" * 90_000
+        oversized_items.append({
+            "source_id": f"source-{i}",
+            "status": "verified",
+            "source_reference": f"https://example.com/{i}",
+            "source_version": "v1",
+            "sha256": hashlib.sha256(oversized_body.encode("utf-8")).hexdigest(),
+            "content": oversized_body,
+        })
+    oversized_receipt = {**receipt, "items": oversized_items}
+    try:
+        relevance_generator.validate_external_followup_receipt(oversized_receipt, oversized_route)
+    except RuntimeError as exc:
+        assert "context limit" in str(exc)
+    else:
+        raise AssertionError("receipt above the total context limit must fail")
+
 
 def test_scoring_accepts_only_external_followup_metadata_bound_to_every_route_id():
     output = relevance(context_text=CONTEXT)
-    output["external_followup_receipt_sha256"] = "b" * 64
-    output["external_followup_receipts"] = [{
+    external_text = external_receipt_text(CONTEXT)
+    _, _, _, info, errors = cs._relevance_result(output, CONTEXT, external_text)
+    assert not errors
+    assert info["external_followups_checked"] is True
+    assert info["external_followup_receipt_sha256"] == output["external_followup_receipt_sha256"]
+
+    forged = relevance(context_text=CONTEXT)
+    forged["external_followup_receipt_sha256"] = "b" * 64
+    forged["external_followup_receipts"] = [{
         "source_id": "yw-context-rule-table",
         "status": "verified",
         "source_reference": "https://ywhome.feishu.cn/base/example",
         "source_version": "base-revision:10",
         "sha256": "c" * 64,
     }]
-    _, _, _, info, errors = cs._relevance_result(output, CONTEXT)
-    assert not errors
-    assert info["external_followups_checked"] is True
-    assert info["external_followup_receipt_sha256"] == "b" * 64
+    _, _, status, _, errors = cs._relevance_result(forged, CONTEXT, external_text)
+    assert status == "unavailable"
+    assert any("file hash does not match" in error for error in errors)
+
+    route = cs._parse_ywcontext_p1(CONTEXT)
+    live_table, verified_item = trusted_rule_table_fixture(CONTEXT)
+    verified_text = external_receipt_text(CONTEXT, items=[verified_item])
+    original_reader = external_receipt_validator.read_authoritative_rule_table
+    external_receipt_validator.read_authoritative_rule_table = lambda current_route: (live_table, "live_readback_matches_pinned")
+    try:
+        validated = relevance_generator.validate_external_followup_receipt(json.loads(verified_text), route)
+        verified_receipt = external_receipt_validator.verify_external_followup_sources(validated, route)
+        pinned_receipt = external_receipt_validator.verify_external_followup_sources(
+            validated, route, reader=lambda _: (live_table, "pinned_snapshot_only_live_unavailable"),
+        )
+        assert pinned_receipt["items"][0]["verification_provenance"] == "pinned_snapshot_only_live_unavailable"
+        verified = relevance(context_text=CONTEXT)
+        verified["external_followup_receipt_sha256"] = hashlib.sha256(verified_text.encode("utf-8")).hexdigest()
+        verified["external_followup_receipts"] = verified_receipt["items"]
+        _, _, _, info, errors = cs._relevance_result(verified, CONTEXT, verified_text)
+        assert not errors
+        assert info["external_followup_receipts"][0]["verification_provenance"] == "live_readback_matches_pinned"
+
+        forged_payload = json.loads(verified_text)
+        forged_payload["items"][0]["source_reference"] = "https://attacker.invalid/fake-source"
+        forged_payload["items"][0]["source_version"] = "invented-revision"
+        forged_text = json.dumps(forged_payload, ensure_ascii=False, separators=(",", ":"))
+        forged_source = json.loads(json.dumps(verified))
+        forged_source["external_followup_receipt_sha256"] = hashlib.sha256(forged_text.encode("utf-8")).hexdigest()
+        forged_source["external_followup_receipts"][0]["source_reference"] = "https://attacker.invalid/fake-source"
+        forged_source["external_followup_receipts"][0]["source_version"] = "invented-revision"
+        _, _, status, _, errors = cs._relevance_result(forged_source, CONTEXT, forged_text)
+        assert status == "unavailable"
+        assert any("authoritative source" in error or "source version" in error for error in errors)
+
+        fake_content_payload = json.loads(verified_text)
+        fake_table_content = json.loads(fake_content_payload["items"][0]["content"])
+        fake_table_content["rows"][0]["name"] = "自洽但伪造的规则名"
+        fake_content_payload["items"][0]["content"] = json.dumps(fake_table_content, ensure_ascii=False, separators=(",", ":"))
+        fake_content_payload["items"][0]["sha256"] = hashlib.sha256(
+            fake_content_payload["items"][0]["content"].encode("utf-8")
+        ).hexdigest()
+        fake_content_text = json.dumps(fake_content_payload, ensure_ascii=False, separators=(",", ":"))
+        fake_content = json.loads(json.dumps(verified))
+        fake_content["external_followup_receipt_sha256"] = hashlib.sha256(fake_content_text.encode("utf-8")).hexdigest()
+        fake_content["external_followup_receipts"][0]["sha256"] = fake_content_payload["items"][0]["sha256"]
+        _, _, status, _, errors = cs._relevance_result(fake_content, CONTEXT, fake_content_text)
+        assert status == "unavailable"
+        assert any("does not match the authoritative source" in error for error in errors), errors
+
+        tampered_payload = json.loads(verified_text)
+        tampered_payload["items"][0]["content"] += " 被篡改"
+        tampered_text = json.dumps(tampered_payload, ensure_ascii=False, separators=(",", ":"))
+        tampered = json.loads(json.dumps(verified))
+        tampered["external_followup_receipt_sha256"] = hashlib.sha256(tampered_text.encode("utf-8")).hexdigest()
+        _, _, status, _, errors = cs._relevance_result(tampered, CONTEXT, tampered_text)
+        assert status == "unavailable"
+        assert any("matching SHA-256" in error for error in errors)
+
+        wrong_route_payload = json.loads(verified_text)
+        wrong_route_payload["snapshot_commit"] = "f" * 40
+        wrong_route_text = json.dumps(wrong_route_payload, ensure_ascii=False, separators=(",", ":"))
+        wrong_route = json.loads(json.dumps(verified))
+        wrong_route["external_followup_receipt_sha256"] = hashlib.sha256(wrong_route_text.encode("utf-8")).hexdigest()
+        _, _, status, _, errors = cs._relevance_result(wrong_route, CONTEXT, wrong_route_text)
+        assert status == "unavailable"
+        assert any("does not match the pinned" in error for error in errors)
+    finally:
+        external_receipt_validator.read_authoritative_rule_table = original_reader
 
     missing_receipt = relevance(context_text=CONTEXT)
     del missing_receipt["external_followups_checked"]
     del missing_receipt["external_followup_receipt_sha256"]
     del missing_receipt["external_followup_receipts"]
-    _, _, status, _, errors = cs._relevance_result(missing_receipt, CONTEXT)
+    _, _, status, _, errors = cs._relevance_result(missing_receipt, CONTEXT, external_text)
     assert status == "unavailable"
     assert any("required for this YWContext route" in error for error in errors)
 
     output["external_followup_receipts"] = []
-    _, _, status, _, errors = cs._relevance_result(output, CONTEXT)
+    _, _, status, _, errors = cs._relevance_result(output, CONTEXT, external_text)
     assert status == "unavailable"
-    assert any("do not match" in error for error in errors)
+    assert any("does not match the validated receipt file" in error for error in errors)
+
+    unsupported_route_payload = context_route_payload()
+    unsupported_route_payload["external_followups"].append({"source_id": "flomo", "reason_codes": ["source_not_ready"]})
+    unsupported_route_text = json.dumps(unsupported_route_payload, ensure_ascii=False, separators=(",", ":"))
+    unsupported_route = cs._parse_ywcontext_p1(unsupported_route_text)
+    _, unsupported_item = trusted_rule_table_fixture(unsupported_route_text)
+    unsupported_item["source_id"] = "flomo"
+    unsupported_items = [{"source_id": "yw-context-rule-table", "status": "unavailable", "reason": "live rules unavailable"}, unsupported_item]
+    unsupported_receipt = relevance_generator.validate_external_followup_receipt(
+        json.loads(external_receipt_text(unsupported_route_text, items=unsupported_items)), unsupported_route,
+    )
+    try:
+        external_receipt_validator.verify_external_followup_sources(unsupported_receipt, unsupported_route)
+    except RuntimeError as exc:
+        assert "no authoritative source verifier" in str(exc)
+    else:
+        raise AssertionError("unregistered source verifier must not permit external relevance evidence")
+
+    not_relevant_items = [{
+        "source_id": "yw-context-rule-table",
+        "status": "not_relevant",
+        "reason": "self-reported irrelevant",
+    }]
+    not_relevant = relevance_generator.validate_external_followup_receipt(
+        json.loads(external_receipt_text(CONTEXT, items=not_relevant_items)), cs._parse_ywcontext_p1(CONTEXT),
+    )
+    checked_rule_table = external_receipt_validator.verify_external_followup_sources(
+        not_relevant, cs._parse_ywcontext_p1(CONTEXT), reader=fixture_authoritative_rule_table,
+    )
+    assert checked_rule_table["items"][0]["status"] == "verified"
+    assert checked_rule_table["items"][0]["verification_provenance"] == "live_readback_matches_pinned"
+
+    non_rule_route_payload = context_route_payload()
+    non_rule_route_payload["external_followups"].append({"source_id": "flomo", "reason_codes": ["source_not_ready"]})
+    non_rule_route_text = json.dumps(non_rule_route_payload, ensure_ascii=False, separators=(",", ":"))
+    non_rule_route = cs._parse_ywcontext_p1(non_rule_route_text)
+    non_rule_items = [
+        {"source_id": "yw-context-rule-table", "status": "unavailable", "reason": "ignored placeholder"},
+        {"source_id": "flomo", "status": "not_relevant", "reason": "self-reported irrelevant"},
+    ]
+    non_rule_receipt = relevance_generator.validate_external_followup_receipt(
+        json.loads(external_receipt_text(non_rule_route_text, items=non_rule_items)), non_rule_route,
+    )
+    try:
+        external_receipt_validator.verify_external_followup_sources(
+            non_rule_receipt, non_rule_route, reader=fixture_authoritative_rule_table,
+        )
+    except RuntimeError as exc:
+        assert "source-completeness verifier" in str(exc)
+    else:
+        raise AssertionError("self-reported not_relevant from an unsupported source must not suppress unknown content")
 
 
 def test_context_fingerprint_tracks_pinned_commit_and_manifest():
@@ -1285,6 +1521,33 @@ def test_context_fingerprint_tracks_pinned_commit_and_manifest():
     result1 = cs.score(quality(), SOURCE, relevance_output=relevance(context_text=first), context_text=first)
     result2 = cs.score(quality(), SOURCE, relevance_output=relevance(context_text=second), context_text=second)
     assert result1["context_fingerprint"] != result2["context_fingerprint"]
+
+    external_v2_text = external_receipt_text(first)
+    external_v2 = json.loads(external_v2_text)
+    external_v2["checked_at"] = "2026-11-12T12:00:00+08:00"
+    external_v2_text = json.dumps(external_v2, ensure_ascii=False, separators=(",", ":"))
+    output_v2 = relevance(context_text=first)
+    output_v2["external_followup_receipt_sha256"] = hashlib.sha256(external_v2_text.encode("utf-8")).hexdigest()
+    result3 = cs.score(quality(), SOURCE, relevance_output=output_v2, context_text=first, external_context_text=external_v2_text)
+    assert result1["context_fingerprint"] == result3["context_fingerprint"]
+
+    original_reader = external_receipt_validator.read_authoritative_rule_table
+    version2_table, _ = trusted_rule_table_fixture(first)
+    version2_table["source_revision"] = "base-revision:11"
+    version2_table["rows"][0]["name"] = "规则命中顺序修订"
+    version2_table["rows_sha256"] = hashlib.sha256(json.dumps(
+        version2_table["rows"], ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    external_receipt_validator.read_authoritative_rule_table = lambda _: (version2_table, "live_readback_differs_from_pinned")
+    try:
+        output_v3 = relevance(context_text=first)
+        result4 = cs.score(
+            quality(), SOURCE, relevance_output=output_v3, context_text=first,
+            external_context_text=external_receipt_text(first),
+        )
+    finally:
+        external_receipt_validator.read_authoritative_rule_table = original_reader
+    assert result1["context_fingerprint"] != result4["context_fingerprint"]
 
 
 def test_fingerprints_ignore_layout_but_track_content_and_context():
@@ -1386,25 +1649,52 @@ def test_three_axis_routing_matrix():
 def test_cli_end_to_end_success_and_failure_routes():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        yw_context_root = root / "yw-context"
+        (yw_context_root / "scripts").mkdir(parents=True)
+        live_table, _ = trusted_rule_table_fixture()
+        reader_script = (
+            "const table = " + json.dumps(live_table, ensure_ascii=False, separators=(",", ":")) + ";\n"
+            "const commitIndex = process.argv.indexOf('--commit');\n"
+            "table.snapshot_commit = process.argv[commitIndex + 1];\n"
+            "process.stdout.write(JSON.stringify(table) + '\\n');\n"
+        )
+        (yw_context_root / "scripts" / "read-classification-rules.mjs").write_text(reader_script, encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Read-X Test"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "read-x-test@example.invalid"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/SimplyY/yw-context.git"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "scripts/read-classification-rules.mjs"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-q", "-m", "test rule reader"], cwd=yw_context_root, check=True, capture_output=True, text=True)
+        cli_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=yw_context_root, check=True, capture_output=True, text=True).stdout.strip()
+        cli_context_payload = context_route_payload()
+        cli_context_payload["snapshot_commit"] = cli_commit
+        cli_context = json.dumps(cli_context_payload, ensure_ascii=False, separators=(",", ":"))
+
         source_path = root / "source.md"
         quality_path = root / "quality.json"
         relevance_path = root / "relevance.json"
         context_path = root / "ywcontext-p1.json"
+        external_context_path = root / "external-followups.json"
         source_path.write_text(SOURCE, encoding="utf-8")
-        relevance_path.write_text(json.dumps(relevance(), ensure_ascii=False), encoding="utf-8")
-        context_path.write_text(CONTEXT, encoding="utf-8")
+        context_path.write_text(cli_context, encoding="utf-8")
+        relevance_path.write_text(json.dumps(relevance(context_text=cli_context), ensure_ascii=False), encoding="utf-8")
+        external_context_path.write_text(external_receipt_text(cli_context), encoding="utf-8")
 
-        def run_cli(quality_output, context=CONTEXT):
+        def run_cli(quality_output, context=cli_context):
             quality_path.write_text(json.dumps(quality_output, ensure_ascii=False), encoding="utf-8")
             context_path.write_text(context, encoding="utf-8")
+            env = os.environ.copy()
+            env["YW_CONTEXT_ROOT"] = str(yw_context_root)
             completed = subprocess.run(
                 [
                     sys.executable, str(Path(cs.__file__)), str(quality_path), str(source_path),
                     "--relevance-output", str(relevance_path), "--context", str(context_path),
+                    "--external-context", str(external_context_path),
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
+                env=env,
             )
             return json.loads(completed.stdout)
 
@@ -1415,6 +1705,13 @@ def test_cli_end_to_end_success_and_failure_routes():
         result = run_cli(quality(boundary))
         assert (result["quality_score"], result["relevance_score"], result["interest_score"], result["decision_score"]) == (6.8, 0.5, 0.5, 8.2)
         assert result["route"] == "long_read" and result["ljg_range"] == [1, 1]
+
+        external_context_path.write_text("{}", encoding="utf-8")
+        tampered_result = run_cli(quality(boundary))
+        assert tampered_result["relevance_score"] is None
+        assert tampered_result["context_fingerprint"] is None
+        assert any("file hash does not match" in issue for issue in tampered_result["issues"])
+        external_context_path.write_text(external_receipt_text(cli_context), encoding="utf-8")
 
         quality_path.write_text(json.dumps(quality(boundary), ensure_ascii=False), encoding="utf-8")
         completed = subprocess.run(

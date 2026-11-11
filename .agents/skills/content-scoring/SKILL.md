@@ -24,7 +24,7 @@ link-card 抓取正文
   -> content_scoring.py 校验引用、算 quality_score、应用证据硬门
   -> 必要时 fresh-context 质量重评一次
   -> content_scoring.py 返回 scored 或 needs_relevance
-  -> 仅 needs_relevance 读取 YWContext P1 完整正文并生成 relevance_output v3.1
+  -> 仅 needs_relevance 读取 YWContext P1 完整正文并生成 relevance_output v3.2
   -> content_scoring.py 合成最终 decision_score、route、ljg_range
   -> link-card 发卡；route=long_read 时把 scoring_result 原样传给 long-read
 ```
@@ -43,15 +43,15 @@ link-card 抓取正文
 
 先仅传质量输出运行脚本。只有脚本返回 `score_status=needs_relevance` 时才执行本步；其他质量结果禁止读取 YWContext、禁止生成相关性。`needs_relevance` 是内部暂停态，不得发卡或分派。
 
-运行 YWContext P1 路由并把返回的 JSON 保存到当前 `run_dir`。路由会锁定最新 YWContext Git 提交；评分器逐条复核本仓正文哈希、manifest 哈希和覆盖声明。`coverage.complete=false` 时仍使用哈希有效的本仓 P1，并将缺口来源视为未知，不视为没有兴趣。按 `external_followups[].lookup_hints` 读取固定提交对应的实时规则表，并检查与文章相关的外围来源；将每个 followup 记入 `yw-context-external-followup-receipt/v1` 收据，绑定同一 `snapshot_commit` / `manifest_sha256`，状态为 `verified`（须含来源引用、版本、正文及正文 SHA-256）、`unavailable` 或 `not_relevant`（后二者须写明原因）。未能读取的来源保留为缺口，但继续按已验证内容评分。相关性模型不得把未查来源描述成已查。路由无效、没有任何可用本仓 P1 正文、外部核查收据缺失/不匹配或远端提交不可验证时，才停止相关性计算并用 `--relevance-unavailable` 回到质量分。不得读取 YWNext 副本或改用其他个人材料。
+运行 YWContext P1 路由并把返回的 JSON 保存到当前 `run_dir`。路由会锁定最新 YWContext Git 提交；评分器逐条复核本仓正文哈希、manifest 哈希和覆盖声明。`coverage.complete=false` 时仍使用哈希有效的本仓 P1，并将缺口来源视为未知，不视为没有兴趣。按 `external_followups[].lookup_hints` 检查相关外围来源，并生成绑定同一 `snapshot_commit` / `manifest_sha256` 的 `yw-context-external-followup-receipt/v1` 收据。哈希自洽只能证明文件未被改动，不能证明源端真实。当前只有 `yw-context-rule-table` 有权威读取器；`generate_relevance.py` 与最终评分器都会独立重读它，并把原始收据中的占位状态替换成经过验证的完整机读规则表。实时读取失败时仅回退到该固定提交中 schema、policy hash、revision、行数和 rows hash 全部通过的规则快照，并标明 `pinned_snapshot_only_live_unavailable`。若原始收据声称 `verified`，引用、版本与全量行必须和读取结果一致，否则拒绝。其他来源目前没有注册权威验证器，不能标 `verified` 或 `not_relevant`；读取不了、来源无验证器或无法证明完整检查范围时记录 `unavailable` 和原因。以后只有完成对应来源的权威读取器与回归，才可扩大验证范围。未能读取的来源保留为缺口，但继续使用已验证的本仓 P1 评分；相关性模型不得把未查来源描述成已查。路由无效、没有任何可用本仓 P1 正文、外部收据缺失/不匹配或远端提交不可验证时，才停止相关性计算并用 `--relevance-unavailable` 回到质量分。不得读取 YWNext 副本或改用其他个人材料。
 
-收据结构为：`{"schema":"yw-context-external-followup-receipt/v1","snapshot_commit":"<same commit>","manifest_sha256":"<same manifest>","checked_at":"<ISO-8601 with timezone>","items":[{"source_id":"<route followup id>","status":"verified","source_reference":"<clickable or repository locator>","source_version":"<revision or version>","sha256":"<content SHA-256>","content":"<only the relevant source excerpt>"}]}`。`items` 必须与路由 `external_followups` 的 source_id 集合一一对应。不可读或与文章无关时，将 item 状态设为 `unavailable` / `not_relevant` 并填写 `reason`，不写正文。先对 `yw-context-rule-table` followup 运行 `read-classification-rules.mjs --commit <snapshot_commit>`；再按每个来源的 `lookup_hints` 在登记仓库/入口核对相关内容及版本。已核查的来源只摘录本次需要的证据；不能读到的来源照实记录 `unavailable`，随后仍继续本仓评分。私有正文和收据只保存在本轮 `run_dir`。
+收据结构为：`{"schema":"yw-context-external-followup-receipt/v1","snapshot_commit":"<same commit>","manifest_sha256":"<same manifest>","checked_at":"<ISO-8601 with timezone>","items":[{"source_id":"<route followup id>","status":"unavailable","reason":"<unverified placeholder or unavailable reason>"}]}`。`items` 必须与路由 `external_followups` 的 source_id 集合一一对应。规则表原始项可留占位，两个评分阶段都会用可信读取替换；若手工附带 `verified` 表内容，必须按结构提供完整 rows，并与授权读回完全一致。其他来源在各自权威读取器接入前均记为 `unavailable`；不能将其声明为 `not_relevant` 来压掉未知信息。私有正文和收据只保存在本轮 `run_dir`。
 
 ```text
 /Users/yuwei/code/yw-context/scripts/context-route.mjs --mode full --latest --consumer read-x.content-scoring
 ```
 
-相关性隔离上下文只接收文章元数据、`claim_ledger`、路由结果中每条已校验的 P1 完整正文，以及按规则表实际读回并带来源标识/版本/哈希的相关外围资料。不要把完整外围原件混入长期画像；只取与本轮判断有关的最小证据。输出 `relevance_output v3.1`：对两条独立轴各给一个分，并附本次外围核查状态和未解决来源。`generate_relevance.py` 校验外围收据恰好覆盖路由中的所有 followup，成功后仅保留收据哈希和脱敏来源状态；它在评分结果成功写入后，使用已校验的 `consumer_receipt` 自动追加独立消费者 ACK。ACK 失败则本轮标记失败，不把未确认消费算作完成。指纹包含路由提交和 manifest 哈希；外围资料另由本轮来源/版本/哈希收据绑定。
+相关性隔离上下文只接收文章元数据、`claim_ledger`、路由结果中每条已校验的 P1 完整正文，以及按规则表实际读回并带来源标识/版本/哈希的相关外围资料。不要把完整外围原件混入长期画像；只取与本轮判断有关的最小证据。输出 `relevance_output v3.2`：对两条独立轴各给一个分，并附本次外围核查状态和未解决来源。`generate_relevance.py` 校验外围收据恰好覆盖路由中的所有 followup，成功后只保留来源元数据、验证方式与外层收据哈希，不在评分结果中复制外围正文；它在相关性结果成功写入后，使用已校验的 `consumer_receipt` 自动追加独立消费者 ACK。ACK 失败则本轮标记失败，不把未确认消费算作完成。上下文指纹包含路由提交、manifest 哈希，以及通过校验的来源状态、版本和正文哈希；收据时间戳变化不会单独改变指纹。
 
 - **方向相关 `relevance_score`**（0 到 `relevance_bonus.relevance_max`，0.5）：按文章**内容**对飞鱼元主线的命中程度。
 - **领域兴趣 `interest_score`**（0 到 `relevance_bonus.interest_max`，0.5）：只按 YWContext P1 正文明确列出的兴趣信息判断；缺少明确兴趣证据时不得臆造命中。
@@ -100,6 +100,7 @@ if node /Users/yuwei/code/yw-context/scripts/context-route.mjs \
     --output "$relevance_output"; then
   python3 scripts/content_scoring.py "<run_dir>/quality-output.json" "<run_dir>/source.md" \
     "${score_config_args[@]}" --relevance-output "$relevance_output" --context "$p1_route" \
+    --external-context "<run_dir>/external-followups.json" \
     --output "<run_dir>/scoring-result.json"
 else
   python3 scripts/content_scoring.py "<run_dir>/quality-output.json" "<run_dir>/source.md" \

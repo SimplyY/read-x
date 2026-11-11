@@ -59,11 +59,11 @@
 - 质量输出禁止包含 `calibration`；锚点和目标区间只用于评分后的外部闭卷回归。
 - `domain_confidence`：`high|medium|low`。
 
-## relevance_output v3.1
+## relevance_output v3.2
 
 ```json
 {
-  "schema_version": "3.1",
+  "schema_version": "3.2",
   "relevance_score": 0.5,
   "interest_score": 0.4,
   "matched_mainlines": ["AI 产业认知"],
@@ -72,7 +72,12 @@
   "confidence": "high",
   "conclusion": "相关性结论",
   "context_snapshot_commit": "40 位提交 SHA",
-  "context_manifest_sha256": "64 位 SHA-256"
+  "context_manifest_sha256": "64 位 SHA-256",
+  "external_followups_checked": true,
+  "external_followup_receipt_sha256": "64 位 SHA-256",
+  "external_followup_receipts": [
+    {"source_id": "yw-context-rule-table", "status": "verified", "source_reference": "权威来源链接", "source_version": "base-revision:N", "sha256": "64 位 SHA-256", "verification_provenance": "live_readback_matches_pinned"}
+  ]
 }
 ```
 
@@ -83,7 +88,7 @@
 - `relevance_score>0` 时 `matched_mainlines` 非空；`interest_score>0` 时 `matched_interests` 非空。
 - 判定看内容吻合度与相关性，不以作者身份/名气单独判断。
 - `confidence=low` 时脚本不采用相关性，决策分回退质量分。
-- 该输出不得接收或复述质量分；`schema_version != 3.1` 的旧输出一律拒绝。两个 `context_*` 字段由 `generate_relevance.py` 写入，不由模型生成；评分器必须匹配本轮 YWContext P1 路由的提交和 manifest。
+- 该输出不得接收或复述质量分；`schema_version != 3.2` 的旧输出一律拒绝。`context_*` 与外围收据字段由 `generate_relevance.py` 写入，不由模型生成。评分器必须匹配本轮 YWContext P1 路由、复算 sidecar 文件和内容哈希，并复核权威来源、revision 与完整规则表。
 
 ## scoring_result v3.19
 
@@ -92,7 +97,7 @@
   "score_version": "3.19",
   "policy_source": "base|local",
   "quality_version": "3.16",
-  "relevance_version": "3.1",
+  "relevance_version": "3.2",
   "content_fingerprint": "sha256",
   "context_fingerprint": "sha256 或 null",
   "score_status": "scored|needs_relevance|needs_full_text|needs_review",
