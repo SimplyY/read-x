@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>阅读工作台</title>
+  <link rel="stylesheet" href="./style.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="top"><span class="mark" aria-hidden="true">阅</span><strong>阅读工作台</strong></header>
+    <div class="layout">
+      <nav class="navigation" aria-label="阅读入口">
+        <button id="articles-tab" aria-current="page">文章</button>
+        <button id="books-tab">书籍</button>
+      </nav>
+      <main id="content">
+        <h1>稍后再读</h1>
+        <div class="filters"><label for="search">搜索文章</label><input id="search" type="search" placeholder="搜索标题或作者" autocomplete="off"><div class="filter-row"><select id="state-filter" aria-label="阅读状态"><option>待读</option><option>已读</option><option>跳过</option><option>全部状态</option></select><select id="topic-filter" aria-label="主题"><option>全部主题</option><option>AI与技术</option><option>投资与商业</option><option>历史与文明</option><option>学习与教育</option><option>生活与人文</option></select><select id="score-filter" aria-label="质量分"><option>全部评分</option><option>6分及以上</option><option>6分以下</option><option>评分未知</option></select><select id="length-filter" aria-label="阅读时长"><option>全部时长</option><option>10分钟内</option><option>11至20分钟</option><option>20分钟以上</option><option>时长未知</option></select><select id="pack-filter" aria-label="上下文包"><option>全部上下文包</option><option>已就绪</option><option>未就绪</option></select><select id="sort-filter" aria-label="排序"><option value="new">最新优先</option><option value="old">最早优先</option><option value="score">质量分最高</option><option value="short">阅读时长最短</option></select></div></div>
+        <div class="list-head"><h2>文章</h2><span id="count"></span></div>
+        <p id="status" role="status">正在读取文章…</p>
+        <div id="articles" class="items"></div><div class="pagination"><button id="previous">上一页</button><span id="page-info"></span><button id="next">下一页</button></div>
+      </main>
+    </div>
+  </div>
+  <dialog id="pack-dialog">
+    <div class="dialog-header"><h2 id="pack-title">上下文包</h2><button id="close-pack" aria-label="关闭">关闭</button></div>
+    <p id="pack-status" role="status"></p>
+    <textarea id="pack-content" readonly aria-label="上下文包正文"></textarea>
+    <div class="dialog-actions"><button id="copy-pack" class="primary">复制全文</button><a href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">打开 ChatGPT</a></div>
+  </dialog>
+</body>
+</html>

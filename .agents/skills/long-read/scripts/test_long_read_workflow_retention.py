@@ -191,8 +191,9 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(after_deadline["context_jobs_expired"], 1)
         retained = self.store.get_job(context["job_id"])
         self.assertEqual(retained["status"], "expired")
-        self.assertNotIn("private context title", json.dumps(retained["payload"]))
-        self.assertNotIn("private original text", json.dumps(retained["payload"]))
+        self.assertEqual(retained["payload"]["title"], "private context title")
+        self.assertEqual(retained["payload"]["source"], "private original text")
+        self.assertTrue((self.root / "jobs" / context["job_id"] / "private.txt").is_file())
         self.assertEqual(self.store.connection.execute(
             "SELECT COUNT(*) FROM events WHERE job_id=?", (context["job_id"],)
         ).fetchone()[0], 3)
@@ -202,18 +203,45 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(legacy_admission_after, legacy_admission_before)
         self.assertEqual(self.store.get_job(legacy["job_id"])["payload"]["title"], "private context title")
 
-    def test_context_statistics_are_removed_after_180_days(self):
+    def test_context_statistics_and_source_are_preserved_after_180_days(self):
         context = self.submit_context_fixture(revision=2, source_id="om_context_old")
 
         result = apply_context_retention(
             self.root, now=self.clock.value + STATISTICS_RETENTION_SECONDS + 1,
         )
 
-        self.assertEqual(result["context_statistics_rows_removed"], 1)
-        self.assertIsNone(self.store.get_job(context["job_id"]))
+        self.assertEqual(result["context_statistics_rows_removed"], 0)
+        self.assertIsNotNone(self.store.get_job(context["job_id"]))
+        self.assertTrue((self.root / "jobs" / context["job_id"] / "private.txt").is_file())
         self.assertEqual(self.store.connection.execute(
             "SELECT COUNT(*) FROM admission_attempts WHERE task_id=?", (context["job_id"],)
-        ).fetchone()[0], 0)
+        ).fetchone()[0], 1)
+
+    def test_both_retention_paths_preserve_context_and_shared_snapshot(self):
+        context = self.submit_context_fixture(source_id="om_context_shared")
+        original = self.submit(status="failed", source_id="om_same_snapshot")
+        digest = context["payload"]["snapshot_sha256"]
+        payload = original["payload"]
+        payload["snapshot_sha256"] = digest
+        self.store.connection.execute("UPDATE jobs SET payload_json=? WHERE job_id=?",
+                                      (json.dumps(payload), original["job_id"]))
+        job_dir, snapshot_dir = self.write_content(original | {"payload": payload})
+        context_dir = self.root / "jobs" / context["job_id"]
+        lease = self.store.acquire_lease(context["job_id"], "finish-context")
+        self.store.set_status(lease, "failed")
+        self.store.release_lease(lease)
+
+        for now in (self.clock.value + CONTENT_RETENTION_SECONDS + 1,
+                    self.clock.value + STATISTICS_RETENTION_SECONDS + 1):
+            apply_retention(self.root, now=now)
+            apply_context_retention(self.root, now=now)
+            self.assertTrue(context_dir.exists())
+            self.assertTrue(snapshot_dir.exists())
+            self.assertIsNotNone(self.store.get_job(context["job_id"]))
+            self.assertEqual(self.store.get_job(context["job_id"])["payload"]["source"],
+                             "private original text")
+        self.assertFalse(job_dir.exists())
+        self.assertIsNone(self.store.get_job(original["job_id"]))
 
     def test_unresolved_job_and_its_content_are_never_pruned(self):
         job = self.submit(status="pending")
