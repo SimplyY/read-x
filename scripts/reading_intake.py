@@ -100,7 +100,8 @@ def _open_database(state_dir: Path) -> sqlite3.Connection:
 
 
 def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
-                   allowed_chat_id: str, allowed_sender_id: str) -> dict:
+                   allowed_chat_id: str, allowed_sender_id: str,
+                   live_dispatch: bool = False) -> dict:
     """Persist the URLs from one trusted event, atomically and idempotently.
 
     Event fields are appId, chatId, chatType, senderId, senderType, messageId,
@@ -133,21 +134,27 @@ def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
             "SELECT fingerprint FROM intake_messages WHERE app_id=? AND message_id=?",
             (app_id, message_id),
         ).fetchone()
+        message_was_registered = existing is not None
         if existing:
             if existing[0] != fingerprint:
                 raise ValueError("message replay differs from original")
-            connection.commit()
-            return {"status": "duplicate", "articles": 0}
-        connection.execute("INSERT INTO intake_messages(app_id,message_id,fingerprint) VALUES(?,?,?)",
-                           (app_id, message_id, fingerprint))
+        else:
+            connection.execute("INSERT INTO intake_messages(app_id,message_id,fingerprint) VALUES(?,?,?)",
+                               (app_id, message_id, fingerprint))
         created = 0
+        policy_upgraded = False
         for canonical, original in normalized:
+            prior = connection.execute(
+                "SELECT pack_policy FROM intake_articles WHERE app_id=? AND canonical_url=?",
+                (app_id, canonical),
+            ).fetchone()
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO intake_articles(app_id,canonical_url,original_url,pack_policy) VALUES(?,?,?,?)",
                 (app_id, canonical, original, "score_only" if score_only else "normal"),
             )
             created += cursor.rowcount
             if not score_only:
+                policy_upgraded = policy_upgraded or (prior is not None and prior[0] == "score_only")
                 connection.execute("UPDATE intake_articles SET pack_policy='normal' WHERE app_id=? AND canonical_url=?", (app_id, canonical))
             article_id = connection.execute(
                 "SELECT id FROM intake_articles WHERE app_id=? AND canonical_url=?",
@@ -157,8 +164,21 @@ def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
                 "INSERT OR IGNORE INTO intake_message_articles(app_id,message_id,article_id) VALUES(?,?,?)",
                 (app_id, message_id, article_id),
             )
+        retry_candidate = False
+        if live_dispatch and len(normalized) == 1 and not created and not policy_upgraded and not message_was_registered:
+            # A new user message may retry only an explicitly terminated Agent
+            # run whose durable side-effect checks all pass.
+            from reading_dispatch_guard import can_retry_url
+            retry_candidate = can_retry_url(Path(state_dir), normalized[0][0], connection=connection)
         connection.commit()
-        return {"status": "accepted", "articles": created}
+        result = {"status": "duplicate" if message_was_registered else "accepted", "articles": created}
+        if live_dispatch:
+            # Multi-URL events are durably admitted too; claim() marks them
+            # needs_review until the workflow can process each source safely.
+            result["dispatch_candidate"] = (
+                created > 0 or policy_upgraded or message_was_registered or retry_candidate
+            )
+        return result
     except Exception:
         connection.rollback()
         raise
@@ -188,11 +208,37 @@ def main() -> int:
     parser.add_argument("--allowed-app-id", required=True)
     parser.add_argument("--allowed-chat-id", required=True)
     parser.add_argument("--allowed-sender-id", required=True)
+    parser.add_argument("--live", action="store_true", help="claim the message for one live Bridge dispatch")
+    parser.add_argument("--finish-dispatch", choices=("failed", "needs_review"),
+                        help="persist a terminal outcome for one previously claimed live dispatch")
+    parser.add_argument("--message-id", help="trusted Feishu message ID for --finish-dispatch")
     args = parser.parse_args()
     try:
+        if args.finish_dispatch:
+            if (args.allowed_app_id != "cli_aab030a473f8dcd2" or not args.message_id or
+                    not re.fullmatch(r"om_[A-Za-z0-9_-]{1,160}", args.message_id)):
+                raise ValueError("invalid dispatch identity")
+            from reading_dispatch_guard import finish_dispatch
+            result = {"status": finish_dispatch(args.state_dir, args.message_id, args.finish_dispatch)}
+            print(json.dumps(result))
+            return 0
+        if args.message_id:
+            raise ValueError("message ID requires a terminal dispatch outcome")
         event = json.load(sys.stdin)
         result = register_event(args.state_dir, event, allowed_app_id=args.allowed_app_id,
-                                allowed_chat_id=args.allowed_chat_id, allowed_sender_id=args.allowed_sender_id)
+                                allowed_chat_id=args.allowed_chat_id, allowed_sender_id=args.allowed_sender_id,
+                                live_dispatch=args.live)
+        if args.live:
+            candidate = result.pop("dispatch_candidate", False)
+            result["dispatch"] = "suppressed"
+            if candidate:
+                from reading_dispatch_guard import admit, claim
+                state = args.state_dir.absolute()
+                phase = admit(state, event["messageId"], exclusive_intake=True)
+                if phase == "queued":
+                    phase = claim(state, state.parent / "long-read" / "workflow.sqlite3",
+                                  event["messageId"], f"bridge:{os.getpid()}")
+                result["dispatch"] = phase
     except (ValueError, OSError, sqlite3.Error, json.JSONDecodeError):
         print(json.dumps({"status": "rejected", "reason": "invalid-event-or-unavailable-store"}))
         return 1

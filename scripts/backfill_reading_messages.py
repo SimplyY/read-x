@@ -14,11 +14,18 @@ from reading_intake import register_event, _open_database
 APP = 'cli_aab030a473f8dcd2'
 CHAT = 'oc_f79c12bcb643eb26c486282f933333a0'
 URL = re.compile(r'''https?://[^\s<>"']+''')
-TRAILING = '),.!?，。！？；）】'
+TRAILING = ',.!?，。！？；'
 
 
 def urls_for(content):
-    return [match.group().rstrip(TRAILING) for match in URL.finditer(content)]
+    urls = []
+    for match in URL.finditer(content):
+        value = match.group().rstrip(TRAILING)
+        for left, right in [('(', ')'), ('（', '）'), ('【', '】')]:
+            while value.endswith(right) and value.count(right) > value.count(left):
+                value = value[:-1].rstrip(TRAILING)
+        urls.append(value)
+    return urls
 
 
 def cli(args):
@@ -26,12 +33,16 @@ def cli(args):
     data = json.loads(result.stdout)
     if result.returncode or data.get('ok') is not True:
         raise RuntimeError('message history unavailable')
-    return data['data']
+    return data
 
 
 def scan(messages, owner, register):
     accepted = 0
     for message in messages:
+        replies = message.get('thread_replies') or []
+        if not isinstance(replies, list):
+            raise ValueError('unsupported thread replies')
+        accepted += scan(replies, owner, register)
         sender = message.get('sender') or {}
         if sender.get('sender_type') != 'user' or sender.get('id_type') != 'open_id' or sender.get('id') != owner:
             continue
@@ -68,9 +79,11 @@ def main():
         start = datetime.fromisoformat(previous) - timedelta(minutes=5)
     else:
         start = datetime(2026,11,17,16,tzinfo=timezone.utc)
-    data = cli(['im','+chat-messages-list','--chat-id',CHAT,'--as','bot','--no-reactions',
+    response = cli(['im','+chat-messages-list','--chat-id',CHAT,'--as','bot','--no-reactions',
                 '--start',start.isoformat(),'--end',now.isoformat(),'--order','asc','--page-all','--page-limit','1000'])
-    if data.get('has_more') or not isinstance(data.get('messages'),list):
+    data = response.get('data') or {}
+    pagination = response.get('meta', {}).get('pagination', {})
+    if pagination.get('complete') is not True or data.get('has_more') or not isinstance(data.get('messages'),list):
         raise RuntimeError('message history incomplete')
     if not args.execute:
         print(json.dumps({'status':'dry_run','messages':len(data['messages'])})); return 0

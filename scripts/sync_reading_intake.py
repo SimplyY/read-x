@@ -2,6 +2,8 @@
 """Synchronize durable Read-X intake records to the reading Base."""
 from __future__ import annotations
 import argparse
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import fcntl
 import hashlib
 import json
@@ -9,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+from urllib.parse import urlsplit
 from archive_reading_context import BASE, TABLE, LarkBase, load_journal, save_journal
 from reading_intake import list_pending, normalize_url, _open_database
 
@@ -44,6 +47,15 @@ def find_source(base, canonical_url):
         offset += len(rows)
 
 
+def field_matches(actual, expected, name):
+    if name == '入库时间' and isinstance(actual, str):
+        try:
+            return datetime.fromisoformat(actual).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M') == expected
+        except ValueError:
+            return False
+    return actual == expected
+
+
 def sync_one(item, base, journal, persist):
     key = 'url:' + hashlib.sha256(item['canonicalUrl'].encode()).hexdigest()
     entry = journal['jobs'].setdefault(str(item['id']), {'key': key, 'url': item['canonicalUrl']})
@@ -58,11 +70,15 @@ def sync_one(item, base, journal, persist):
     if not matches:
         if entry.get('create_attempted'):
             raise RuntimeError('record creation outcome unresolved')
-        entry['create_attempted'] = True
-        persist()
         fields = {'标题': item['originalUrl'], '文章键': key, '原文链接': item['originalUrl'],
                   '阅读状态': '待读', '人工版本': 1, '抓取状态': '待处理',
                   '评分状态': '待处理', '双包状态': '不生成' if item.get('packPolicy') == 'score_only' else '待处理'}
+        if item.get('createdAt'):
+            created = datetime.strptime(item['createdAt'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            fields['入库时间'] = created.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M')
+        fields['来源'] = urlsplit(item['originalUrl']).hostname or ''
+        entry['create_attempted'] = True
+        persist()
         try:
             base.call('+record-upsert', '--json', json.dumps(fields, ensure_ascii=False))
         except RuntimeError:
@@ -73,6 +89,23 @@ def sync_one(item, base, journal, persist):
     record = matches[0]
     if entry.get('record_id') not in (None, record['id']):
         raise ValueError('record identity changed')
+    # Repair metadata on records owned by this intake key only. A source match
+    # to an older context record may have unknown historical ingestion time.
+    if record['fields'].get('文章键') == key:
+        fields = {}
+        if not record['fields'].get('来源'):
+            fields['来源'] = urlsplit(item['originalUrl']).hostname or ''
+        if not record['fields'].get('入库时间') and item.get('createdAt'):
+            created = datetime.strptime(item['createdAt'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            fields['入库时间'] = created.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M')
+        if fields:
+            try:
+                base.call('+record-upsert', '--record-id', record['id'], '--json', json.dumps(fields, ensure_ascii=False))
+            except RuntimeError:
+                pass  # Readback resolves a timeout without changing user-owned fields.
+            check = base.find(key)
+            if len(check) != 1 or check[0]['id'] != record['id'] or any(not field_matches(check[0]['fields'].get(name), value, name) for name, value in fields.items()):
+                raise RuntimeError('intake metadata update outcome unresolved')
     entry['record_id'] = record['id']
     entry['status'] = 'verified'
     persist()
@@ -89,7 +122,8 @@ def main():
     if not args.execute:
         print(json.dumps({'status': 'dry_run', 'pending': len(pending)}))
         return 0
-    fd = os.open(state / 'sync.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    archive_state = Path(__file__).resolve().parents[1] / 'state/long-read'
+    fd = os.open(archive_state / 'reading-archive.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         journal_path = state / 'sync-journal.json'
@@ -97,16 +131,22 @@ def main():
         base = LarkBase(BASE, TABLE)
         base.verify_identity('cli_aab030a473f8dcd2')
         complete = 0
+        needs_review = 0
         for item in list_pending(state):
-            record_id = sync_one(item, base, journal, lambda: save_journal(journal_path, journal))
+            try:
+                sync_one(item, base, journal, lambda: save_journal(journal_path, journal))
+            except (ValueError, RuntimeError):
+                # Preserve unresolved items without blocking unrelated articles.
+                needs_review += 1
+                continue
             conn = _open_database(state)
             try:
                 conn.execute("UPDATE intake_articles SET sync_status='synced' WHERE id=? AND sync_status='pending'", (item['id'],))
             finally:
                 conn.close()
             complete += 1
-        print(json.dumps({'status': 'ok', 'synced': complete}))
-        return 0
+        print(json.dumps({'status': 'needs_review' if needs_review else 'ok', 'synced': complete, 'needs_review': needs_review}))
+        return 1 if needs_review else 0
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)

@@ -20,6 +20,9 @@ class FakeBase:
     def find(self, key):
         return copy.deepcopy([r for r in self.records if r['fields']['文章键'] == key])
 
+    def find_source(self, url):
+        return copy.deepcopy([r for r in self.records if r['fields'].get('原文链接') == url])
+
     def create(self, key, title):
         self.creates += 1
         if not self.discard_create:
@@ -39,8 +42,9 @@ class FakeBase:
     def download(self, record_id, token):
         return self.files[token]
 
-    def set_manifest(self, record_id, manifest):
+    def set_manifest(self, record_id, manifest, fields=None):
         self.records[0]['fields']['校验清单'] = manifest
+        self.records[0]['fields'].update(fields or {})
 
 
 def job():
@@ -104,6 +108,17 @@ class ArchiveTests(unittest.TestCase):
         base.create('context:app1:om_1', 'b')
         with self.assertRaisesRegex(ValueError, 'multiple'):
             archive(job(), base, journal, lambda: None)
+
+    def test_reuses_existing_intake_record_for_same_source(self):
+        base, journal = FakeBase(), {'jobs': {}}
+        base.records.append({'id':'rec1','fields':{'文章键':'url:existing','标题':'Existing',
+                                                  '原文链接':'https://example.com/a','状态':'已读'}})
+        source = {**job(), 'source_url':'https://example.com/a'}
+        result = archive(source, base, journal, lambda: None)
+        self.assertEqual(result['record_id'], 'rec1')
+        self.assertEqual(base.creates, 0)
+        self.assertEqual(base.records[0]['fields']['状态'], '已读')
+        self.assertEqual(__import__('json').loads(base.records[0]['fields']['校验清单'])['source_key'], 'url:existing')
 
     def test_pending_attempt_survives_restart(self):
         with tempfile.TemporaryDirectory() as directory:

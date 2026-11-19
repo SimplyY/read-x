@@ -12,10 +12,11 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36"
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
 
@@ -154,14 +155,28 @@ def parse_article(source: str, url: str) -> str:
     return "\n".join(metadata) + body + "\n"
 
 
-def fetch(url: str) -> str:
+def validate_url(url: str) -> None:
     parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+    if (parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com"
+            or parsed.username or parsed.password or parsed.port not in (None, 443)):
         raise ValueError("只允许公开的 https://mp.weixin.qq.com/ URL")
+
+
+class WeChatRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch(url: str) -> str:
+    validate_url(url)
     request = Request(url, headers={"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"})
-    with build_opener(ProxyHandler({})).open(request, timeout=15) as response:
+    with build_opener(ProxyHandler({}), WeChatRedirectHandler()).open(request, timeout=15) as response:
         charset = response.headers.get_content_charset() or "utf-8"
-        source = response.read().decode(charset, errors="replace")
+        content = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(content) > MAX_RESPONSE_BYTES:
+            raise ValueError("微信文章响应超过大小限制")
+        source = content.decode(charset, errors="replace")
     return parse_article(source, url)
 
 

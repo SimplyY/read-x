@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
+from reading_intake import normalize_url
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".agents/skills/long-read/scripts"))
@@ -61,7 +62,7 @@ def read_job(state_dir: Path, job_id: str) -> dict:
         source_url = None
     return {"job_id": job_id, "app_id": row["app_id"], "message_id": row["source_message_id"],
             "snapshot": payload["snapshot_sha256"], "title": payload.get("title") or "未命名文章",
-            "source_url": source_url, "files": files}
+            "author": evidence.get("metadata", {}).get("author"), "source_url": source_url, "files": files}
 
 
 class LarkBase:
@@ -112,12 +113,42 @@ class LarkBase:
                 raise ValueError("Base pagination stalled")
             offset += len(rows)
 
+    def find_source(self, url: str) -> list[dict]:
+        expected = normalize_url(url)
+        matches, offset = [], 0
+        while True:
+            page = self.call('+record-list', '--limit', '200', '--offset', str(offset))
+            names, rows, ids = page['fields'], page['data'], page['record_id_list']
+            if len(rows) != len(ids):
+                raise ValueError('invalid Base record page')
+            for record_id, values in zip(ids, rows):
+                if len(values) != len(names):
+                    raise ValueError('invalid Base row')
+                fields = dict(zip(names, values))
+                source = fields.get('原文链接')
+                if not source and fields.get('校验清单'):
+                    try:
+                        source = json.loads(fields['校验清单']).get('source_url')
+                    except (TypeError, ValueError):
+                        continue
+                try:
+                    same = source and normalize_url(source) == expected
+                except ValueError:
+                    same = False
+                if same:
+                    matches.append({'id': record_id, 'fields': fields})
+            if not page.get('has_more'):
+                return matches
+            if not rows:
+                raise ValueError('Base pagination stalled')
+            offset += len(rows)
+
     def create(self, key: str, title: str) -> None:
         self.call("+record-upsert", "--json", json.dumps({"标题": title, "文章键": key}, ensure_ascii=False))
 
-    def set_manifest(self, record_id: str, manifest: str) -> None:
+    def set_manifest(self, record_id: str, manifest: str, fields: dict | None = None) -> None:
         self.call("+record-upsert", "--record-id", record_id,
-                  "--json", json.dumps({"校验清单": manifest}, ensure_ascii=False))
+                  "--json", json.dumps({"校验清单": manifest, **(fields or {})}, ensure_ascii=False))
 
     def upload(self, record_id: str, field: str, content: bytes) -> None:
         with tempfile.TemporaryDirectory(prefix="readx-archive-") as directory:
@@ -173,7 +204,10 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
         raise ValueError("archive journal conflicts with frozen input")
     entry["status"] = "verifying"
     persist()
-    matches = base.find(key)
+    record_key = entry.get('record_key', key)
+    matches = base.find(record_key)
+    if not entry.get('record_key') and job.get('source_url'):
+        matches = list({record['id']: record for record in matches + base.find_source(job['source_url'])}.values())
     if len(matches) > 1:
         raise ValueError("multiple Base records match source identity")
     if not matches:
@@ -189,12 +223,16 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
         if len(matches) != 1:
             raise RuntimeError("record creation outcome unresolved")
     record = matches[0]
+    record_key = record['fields'].get('文章键')
+    if not isinstance(record_key, str) or not record_key:
+        raise ValueError('Base record key missing')
+    entry['record_key'] = record_key
     if entry.get("record_id") not in (None, record["id"]):
         raise ValueError("Base record identity changed")
     entry["record_id"] = record["id"]
     persist()
     for filename, field in FIELDS.items():
-        matches = base.find(key)
+        matches = base.find(record_key)
         if len(matches) != 1 or matches[0]["id"] != entry["record_id"]:
             raise ValueError("Base record identity changed")
         attachments = matches[0]["fields"].get(field) or []
@@ -209,7 +247,7 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
                 base.upload(entry["record_id"], field, job["files"][filename])
             except RuntimeError:
                 pass
-            matches = base.find(key)
+            matches = base.find(record_key)
             if len(matches) != 1 or matches[0]["id"] != entry["record_id"]:
                 raise RuntimeError("attachment upload outcome unresolved")
             attachments = matches[0]["fields"].get(field) or []
@@ -221,12 +259,12 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
             raise ValueError("Base attachment readback mismatch")
         entry.setdefault("verified", {})[field] = {"file_token": token, **expected[filename]}
         persist()
-    manifest = json.dumps({"schema": "readx.context-archive/v1", "source_key": key,
+    manifest = json.dumps({"schema": "readx.context-archive/v1", "source_key": record_key,
                            "source_url": job.get("source_url"), "snapshot_sha256": job["snapshot"],
                            "packs": {"decode": entry["verified"]["深层解码"],
                                      "munger": entry["verified"]["芒格洞察"]}},
                           ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    matches = base.find(key)
+    matches = base.find(record_key)
     if len(matches) != 1 or matches[0]["id"] != entry["record_id"]:
         raise ValueError("Base record identity changed")
     for field, verified in entry["verified"].items():
@@ -241,14 +279,33 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
             raise RuntimeError("manifest update outcome unresolved")
         entry["manifest_attempted"] = True
         persist()
+    old = matches[0]["fields"]
+    fields = {}
+    if old.get("抓取状态") != "已完成":
+        fields["抓取状态"] = "已完成"
+    if old.get("双包状态") != "已就绪":
+        fields["双包状态"] = "已就绪"
+    if job.get("title") and old.get("标题") in (None, "", job.get("source_url")):
+        fields["标题"] = job["title"]
+    if job.get("author") and not old.get("作者"):
+        fields["作者"] = str(job["author"])[:200]
+    if job.get("source_url") and not old.get("原文链接"):
+        fields["原文链接"] = job["source_url"]
+    if job.get("source_url") and not old.get("来源"):
+        fields["来源"] = urlsplit(job["source_url"]).hostname or ""
+    if fields or not existing:
+        entry["metadata_attempted"] = True
+        persist()
         try:
-            base.set_manifest(entry["record_id"], manifest)
+            base.set_manifest(entry["record_id"], manifest, fields)
         except RuntimeError:
             pass
-        matches = base.find(key)
+        matches = base.find(record_key)
         if (len(matches) != 1 or matches[0]["id"] != entry["record_id"]
-                or matches[0]["fields"].get("校验清单") != manifest):
+                or matches[0]["fields"].get("校验清单") != manifest
+                or any(matches[0]["fields"].get(name) != value for name, value in fields.items())):
             raise RuntimeError("manifest update outcome unresolved")
+    entry["metadata_complete"] = True
     entry["status"] = "verified"
     entry["verified_at"] = time.time()
     persist()

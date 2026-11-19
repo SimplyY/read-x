@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from render_score_card import render_card
@@ -88,11 +89,32 @@ def main() -> int:
         score_only=args.score_only,
         quick_read=quick_read,
     )
+    if args.idempotency_key.startswith('readx-score-'):
+        try:
+            from reading_score_receipt import prepare_recovery
+            prepare_recovery(message_id=args.idempotency_key[len('readx-score-'):], url=args.url,
+                             title=args.title, author=args.author, result=result,
+                             gate_path=args.evidence_output,
+                             scoring_sha=hashlib.sha256(args.scoring_result.read_bytes()).hexdigest())
+        except Exception:
+            # A Read-X score card must have its recovery intent before the
+            # external send. Otherwise a lost acknowledgment could be replayed.
+            print('reading-index: score recovery unavailable; score card not sent', file=sys.stderr)
+            return 1
     evidence = _send(args, card)
     args.evidence_output.write_text(
         json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    # Persist metadata only after the existing delivery gate has been saved.
+    # A local indexing failure must never cause the already-sent card to retry.
+    if args.idempotency_key.startswith('readx-score-'):
+        try:
+            from reading_score_receipt import record_receipt
+            record_receipt(message_id=args.idempotency_key[len('readx-score-'):], url=args.url,
+                           title=args.title, author=args.author, result=result)
+        except Exception:
+            print('reading-index: score metadata unavailable', file=sys.stderr)
     print(json.dumps(evidence, ensure_ascii=False))
 
 

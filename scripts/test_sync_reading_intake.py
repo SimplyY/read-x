@@ -31,6 +31,11 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(sync_one(item,b,j,lambda:None),'recnew')
         self.assertEqual(sync_one(item,b,j,lambda:None),'recnew')
         self.assertEqual(b.creates,1)
+    def test_new_article_keeps_intake_time_and_source(self):
+        b = Base()
+        sync_one({**item, 'createdAt':'2026-11-19 01:30:00'},b,{'jobs':{}},lambda:None)
+        self.assertEqual(b.records[0]['fields']['入库时间'],'2026-11-19 09:30')
+        self.assertEqual(b.records[0]['fields']['来源'],'example.com')
     def test_uncertain_create_does_not_replay(self):
         b,j=Base(),{'jobs':{'1':{'key':'url:'+__import__('hashlib').sha256(item['canonicalUrl'].encode()).hexdigest(),'url':item['canonicalUrl'],'create_attempted':True}}}
         with self.assertRaisesRegex(RuntimeError,'unresolved'):
