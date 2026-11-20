@@ -467,9 +467,17 @@ def submit_context_inputs(**options) -> dict:
         raise ValueError("context admission requires a valid trusted task identity")
     state_dir = Path(options.get("state_dir", DEFAULT_STATE_DIR)).absolute()
     _reject_symlink_path(state_dir)
-    task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"read-x:context:{app_id}:{source_id}"))
+    article_url = options.get('article_url')
+    article_key = ''
+    if article_url:
+        from reading_article_identity import identity_from_trusted_intake
+        article_key = identity_from_trusted_intake(state_dir.parent / 'reading-workbench',app_id,source_id,article_url)
+        if not article_key:
+            raise ValueError('article URL option requires a multi-URL source event')
+    from reading_article_identity import context_task_id
+    task_id = context_task_id(app_id,source_id,article_key)
     fields = {"task_id": task_id, "app_id": app_id, "source_message_id": source_id,
-              "plan_revision": 2}
+              "plan_revision": 2, "article_key":article_key}
     with WorkflowStore(state_dir) as store:
         store.record_context_admission(**fields, status="preparing")
     try:
@@ -495,6 +503,7 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
                           app_id: str, feishu_profile: str, source_message_id: str,
                           route: str = "context", score_only: bool = False,
                           special_fast_path: bool = False, context_pack_dir: Path | None = None,
+                          article_url: str | None = None,
                           prompt_fetcher=None, profile_resolver=resolve_worker_profile_key,
                           state_dir: Path = DEFAULT_STATE_DIR) -> dict:
     """Freeze business bytes and a context-only plan, without any model submission."""
@@ -518,11 +527,23 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
     if not source_text.strip():
         raise ValueError("context packages require a nonempty source")
     evidence_text = validate_evidence(files["evidence.json"].decode("utf-8"), source_text)
+    article_key = ''
+    if article_url:
+        from reading_article_identity import identity_from_trusted_intake
+        from reading_intake import normalize_url
+        article_key = identity_from_trusted_intake(Path(state_dir).absolute().parent / 'reading-workbench',app_id,source_message_id,article_url)
+        evidence_object = _object(files['evidence.json'], 'evidence')
+        evidence_url = (evidence_object.get('metadata') or {}).get('source_url')
+        if not article_key or not evidence_url or normalize_url(evidence_url) != normalize_url(article_url):
+            raise ValueError('article URL does not match trusted source evidence')
     context = _object(files["trigger-context.json"], "trigger context")
     if (context.get("appId") != app_id or context.get("sourceMessageId") != source_message_id
             or not source_message_id.startswith("om_") or context.get("feishuProfile") != feishu_profile
             or context.get("senderType") != "user"):
         raise ValueError("context packages require trusted matching trigger identity")
+    if article_key:
+        from reading_article_identity import verify_child_authority
+        verify_child_authority(Path(state_dir).absolute().parent/'reading-workbench',app_id,source_message_id,article_key,context)
     state_dir = Path(state_dir).absolute()
     _reject_symlink_path(state_dir)
     admission_sha = _hash(_canonical({"files": {key: _hash(value) for key, value in files.items()},
@@ -530,8 +551,16 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
                                      "context_pack_dir": str(context_pack_dir.absolute()) if context_pack_dir else None}))
 
     def existing_job(store):
-        row = store.connection.execute("SELECT job_id FROM jobs WHERE app_id=? AND source_message_id=?",
-                                       (app_id, source_message_id)).fetchone()
+        columns={row['name'] for row in store.connection.execute('PRAGMA table_info(jobs)')}
+        if article_key and 'article_key' not in columns:
+            raise StoreConflict('offline article schema migration required')
+        if article_key and store.connection.execute(
+                "SELECT 1 FROM jobs WHERE app_id=? AND source_message_id=? AND article_key='' LIMIT 1",
+                (app_id,source_message_id)).fetchone():
+            raise StoreConflict('legacy message has unknown article side effects')
+        clause=' AND article_key=?' if 'article_key' in columns else ''
+        args=(app_id,source_message_id,article_key) if clause else (app_id,source_message_id)
+        row = store.connection.execute("SELECT job_id FROM jobs WHERE app_id=? AND source_message_id=?"+clause, args).fetchone()
         if not row:
             return None
         job = store.get_job(row["job_id"])
@@ -575,7 +604,8 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
                            "content": article_raw.decode("utf-8")},
         "concision": {"prompt_source": str(CONCISION_PROMPT_PATH), "prompt_sha256": _hash(concision_raw),
                       "content": concision_raw.decode("utf-8")}, "munger-analysis": asset})
-    task_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"read-x:context:{app_id}:{source_message_id}"))
+    from reading_article_identity import context_task_id
+    task_id = context_task_id(app_id,source_message_id,article_key)
     input_sha = _hash(_canonical({"source": _hash(files["source.md"]), "evidence": _hash(files["evidence.json"])}))
     packs = [{"artifact_key": key, "pack_id": str(uuid.uuid5(uuid.UUID(task_id), key)),
               "prompt_file": filename, "prompt_sha256": _hash(files[filename]),
@@ -621,10 +651,12 @@ def _submit_context_inputs(*, source: Path, evidence: Path, trigger_context: Pat
                            "trigger": trigger, "requested_automatic": [], "required_artifacts": list(CONTEXT_ARTIFACTS),
                            "artifact_plan_finalized": True, "context_packs": packs,
                            "context_pack_dir": str(context_pack_dir.absolute()) if context_pack_dir else None}
+                if article_key:
+                    payload['article_key'] = article_key
                 issue = workflow_payload_issue(payload, app_id=app_id, source_message_id=source_message_id)
                 if issue:
                     raise ValueError(f"context submission failed workflow validation: {issue}")
-                job = store.submit(payload, app_id=app_id, source_message_id=source_message_id, job_id=task_id,
+                job = store.submit(payload, app_id=app_id, source_message_id=source_message_id, job_id=task_id, article_key=article_key,
                                    artifacts=[{"key": key, "kind": "context_pack"} for key in CONTEXT_ARTIFACTS])
                 return {"status": "accepted", "job_id": job["job_id"], "created": job["created"],
                         **context_result(job, store.artifacts(job["job_id"]))}
@@ -1041,6 +1073,7 @@ def main(argv=None) -> int:
     context_submit.add_argument("--score-only", action="store_true")
     context_submit.add_argument("--special-fast-path", action="store_true")
     context_submit.add_argument("--context-pack-dir", type=Path)
+    context_submit.add_argument("--article-url", help="多链接来源事件内当前文章的原始 URL")
     status = commands.add_parser("status")
     status.add_argument("--chat-id", help="只读查询该会话的持久工作流终态")
     status.add_argument("--report-key", help="只读查看可靠性报告和附件/卡片投递收据")
@@ -1133,6 +1166,7 @@ def main(argv=None) -> int:
                 trigger_context=args.trigger_context, title=args.title, title_source=args.title_source,
                 source_status=args.source_status, app_id=args.app_id, feishu_profile=args.feishu_profile,
                 source_message_id=args.source_message_id, route=args.route, score_only=args.score_only,
+                article_url=args.article_url,
                 special_fast_path=args.special_fast_path, context_pack_dir=args.context_pack_dir,
                 state_dir=args.state_dir)
             if result["status"] == "accepted":

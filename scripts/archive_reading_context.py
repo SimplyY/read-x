@@ -62,7 +62,8 @@ def read_job(state_dir: Path, job_id: str) -> dict:
         source_url = None
     return {"job_id": job_id, "app_id": row["app_id"], "message_id": row["source_message_id"],
             "snapshot": payload["snapshot_sha256"], "title": payload.get("title") or "未命名文章",
-            "author": evidence.get("metadata", {}).get("author"), "source_url": source_url, "files": files}
+            "author": evidence.get("metadata", {}).get("author"), "source_url": source_url, "files": files,
+            "article_key": payload.get('article_key','')}
 
 
 class LarkBase:
@@ -198,6 +199,11 @@ def save_journal(path: Path, journal: dict) -> None:
 
 def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
     key = f"context:{job['app_id']}:{job['message_id']}"
+    if job.get('article_key'):
+        from reading_article_identity import article_key
+        if not job.get('source_url') or article_key(job['source_url'],multi=True) != job['article_key']:
+            raise ValueError('frozen article identity mismatch')
+        key += f":{job['article_key']}"
     expected = {name: {"sha256": digest(job["files"][name]), "bytes": len(job["files"][name])} for name in FIELDS}
     entry = journal["jobs"].setdefault(job["job_id"], {"key": key, "snapshot": job["snapshot"], "expected": expected})
     if entry.get("key") != key or entry.get("snapshot") != job["snapshot"] or entry.get("expected") != expected:

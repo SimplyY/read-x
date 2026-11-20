@@ -163,8 +163,23 @@ export function buildApp({ gatewayKey, adapter = createBaseAdapter(), bookQuery,
   app.addHook('onRequest', async (request, reply) => {
     reply.header('Cache-Control', 'private, no-store').header('X-Content-Type-Options', 'nosniff')
       .header('Referrer-Policy', 'no-referrer').header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
-    const candidate = Buffer.from(typeof request.headers['x-readx-gateway-key'] === 'string' ? request.headers['x-readx-gateway-key'] : '');
-    if (candidate.length !== expected.length || !timingSafeEqual(candidate, expected)) return reply.code(403).send({ error: '访问被拒绝' });
+    const suppliedKey = request.headers['x-readx-gateway-key'];
+    if (suppliedKey !== undefined) {
+      const candidate = Buffer.from(typeof suppliedKey === 'string' ? suppliedKey : '');
+      if (candidate.length !== expected.length || !timingSafeEqual(candidate, expected)) return reply.code(403).send({ error: '访问被拒绝' });
+      return;
+    }
+
+    // Match Invest-X: this service binds only to loopback, and an unkeyed
+    // browser request is accepted only for an exact local Host. The Feishu
+    // Gateway continues to authenticate with the service key above.
+    const remoteAddress = request.raw.socket?.remoteAddress;
+    const address = request.server.server.address();
+    const port = address && typeof address !== 'string' ? address.port : null;
+    const host = request.headers.host;
+    const localPeer = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remoteAddress);
+    const localHost = Number.isInteger(port) && [`127.0.0.1:${port}`, `localhost:${port}`].includes(host);
+    if (!localPeer || !localHost) return reply.code(403).send({ error: '访问被拒绝' });
   });
   for (const [route, file, type] of [['/', 'index.html', 'text/html; charset=utf-8'], ['/app.js', 'app.js', 'application/javascript; charset=utf-8'], ['/style.css', 'style.css', 'text/css; charset=utf-8']]) {
     app.get(route, async (_request, reply) => reply.type(type).send(await readFile(path.join(publicDir, file))));

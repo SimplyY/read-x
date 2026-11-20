@@ -11,6 +11,27 @@ let showingBooks = false;
 let page = 1;
 const queryState = new URLSearchParams(location.search);
 
+function setActiveTab(selected) {
+  for (const tab of [articlesTab, booksTab]) {
+    const active = tab === selected;
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  content.setAttribute('aria-labelledby', selected.id);
+}
+
+document.querySelector('.navigation').addEventListener('keydown', event => {
+  const tabs = [articlesTab, booksTab];
+  const index = tabs.indexOf(document.activeElement);
+  const next = event.key === 'ArrowRight' ? (index + 1) % tabs.length
+    : event.key === 'ArrowLeft' ? (index - 1 + tabs.length) % tabs.length
+    : event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : -1;
+  if (next < 0) return;
+  event.preventDefault();
+  tabs[next].focus();
+  tabs[next].click();
+});
+
 
 function action(label, callback) {
   const button = document.createElement('button');
@@ -157,8 +178,7 @@ async function loadArticles() {
 articlesTab.addEventListener('click', () => {
   if (!showingBooks) return;
   showingBooks = false;
-  booksTab.removeAttribute('aria-current');
-  articlesTab.setAttribute('aria-current', 'page');
+  setActiveTab(articlesTab);
   content.innerHTML = originalContent;
   loadArticles();
 });
@@ -338,8 +358,7 @@ async function saveBookReview() {
 booksTab.addEventListener('click', () => {
   if (showingBooks) return;
   showingBooks = true;
-  articlesTab.removeAttribute('aria-current');
-  booksTab.setAttribute('aria-current', 'page');
+  setActiveTab(booksTab);
   renderBooks();
 });
 document.querySelector('#close-pack').addEventListener('click', () => dialog.close());

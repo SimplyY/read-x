@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 import sys
 
-from reading_dispatch_guard import reconcile
+from reading_dispatch_guard import reconcile, reconcile_child
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / 'state/reading-workbench'
@@ -28,6 +28,8 @@ def main() -> int:
         messages = [row[0] for row in connection.execute(
             "SELECT message_id FROM reading_dispatch WHERE app_id=? AND phase IN ('running','needs_review','failed')", (APP,)
         )]
+        children = (connection.execute("SELECT message_id,article_key FROM reading_dispatch_children WHERE app_id=? AND phase IN ('running','needs_review','failed')",(APP,)).fetchall()
+                    if 'reading_dispatch_children' in tables else [])
     finally:
         connection.close()
     completed = 0
@@ -40,6 +42,11 @@ def main() -> int:
                 pending += 1
         except (OSError, ValueError, sqlite3.Error):
             pending += 1
+    for message_id,key in children:
+        try:
+            if reconcile_child(STATE,WORKFLOW,ARCHIVE,message_id,key) == 'completed': completed += 1
+            else: pending += 1
+        except (OSError,ValueError,sqlite3.Error): pending += 1
     print(json.dumps({'status':'ok','completed':completed,'pending':pending}))
     return 0
 

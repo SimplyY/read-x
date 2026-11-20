@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 
 from reading_intake import list_pending, register_event
 
@@ -78,6 +79,20 @@ class IntakeTests(unittest.TestCase):
         with sqlite3.connect(self.root / "intake.sqlite3") as db:
             self.assertEqual(db.execute("SELECT count(*) FROM intake_messages").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM intake_articles").fetchone()[0], 2)
+
+    def test_verified_source_time_is_preserved_for_new_article(self):
+        created_ms = 1790000000000
+        event = dict(self.event, sourceCreatedAt=str(created_ms))
+        self.register(event)
+        expected = datetime.fromtimestamp(created_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertEqual(list_pending(self.root)[0]["createdAt"], expected)
+
+    def test_invalid_or_implausible_source_time_uses_local_intake_time(self):
+        event = dict(self.event, sourceCreatedAt="1790000000000junk")
+        self.register(event)
+        created_at = list_pending(self.root)[0]["createdAt"]
+        self.assertNotEqual(created_at, "1790000000junk")
+        self.assertRegex(created_at, r"^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$")
 
     def test_cli_survives_process_restart(self):
         command = [sys.executable, str(Path(__file__).with_name("reading_intake.py")),

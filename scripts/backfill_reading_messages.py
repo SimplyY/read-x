@@ -36,13 +36,13 @@ def cli(args):
     return data
 
 
-def scan(messages, owner, register):
+def scan(messages, owner, register, *, nested=False):
     accepted = 0
     for message in messages:
         replies = message.get('thread_replies') or []
         if not isinstance(replies, list):
             raise ValueError('unsupported thread replies')
-        accepted += scan(replies, owner, register)
+        accepted += scan(replies, owner, register, nested=True)
         sender = message.get('sender') or {}
         if sender.get('sender_type') != 'user' or sender.get('id_type') != 'open_id' or sender.get('id') != owner:
             continue
@@ -57,6 +57,12 @@ def scan(messages, owner, register):
         event = {'appId':APP, 'chatId':CHAT, 'chatType':'group', 'senderId':owner,
                  'senderType':'user', 'messageId':message.get('message_id'), 'urls':urls,
                  'scoreOnly':bool(re.fullmatch(r'仅评分\s+https?://\S+',content.strip()))}
+        if message.get('create_time'):
+            event['sourceCreatedAt'] = str(message['create_time'])
+        if message.get('thread_id'):
+            event['threadId'] = message['thread_id']
+        elif nested:
+            event['routingUncertain'] = True
         result = register(event)
         accepted += result['articles']
     return accepted

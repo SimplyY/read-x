@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -72,6 +73,7 @@ def main() -> int:
     parser.add_argument("--score-only", action="store_true")
     parser.add_argument("--quick-read", type=Path)
     parser.add_argument("--idempotency-key", required=True)
+    parser.add_argument("--source-message-id", help="多链接来源消息的真实飞书消息 ID")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--chat-id")
     target.add_argument("--user-id")
@@ -89,30 +91,55 @@ def main() -> int:
         score_only=args.score_only,
         quick_read=quick_read,
     )
-    if args.idempotency_key.startswith('readx-score-'):
+    multi_key = ''
+    if args.source_message_id:
+        from reading_article_identity import identity_from_trusted_intake, score_request_id
+        from reading_score_receipt import STATE, APP
+        multi_key = identity_from_trusted_intake(STATE, APP, args.source_message_id, args.url)
+        if not multi_key or args.idempotency_key != score_request_id(args.source_message_id,multi_key):
+            raise ValueError('score request does not match trusted article identity')
+    if multi_key or args.idempotency_key.startswith('readx-score-'):
         try:
-            from reading_score_receipt import prepare_recovery
-            prepare_recovery(message_id=args.idempotency_key[len('readx-score-'):], url=args.url,
+            from reading_score_receipt import prepare_recovery, begin_score_send
+            source_id = args.source_message_id if multi_key else args.idempotency_key[len('readx-score-'):]
+            digest = hashlib.sha256(args.scoring_result.read_bytes()).hexdigest()
+            prepare_recovery(message_id=source_id, url=args.url,
                              title=args.title, author=args.author, result=result,
                              gate_path=args.evidence_output,
-                             scoring_sha=hashlib.sha256(args.scoring_result.read_bytes()).hexdigest())
+                             scoring_sha=digest, article_key=multi_key)
+            if multi_key:
+                begin_score_send(message_id=source_id,url=args.url,article_key=multi_key,
+                                 scoring_sha=digest,request_id=args.idempotency_key,
+                                 card_sha=hashlib.sha256(json.dumps(card,ensure_ascii=False).encode('utf-8')).hexdigest(),
+                                 target_type='chat_id' if args.chat_id else 'user_id',target_id=args.chat_id or args.user_id)
         except Exception:
             # A Read-X score card must have its recovery intent before the
             # external send. Otherwise a lost acknowledgment could be replayed.
             print('reading-index: score recovery unavailable; score card not sent', file=sys.stderr)
             return 1
     evidence = _send(args, card)
-    args.evidence_output.write_text(
-        json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    evidence_text=json.dumps(evidence, ensure_ascii=False, indent=2) + "\n"
+    if multi_key:
+        fd=os.open(args.evidence_output,os.O_CREAT|os.O_EXCL|os.O_WRONLY|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as output:
+            output.write(evidence_text)
+            output.flush()
+            os.fsync(output.fileno())
+        directory=os.open(args.evidence_output.parent,os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    else:
+        args.evidence_output.write_text(evidence_text,encoding="utf-8")
+    if multi_key:
+        from reading_score_receipt import confirm_score_send
+        confirm_score_send(message_id=args.source_message_id,article_key=multi_key,evidence=evidence)
     # Persist metadata only after the existing delivery gate has been saved.
     # A local indexing failure must never cause the already-sent card to retry.
-    if args.idempotency_key.startswith('readx-score-'):
+    if multi_key or args.idempotency_key.startswith('readx-score-'):
         try:
             from reading_score_receipt import record_receipt
-            record_receipt(message_id=args.idempotency_key[len('readx-score-'):], url=args.url,
-                           title=args.title, author=args.author, result=result)
+            record_receipt(message_id=args.source_message_id if multi_key else args.idempotency_key[len('readx-score-'):], url=args.url,
+                           title=args.title, author=args.author, result=result, article_key=multi_key)
         except Exception:
             print('reading-index: score metadata unavailable', file=sys.stderr)
     print(json.dumps(evidence, ensure_ascii=False))

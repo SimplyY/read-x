@@ -7,6 +7,7 @@ No network calls or Base writes are performed here.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -121,6 +122,14 @@ def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
     if not isinstance(urls, list) or not urls or len(urls) > 100:
         raise ValueError("event must contain URLs")
     normalized = [(normalize_url(url), url) for url in urls]
+    source_created = event.get("sourceCreatedAt")
+    source_created_ms = (int(source_created) if isinstance(source_created, str)
+                         and re.fullmatch(r"[0-9]{13}", source_created) else None)
+    source_created_at = None
+    if source_created_ms is not None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if 946684800000 <= source_created_ms <= now_ms + 86400000:
+            source_created_at = datetime.fromtimestamp(source_created_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     score_only = event.get("scoreOnly") is True
     fingerprint = hashlib.sha256(json.dumps({
         "appId": app_id, "chatId": chat_id, "chatType": event["chatType"],
@@ -148,10 +157,16 @@ def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
                 "SELECT pack_policy FROM intake_articles WHERE app_id=? AND canonical_url=?",
                 (app_id, canonical),
             ).fetchone()
-            cursor = connection.execute(
-                "INSERT OR IGNORE INTO intake_articles(app_id,canonical_url,original_url,pack_policy) VALUES(?,?,?,?)",
-                (app_id, canonical, original, "score_only" if score_only else "normal"),
-            )
+            if source_created_at:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO intake_articles(app_id,canonical_url,original_url,created_at,pack_policy) VALUES(?,?,?,?,?)",
+                    (app_id, canonical, original, source_created_at, "score_only" if score_only else "normal"),
+                )
+            else:
+                cursor = connection.execute(
+                    "INSERT OR IGNORE INTO intake_articles(app_id,canonical_url,original_url,pack_policy) VALUES(?,?,?,?)",
+                    (app_id, canonical, original, "score_only" if score_only else "normal"),
+                )
             created += cursor.rowcount
             if not score_only:
                 policy_upgraded = policy_upgraded or (prior is not None and prior[0] == "score_only")
@@ -164,6 +179,25 @@ def register_event(state_dir: Path, event: dict, *, allowed_app_id: str,
                 "INSERT OR IGNORE INTO intake_message_articles(app_id,message_id,article_id) VALUES(?,?,?)",
                 (app_id, message_id, article_id),
             )
+        if app_id == 'cli_aab030a473f8dcd2' and len({canonical for canonical,_ in normalized}) > 1:
+            thread_id=event.get('threadId')
+            if thread_id is not None: _id(thread_id,'omt_')
+            from reading_dispatch_guard import admit_children_transaction
+            uncertain = event.get('routingUncertain') is True
+            source_created=event.get('sourceCreatedAt')
+            source_created_ms=(int(source_created) if isinstance(source_created,str) and re.fullmatch(r'[0-9]{13}',source_created) else None)
+            if not live_dispatch:
+                cutover_exists=connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reading_dispatch_cutover'").fetchone()
+                cutover=(connection.execute('SELECT cutover_ms FROM reading_dispatch_cutover WHERE singleton=1').fetchone()
+                         if cutover_exists else None)
+                # A historical message may already have unknown side effects.
+                # Only a source timestamp after the explicitly established,
+                # drained cutover can be recovered automatically.
+                if not cutover or source_created_ms is None or source_created_ms<cutover[0]:
+                    uncertain=True
+            admit_children_transaction(connection,message_id,[original for _,original in normalized],
+                                       chat_id=chat_id,sender_id=sender_id,thread_id=thread_id,
+                                       routing_uncertain=uncertain,source_created_ms=source_created_ms)
         retry_candidate = False
         if live_dispatch and len(normalized) == 1 and not created and not policy_upgraded and not message_was_registered:
             # A new user message may retry only an explicitly terminated Agent
@@ -212,17 +246,39 @@ def main() -> int:
     parser.add_argument("--finish-dispatch", choices=("failed", "needs_review"),
                         help="persist a terminal outcome for one previously claimed live dispatch")
     parser.add_argument("--message-id", help="trusted Feishu message ID for --finish-dispatch")
+    parser.add_argument("--article-key", help="multi-link child identity for --finish-dispatch")
+    parser.add_argument("--claim-child", action="store_true")
+    parser.add_argument("--list-queued-children", action="store_true")
     args = parser.parse_args()
     try:
+        if args.list_queued_children:
+            if args.allowed_app_id != 'cli_aab030a473f8dcd2': raise ValueError('invalid app')
+            from reading_dispatch_guard import queued_children
+            from reading_article_identity import score_request_id
+            rows=queued_children(args.state_dir,chat_id=args.allowed_chat_id,sender_id=args.allowed_sender_id)
+            rows=[{**row,'scoreId':score_request_id(row['messageId'],row['articleKey'])} for row in rows]
+            print(json.dumps({'status':'ok','children':rows})); return 0
+        if args.claim_child:
+            if args.allowed_app_id != 'cli_aab030a473f8dcd2' or not args.message_id or not args.article_key:
+                raise ValueError('invalid child identity')
+            from reading_dispatch_guard import claim_child
+            state=args.state_dir.absolute()
+            phase=claim_child(state,state.parent/'long-read'/'workflow.sqlite3',args.message_id,args.article_key,
+                              f'bridge:{os.getpid()}',allowed_chat=args.allowed_chat_id,allowed_sender=args.allowed_sender_id)
+            print(json.dumps({'status':phase})); return 0
         if args.finish_dispatch:
             if (args.allowed_app_id != "cli_aab030a473f8dcd2" or not args.message_id or
                     not re.fullmatch(r"om_[A-Za-z0-9_-]{1,160}", args.message_id)):
                 raise ValueError("invalid dispatch identity")
-            from reading_dispatch_guard import finish_dispatch
-            result = {"status": finish_dispatch(args.state_dir, args.message_id, args.finish_dispatch)}
+            if args.article_key:
+                from reading_dispatch_guard import finish_child
+                result = {"status": finish_child(args.state_dir,args.message_id,args.article_key,args.finish_dispatch)}
+            else:
+                from reading_dispatch_guard import finish_dispatch
+                result = {"status": finish_dispatch(args.state_dir, args.message_id, args.finish_dispatch)}
             print(json.dumps(result))
             return 0
-        if args.message_id:
+        if args.message_id or args.article_key:
             raise ValueError("message ID requires a terminal dispatch outcome")
         event = json.load(sys.stdin)
         result = register_event(args.state_dir, event, allowed_app_id=args.allowed_app_id,
@@ -231,7 +287,17 @@ def main() -> int:
         if args.live:
             candidate = result.pop("dispatch_candidate", False)
             result["dispatch"] = "suppressed"
-            if candidate:
+            if len({normalize_url(url) for url in event['urls']}) > 1:
+                from reading_dispatch_guard import admit_children
+                from reading_article_identity import article_key, score_request_id
+                state=args.state_dir.absolute()
+                admit_children(state,event['messageId'],event['urls'],chat_id=event['chatId'],sender_id=event['senderId'],thread_id=event.get('threadId'))
+                result['children']=[]
+                for url in dict.fromkeys(normalize_url(url) for url in event['urls']):
+                    key=article_key(url,multi=True)
+                    result['children'].append({'url':url,'articleKey':key,'scoreId':score_request_id(event['messageId'],key),'dispatch':'queued'})
+                result['dispatch']='multi'
+            elif candidate:
                 from reading_dispatch_guard import admit, claim
                 state = args.state_dir.absolute()
                 phase = admit(state, event["messageId"], exclusive_intake=True)

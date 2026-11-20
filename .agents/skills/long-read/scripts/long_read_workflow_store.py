@@ -115,6 +115,9 @@ def workflow_payload_issue(payload: object, *, app_id: str | None = None,
             WORKFLOW_CONTRACT_VERSION, CONTEXT_WORKFLOW_CONTRACT_VERSION}:
         return "unadmitted-legacy-job"
     context_only = payload.get("workflow_contract_version") == CONTEXT_WORKFLOW_CONTRACT_VERSION
+    if 'article_key' in payload and (not context_only or not isinstance(payload['article_key'],str)
+                                     or not re.fullmatch(r'[0-9a-f]{64}',payload['article_key'])):
+        return 'invalid-workflow-payload'
     if context_only:
         if (payload.get("schema") != "read-x-context-submission/v1"
                 or payload.get("source_status") != "complete"
@@ -423,7 +426,7 @@ CREATE TABLE IF NOT EXISTS jobs (
  version INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_token TEXT,
  fencing INTEGER NOT NULL DEFAULT 0, lease_expires_at REAL,
  created_at REAL NOT NULL, updated_at REAL NOT NULL,
- UNIQUE(app_id, source_message_id)
+ article_key TEXT NOT NULL DEFAULT '', UNIQUE(app_id, source_message_id,article_key)
 );
 CREATE TABLE IF NOT EXISTS artifacts (
  job_id TEXT NOT NULL REFERENCES jobs(job_id), artifact_key TEXT NOT NULL,
@@ -453,7 +456,7 @@ CREATE TABLE IF NOT EXISTS admission_attempts (
  task_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, source_message_id TEXT NOT NULL,
  requested_plan_json TEXT NOT NULL, plan_revision INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL,
  reason_code TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
- UNIQUE(app_id,source_message_id)
+ article_key TEXT NOT NULL DEFAULT '', UNIQUE(app_id,source_message_id,article_key)
 );
 CREATE TABLE IF NOT EXISTS reports (
  report_key TEXT PRIMARY KEY, period_type TEXT NOT NULL,
@@ -592,10 +595,12 @@ class WorkflowStore:
         return value
 
     def submit(self, payload: dict, *, app_id: str, source_message_id: str | None = None,
-               artifacts: list[dict] | None = None, job_id: str | None = None) -> dict:
+               artifacts: list[dict] | None = None, job_id: str | None = None, article_key: str = '') -> dict:
         _name(app_id)
         if source_message_id is not None:
             _name(source_message_id)
+        if article_key and not re.fullmatch(r'[0-9a-f]{64}', article_key):
+            raise ValueError('invalid article key')
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
         if job_id is not None:
@@ -613,8 +618,13 @@ class WorkflowStore:
         encoded = _json(payload)
         digest = hashlib.sha256(_json({"payload": payload, "artifacts": specs}).encode()).hexdigest()
         with self._transaction():
-            old = self.connection.execute("SELECT job_id,app_id,source_message_id,input_sha256,CAST(payload_json AS BLOB) AS payload_json,status,version,lease_owner,lease_token,fencing,lease_expires_at,created_at,updated_at FROM jobs WHERE app_id=? AND source_message_id=?",
-                                          (app_id, source_message_id)).fetchone() if source_message_id else None
+            columns = {row['name'] for row in self.connection.execute('PRAGMA table_info(jobs)')}
+            if article_key and 'article_key' not in columns:
+                raise StoreConflict('offline article schema migration required')
+            clause = ' AND article_key=?' if 'article_key' in columns else ''
+            args = (app_id,source_message_id,article_key) if clause else (app_id,source_message_id)
+            old = self.connection.execute("SELECT job_id,app_id,source_message_id,input_sha256,CAST(payload_json AS BLOB) AS payload_json,status,version,lease_owner,lease_token,fencing,lease_expires_at,created_at,updated_at FROM jobs WHERE app_id=? AND source_message_id=?"+clause,
+                                          args).fetchone() if source_message_id else None
             if old:
                 if old["input_sha256"] != digest:
                     raise StoreConflict("source message already submitted with different input")
@@ -622,8 +632,12 @@ class WorkflowStore:
                 result["created"] = False
                 return result
             job_id, now = job_id or str(uuid.uuid4()), self.clock()
-            self.connection.execute("INSERT INTO jobs(job_id,app_id,source_message_id,input_sha256,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)",
-                                    (job_id, app_id, source_message_id, digest, encoded, now, now))
+            if article_key:
+                self.connection.execute("INSERT INTO jobs(job_id,app_id,source_message_id,input_sha256,payload_json,status,created_at,updated_at,article_key) VALUES(?,?,?,?,?,'pending',?,?,?)",
+                                        (job_id, app_id, source_message_id, digest, encoded, now, now, article_key))
+            else:
+                self.connection.execute("INSERT INTO jobs(job_id,app_id,source_message_id,input_sha256,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?)",
+                                        (job_id, app_id, source_message_id, digest, encoded, now, now))
             for item in specs:
                 self.connection.execute("INSERT INTO artifacts(job_id,artifact_key,kind,required) VALUES(?,?,?,?)",
                                         (job_id, item["key"], item["kind"], int(item["required"])))
@@ -641,11 +655,13 @@ class WorkflowStore:
 
     def record_context_admission(self, *, task_id: str, app_id: str, source_message_id: str,
                                  status: str, plan_revision: int = 1,
-                                 reason_code: str | None = None) -> None:
+                                 reason_code: str | None = None, article_key: str = '') -> None:
         """Count intended new tasks even if input/Prompt admission cannot finish."""
         task_id = str(uuid.UUID(task_id))
         _name(app_id)
         _name(source_message_id)
+        if article_key and not re.fullmatch(r'[0-9a-f]{64}', article_key):
+            raise ValueError('invalid article key')
         if status not in {"preparing", "accepted", "blocked"}:
             raise ValueError("invalid context admission state")
         if type(plan_revision) is not int or plan_revision < 1:
@@ -654,8 +670,15 @@ class WorkflowStore:
             _name(reason_code)
         now = self.clock()
         with self._transaction():
-            self.connection.execute("INSERT OR IGNORE INTO admission_attempts(task_id,app_id,source_message_id,requested_plan_json,plan_revision,status,reason_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (task_id, app_id, source_message_id, _json(list(CONTEXT_ARTIFACTS)), plan_revision, status, reason_code, now, now))
+            if article_key:
+                columns = {row['name'] for row in self.connection.execute('PRAGMA table_info(admission_attempts)')}
+                if 'article_key' not in columns:
+                    raise StoreConflict('offline article schema migration required')
+                self.connection.execute("INSERT OR IGNORE INTO admission_attempts(task_id,app_id,source_message_id,requested_plan_json,plan_revision,status,reason_code,created_at,updated_at,article_key) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (task_id, app_id, source_message_id, _json(list(CONTEXT_ARTIFACTS)), plan_revision, status, reason_code, now, now, article_key))
+            else:
+                self.connection.execute("INSERT OR IGNORE INTO admission_attempts(task_id,app_id,source_message_id,requested_plan_json,plan_revision,status,reason_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (task_id, app_id, source_message_id, _json(list(CONTEXT_ARTIFACTS)), plan_revision, status, reason_code, now, now))
             if status != "preparing":
                 self.connection.execute("UPDATE admission_attempts SET status=?,reason_code=?,updated_at=? "
                     "WHERE task_id=? AND status!='accepted'", (status, reason_code, now, task_id))

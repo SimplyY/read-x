@@ -10,10 +10,11 @@ a { color:#416da9; display:inline-flex; align-items:center; }
 .app { max-width:1100px; margin:auto; padding:24px 20px 80px; }
 .top { display:flex; align-items:center; gap:10px; margin-bottom:22px; font-size:19px; }
 .mark { display:grid; place-items:center; width:36px; height:36px; border-radius:10px; background:var(--blue); color:white; }
-.layout { display:grid; grid-template-columns:160px minmax(0,1fr); gap:24px; }
-.navigation { display:flex; flex-direction:column; gap:6px; }
-.navigation button { text-align:left; border:0; background:transparent; font-weight:650; }
-.navigation [aria-current=page] { color:#416da9; background:#eaf1fc; }
+.navigation { display:flex; align-items:stretch; gap:8px; border-bottom:1px solid var(--line); margin:0 0 16px; }
+.navigation button { position:relative; min-width:88px; min-height:48px; padding:8px 16px 10px; border:0; border-radius:0; background:transparent; color:var(--muted); font-weight:650; text-align:center; }
+.navigation button:hover { color:#315f99; background:#edf3fa; }
+.navigation button[aria-selected=true] { color:#245a99; background:transparent; }
+.navigation button[aria-selected=true]::after { content:""; position:absolute; right:12px; bottom:-1px; left:12px; height:3px; border-radius:3px 3px 0 0; background:#2e68ad; }
 main { min-width:0; }
 h1 { font-size:27px; margin:0 0 16px; line-height:1.25; }
 h2 { font-size:15px; margin:0; }
@@ -39,8 +40,8 @@ textarea { width:100%; min-height:35vh; max-height:55vh; resize:vertical; border
 @media(max-width:640px) {
   .app { padding:10px 11px calc(32px + env(safe-area-inset-bottom)); }
   .top { margin-bottom:9px; font-size:17px; }.mark { width:32px; height:32px; }
-  .layout { display:block; }.navigation { position:sticky; top:0; z-index:1; flex-direction:row; gap:6px; padding:5px 0 8px; background:var(--page); }
-  .navigation button { flex:1; text-align:center; } h1 { font-size:21px; margin:8px 0 10px; }
+  .navigation { position:sticky; top:0; z-index:1; gap:4px; padding-top:2px; background:var(--page); }
+  .navigation button { flex:1 1 0; min-width:0; } h1 { font-size:21px; margin:8px 0 10px; }
   .filters { padding:9px; }.item { padding:11px; }.item h3 { font-size:14px; }.actions { gap:5px; }
 }
 

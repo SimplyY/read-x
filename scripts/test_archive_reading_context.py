@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from archive_reading_context import FIELDS, archive, load_journal, save_journal
+from reading_article_identity import article_key
 
 
 class FakeBase:
@@ -53,6 +54,26 @@ def job():
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_two_articles_in_one_message_have_independent_archives(self):
+        class MultiBase(FakeBase):
+            def create(self,key,title):
+                self.creates+=1
+                self.records.append({'id':f'rec{self.creates}','fields':{'文章键':key,'标题':title}})
+            def upload(self,record_id,field,content):
+                self.uploads+=1; token=f'file{self.uploads}'; self.files[token]=content
+                next(r for r in self.records if r['id']==record_id)['fields'][field]=[{'file_token':token}]
+            def set_manifest(self,record_id,manifest,fields=None):
+                target=next(r for r in self.records if r['id']==record_id)['fields']
+                target['校验清单']=manifest; target.update(fields or {})
+        base,journal=MultiBase(),{'jobs':{}}
+        for n in (1,2):
+            url=f'https://example.com/{n}'
+            item={**job(),'job_id':f'job{n}','source_url':url,'article_key':article_key(url,multi=True)}
+            self.assertEqual(archive(item,base,journal,lambda:None)['status'],'verified')
+        self.assertEqual(base.creates,2)
+        self.assertEqual(base.uploads,4)
+        self.assertNotEqual(base.records[0]['fields']['文章键'],base.records[1]['fields']['文章键'])
+
     def test_readback_idempotent_and_preserves_user_state(self):
         base, journal = FakeBase(), {'jobs': {}}
         first = archive(job(), base, journal, lambda: None)
