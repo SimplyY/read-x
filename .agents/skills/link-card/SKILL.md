@@ -33,7 +33,7 @@ metadata:
 1. **bot 身份发送** — 所有卡片用 `--as bot`，不用 user 身份。卡片是 bot 产出的内容，不是用户本人发的
 2. **内容质量决定分析深度** — 不因为链接来源不同而区别对待。一篇即刻深度长文值得精读，一篇公众号水文不值得。链接类型只影响「怎么抓取」，不影响「分析多深」。**已知专项文体例外**：阮一峰《科技爱好者周刊》等固定栏目跳过评分，直接走专项解析（见 [0.5] 快通道）——评分是为未知内容设计的路由决策器，已知栏目的质量和处理方式都已确定
 3. **卡片是展示层，不是分析层** — 卡片只负责格式化输出，不替代 long-read 的深度分析
-4. **抓取方式由链接类型决定** — 微信公众号评分只调用 `prepare_scoring_run.py`（内部使用 `wx_fast.py` 纯 HTTP 抓取，不启动浏览器），即刻用 curl + `__NEXT_DATA__`，通用网页用 `read` skill。抓取方式不同，但抓取后的内容走同一套质量判断
+4. **抓取方式由链接类型决定** — 微信公众号评分只调用 `prepare_scoring_run.py`，正文由 `wx_fast.py` 纯 HTTP 抓取。若标题状态为 `needs_title`，或只有非中文原题，则允许用 EGO Lite 只读取页面标题、H1、Open Graph 标题和 `hreflang` 中文 alternate；没有 alternate 时，可检索对应中文译文页，但必须核对该页明确链接回同一原文 URL。EGO 不能替代正文抓取。即刻用 curl + `__NEXT_DATA__`，通用网页用 `read` skill。抓取方式不同，但抓取后的内容走同一套质量判断
 
 ---
 
@@ -88,13 +88,13 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 ## [0] 抓取：按链接类型选择抓取方式
 
-微信公众号只运行一次 `python3 /Users/yuwei/code/read-x/scripts/prepare_scoring_run.py <URL>`。它调用 `wx_fast.py` 进行纯 HTTP 抓取，不启动或回退任何浏览器；确定性创建独立 `run_dir`、解析唯一保存路径、复制并核对 `source.md`、生成匿名正文，并在同一 run 目录生成 Base 配置快照。最终只输出含绝对路径、文章元数据和 `policy_source` 的 JSON。HTTP 失败即失败关闭。禁止在模型中自行 `mktemp`、解析 `fetch.log`、重建标题路径、扫描 output、调用 `grep -P` 或重复抓取。
+微信公众号只运行一次 `python3 /Users/yuwei/code/read-x/scripts/prepare_scoring_run.py <URL>`。它调用 `wx_fast.py` 进行纯 HTTP 正文抓取；确定性创建独立 `run_dir`、解析唯一保存路径、复制并核对 `source.md`、生成匿名正文，并在同一 run 目录生成 Base 配置快照。输出 JSON 含 `title_status` 和 `title_language`。若标题待补采或只有非中文原题，使用 EGO Lite 查看页面标题、H1、Open Graph 标题及中文 alternate；没有 alternate 时，可检索中文译文页，但必须确认译文页明确链接回同一原文 URL。不得根据英文标题自行翻译。中文标题核实时，调用 `python3 /Users/yuwei/code/read-x/scripts/apply_article_title.py --run-dir <run_dir> --url <URL> --title <EGO核实的标题>`，以其读回结果作为本轮标题。没有中文版本时保留真实原题；没有任何标题时保留 `标题待补采`。EGO 仅用于标题元数据，不用于正文和评分。HTTP 正文失败仍按真实失败状态处理。禁止在模型中自行 `mktemp`、解析 `fetch.log`、重建标题路径、扫描 output、调用 `grep -P` 或重复抓取。
 
 非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`，再运行 `python3 /Users/yuwei/code/read-x/scripts/fetch_base_config.py --output <run_dir>/base-config.json`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。Base 读取失败时继续使用本地策略，并保留失败原因。
 
 | 链接类型 | 抓取方式 |
 |---------|---------|
-| `mp.weixin.qq.com` | `prepare_scoring_run.py`（内部使用 `wx_fast.py` 纯 HTTP，只抓取一次） |
+| `mp.weixin.qq.com` | `prepare_scoring_run.py`（正文由 `wx_fast.py` 纯 HTTP 单次抓取；必要时 EGO Lite 仅补标题元数据） |
 | `m.okjike.com` | curl 模拟移动端 → 提取 `__NEXT_DATA__` JSON → 解析 `props.pageProps.post` |
 | 其他 URL | `read` skill |
 

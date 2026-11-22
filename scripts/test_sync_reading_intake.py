@@ -13,8 +13,12 @@ class Base:
                     'record_id_list': [r['id'] for r in self.records], 'has_more': False}
         if operation == '+record-upsert':
             self.creates += 1
-            value = json.loads(args[1])
-            self.records.append({'id':'recnew','fields':value})
+            if args[0] == '--record-id':
+                record_id, value = args[1], json.loads(args[3])
+                next(r for r in self.records if r['id'] == record_id)['fields'].update(value)
+            else:
+                value = json.loads(args[1])
+                self.records.append({'id':'recnew','fields':value})
             return {}
         raise AssertionError(operation)
     def find(self, key):
@@ -36,6 +40,22 @@ class SyncTests(unittest.TestCase):
         sync_one({**item, 'createdAt':'2026-11-19 01:30:00'},b,{'jobs':{}},lambda:None)
         self.assertEqual(b.records[0]['fields']['入库时间'],'2026-11-19 09:30')
         self.assertEqual(b.records[0]['fields']['来源'],'example.com')
+        self.assertEqual(b.records[0]['fields']['标题'],'标题待补采')
+    def test_repairs_only_url_placeholder_on_intake_owned_record(self):
+        b = Base([{'id':'recold','fields':{'文章键':'url:'+__import__('hashlib').sha256(item['canonicalUrl'].encode()).hexdigest(),
+                                           '原文链接':item['originalUrl'],'标题':item['originalUrl']}}])
+        sync_one(item,b,{'jobs':{}},lambda:None)
+        self.assertEqual(b.records[0]['fields']['标题'],'标题待补采')
+    def test_preserves_established_human_title(self):
+        b = Base([{'id':'recold','fields':{'文章键':'url:'+__import__('hashlib').sha256(item['canonicalUrl'].encode()).hexdigest(),
+                                           '原文链接':item['originalUrl'],'标题':'我手动整理的标题'}}])
+        sync_one(item,b,{'jobs':{}},lambda:None)
+        self.assertEqual(b.records[0]['fields']['标题'],'我手动整理的标题')
+    def test_preserves_a_different_user_url_in_title_field(self):
+        b = Base([{'id':'recold','fields':{'文章键':'url:'+__import__('hashlib').sha256(item['canonicalUrl'].encode()).hexdigest(),
+                                           '原文链接':item['originalUrl'],'标题':'https://example.com/other'}}])
+        sync_one(item,b,{'jobs':{}},lambda:None)
+        self.assertEqual(b.records[0]['fields']['标题'],'https://example.com/other')
     def test_uncertain_create_does_not_replay(self):
         b,j=Base(),{'jobs':{'1':{'key':'url:'+__import__('hashlib').sha256(item['canonicalUrl'].encode()).hexdigest(),'url':item['canonicalUrl'],'create_attempted':True}}}
         with self.assertRaisesRegex(RuntimeError,'unresolved'):

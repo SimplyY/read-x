@@ -96,7 +96,7 @@ def main() -> int:
         from reading_article_identity import identity_from_trusted_intake, score_request_id
         from reading_score_receipt import STATE, APP
         multi_key = identity_from_trusted_intake(STATE, APP, args.source_message_id, args.url)
-        if not multi_key or args.idempotency_key != score_request_id(args.source_message_id,multi_key):
+        if not multi_key and args.idempotency_key != score_request_id(args.source_message_id,multi_key):
             raise ValueError('score request does not match trusted article identity')
     if multi_key or args.idempotency_key.startswith('readx-score-'):
         try:

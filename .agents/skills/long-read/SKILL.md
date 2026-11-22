@@ -9,7 +9,7 @@ description: "长文精读编排器：接收 route=long_read 任务，消费 con
 
 对普通完整文章，默认交付 `article-decode` 与独立 `read-x.munger-analysis` 两份可直接用于 ChatGPT 的 TXT；不自动提交 ChatGPT。运行 Skill 的 Agent 负责理解原文并提供简洁标题，记录标题来源。输入、Evidence 或治理 Prompt 未通过校验时停止并留下安全失败状态。
 
-准备好完整原文、Evidence、可信触发上下文和标题后，使用 `long_read_workflow_cli.py submit-context-packs` 持久接管。该入口适用于评分得到的 `route=card` 与 `route=long_read`，不要求 `score-gate.json`，也不触发自动正文、图片或文档发布。以本地状态读取为准：任务返回 `accepted` 只代表已接管；只有双包文件/版本校验和两份附件送达读回均确认后，才汇报“上下文包：已完成 2/2”。
+准备好完整原文、Evidence、可信触发上下文和标题后，使用 `long_read_workflow_cli.py submit-context-packs` 持久接管。该入口适用于评分得到的 `route=card` 与 `route=long_read`，不要求 `score-gate.json`，也不触发自动正文、图片或文档发布。以本地状态读取为准：任务返回 `accepted` 只代表已接管；只有双包文件/版本校验和两份附件送达读回均确认后，才汇报“上下文包：已完成 2/2”。旧 `submit` 已停用；本文件后续工作流段落只适用于既有任务的恢复，不用于创建新任务。
 
 `route=long_read` 的原业务流程继续负责组装、确认、发布与读回；每个 ChatGPT 生成步骤默认准备人工交接包，不调用网页 Bridge 提交。原长文请求已授权继续原业务流程，但不得绕过原有最终人工确认。待人工期间任务保持可恢复状态，不报告业务完成。
 
@@ -25,7 +25,7 @@ description: "长文精读编排器：接收 route=long_read 任务，消费 con
 
 ```text
 原文 + Evidence + scoring_result + 评分凭据 + 可信触发上下文
-     -> workflow CLI submit：校验并持久接管；返回 accepted 才表示已接管
+     -> workflow CLI submit-context-packs：冻结双包并尝试附件送达
      -> 独立 Worker：文字分支检查点 -> 程序装配 -> 主文档发布与读回
      -> 逐张图片：生成 -> 文档插入与读回 -> 单独私聊发送与读回
      -> 所有必需产物确认后，唯一完成门才允许最终成功通知
@@ -54,7 +54,7 @@ Evidence 只能来自原文。作者、日期未知写 `null`；抓取缺失或�
 
 `run_long_read_pipeline.py`、`run_isolated_analyses.py`、`run_chatgpt_munger.py` 与 `run_chatgpt_core_image.py` 的直接 CLI 均不再创建新网页提交；前两类文本脚本只由 Worker 复用 Prompt/校验准备函数。旧文本 Run 只能从持久任务 `resume` 并观察原请求；旧图片 Run 只能通过带匹配摘要的 `run_chatgpt_core_image.py --request-id ... --summary ...` 只读观察。不得把旧脚本当作人工交接入口或绕过任务身份。
 
-只有 `score_status=scored` 且 `route=long_read` 才可提交。提交前准备同一轮的原文、Evidence、评分结果、评分卡凭据、可信触发上下文和 0–3 个唯一问题文件；新任务只允许使用 `references/routing.md` 列出的五个 Skill。已持久接管的任务继续按冻结的问题文件计划恢复。可信触发上下文必须包含 `bridge_context.sourceMessageId`；若字段缺失或本轮合并了多条消息，停止提交，不得猜测或替换消息 ID。将该 ID 原样传给 `--source-message-id`，用于按应用身份和来源事件去重。`long_read_workflow_cli.py submit` 校验后先保存不可变输入快照，再登记任务；只有返回 `status=accepted` 才表示持久接管。
+新任务一律走 `submit-context-packs`；只有既有旧任务才允许恢复。提交前准备同一轮的原文、Evidence、可信触发上下文和简洁标题。可信触发上下文必须包含 `bridge_context.sourceMessageId`；若字段缺失或本轮合并了多条消息，停止提交，不得猜测或替换消息 ID。将该 ID 原样传给 `--source-message-id`，用于按应用身份和来源事件去重。`long_read_workflow_cli.py submit-context-packs` 校验后先保存不可变输入快照，再登记任务；`accepted` 只表示已接管，双包附件送达读回确认后才表示完成。
 
 重复入站以应用身份和来源消息 ID 去重。用户再次主动提交同一 URL 仍是新任务。提交失败时不得报告“已接管”。`status` 只读查看状态；`run-worker` 推进待办任务；`resume --job-id` 从检查点恢复。收到 ChatGPT 结果后，在原 Codex 任务运行 `import-manual-result --job-id <id> --artifact <analysis:branch> --result <file> [--file <original-file>]`，再由 `resume --job-id <id>` 或既有 Worker 接续。人工导入与业务校验、最终确认、发布和远端读回是不同阶段。恢复时先只读核验在途副作用，不能把结果不明变成重新提交。已成功产物按内容哈希和收据复用。
 
@@ -88,28 +88,13 @@ Evidence Schema 与原文逐字引文在请求前严格校验。校验失败时�
 不要把独立 Skill 的表达统一改写成平直白话。完整原稿中的重复也保留；不得以“去重”“精华”或“可读性”为由删除用户尚未看到的分析内容。
 
 文档与单分支分析均不设统一硬性总字数门槛；实际生成约束见 [`single-branch-concision.md`](references/single-branch-concision.md)。附录保留每条 ljg 完整原稿，不压缩、不改语义；标题后不放导言概要。排版细则见 `references/output-schema.md` 第 3、4 节。
-准备每条文字 ljg 的唯一问题文件后，通过持久工作流入口提交同一轮输入：
-
-```bash
-python3 .agents/skills/long-read/scripts/long_read_workflow_cli.py submit \
-  --source <run_dir>/source.md \
-  --evidence <run_dir>/evidence.json \
-  --scoring-result <run_dir>/scoring-result.json \
-  --score-gate <run_dir>/score-gate.json \
-  --trigger-context <run_dir>/trigger-context.json \
-  --app-id <bridge_context.appId> \
-  --feishu-profile <bridge_context.feishuProfile> \
-  --source-message-id <bridge_context.sourceMessageId> \
-  --question ljg-think <run_dir>/question-01.md
-```
-
-按实际分支重复 `--question` 0–3 次。返回 `accepted` 后，Worker 持久推进已适配的文字分析、程序装配、Document Compiler 发布和通知。核心图新生成步骤使用 `core-image` 人工交接；将返回的原始 PNG 作为 `--result` 导入，再沿原 Worker 接续。导入只形成候选；任务、Prompt、原文哈希绑定和 PNG 结构校验通过后，才进入原图片插入、单独私聊发送及读回门禁。多份不同图片候选须先用 `select-manual-candidate` 明确选择。人工来源不产生 `live-dom+snapshot` 等浏览器证据。旧图片 Run 仍只通过带匹配摘要的 `run_chatgpt_core_image.py --request-id ... --summary ...` 只读观察恢复。`status` 只读查看；`run-worker` 推进一个任务；部署后的 `run-worker --serve` 在同一 Worker 中检查报告周期；`resume --job-id <id>` 先核验不确定的远端动作，再从可确认检查点接续。不要运行旧 ChatGPT 脚本、直接写飞书或手工重发。
+旧 `submit` 已停用，不得再从这段准备代码创建新任务。既有任务恢复只用 `status`、`run-worker` 或 `resume --job-id`；人工回填只用 `import-manual-result` 和 `select-manual-candidate`。不要运行旧 ChatGPT 脚本、直接写飞书或手工重发。
 
 `appId` 与 `feishuProfile` 由 Bridge 从当前运行配置注入，提交负载原样保留。准入端按 `appId` 从本地 `lark-cli profile list` 唯一解析 CLI profile，并以 `lark-cli --profile <name> whoami` 核验；工作流另存为 `larkCliProfile`。直接调用 `lark-cli` 的通知和图片适配器显式使用 `larkCliProfile`；Document Compiler 继续使用 Bridge 注入的 `feishuProfile`，因为它绑定的是 Bridge 管理的配置目录。解析不唯一、身份不匹配或无法读取时失败关闭，不修改全局默认 profile。
 
 群消息触发的任务必须在入队前确定可验证的本人 P2P 私聊目标。优先使用可信触发上下文中的 `privateChatId`；缺失时仅可回退到持久化且与当前 CLI profile、发送者 open_id、Read-X bot app_id 精确匹配的已验证报告目标，并将解析出的会话固定到任务。没有匹配目标时拒绝接管；图片发送和读回必须使用同一目标。旧任务缺少 `privateChatId` 时，只允许按相同身份绑定的已保存目标恢复，否则停在待核实。
 
-仅当 `bridge_context.readxCanary` 为 `true` 时，在 `trigger-context.json` 原样保留该字段并在 `submit` 命令中附加 `--test-task`。提交端还会通过 `lark-cli` 只读核验当前用户身份，并按 `sourceMessageId` 读取唯一原始消息，核对发送者、群、消息类型、精确 CANARY 前缀及其唯一文章 URL 与 Evidence 来源 URL 一致。核验失败或无法读取时不登记任务。成功凭据只保存身份、来源时间和内容 / URL 哈希，不保存额外消息正文；Worker、周月报告和留存只把带有效来源凭据的验收任务视为测试任务。既有布尔标记缺少凭据时不得恢复，也不得从正式成功率统计中排除。该校验不改变评分、交付或恢复规则。其他任务不得附加此参数。
+仅当 `bridge_context.readxCanary` 为 `true` 时，在 `trigger-context.json` 原样保留该字段；新双包任务不使用旧 `submit` 的 `--test-task`。既有任务恢复时，提交端仍会通过 `lark-cli` 只读核验当前用户身份，并按 `sourceMessageId` 读取唯一原始消息，核对发送者、群、消息类型、精确 CANARY 前缀及其唯一文章 URL 与 Evidence 来源 URL 一致。核验失败或无法读取时不登记任务。成功凭据只保存身份、来源时间和内容 / URL 哈希，不保存额外消息正文；Worker、周月报告和留存只把带有效来源凭据的验收任务视为测试任务。既有布尔标记缺少凭据时不得恢复，也不得从正式成功率统计中排除。该校验不改变评分、交付或恢复规则。其他任务不得附加此参数。
 
 ## 5. 成品结构
 
@@ -179,7 +164,7 @@ content-scoring 已校验的个人上下文只作为弱辅助排序信号，不�
 ## 自检
 
 - [ ] 是否只处理 `score_status=scored` 且 `route=long_read`，并原样消费上游评分和凭据？
-- [ ] 是否由 `long_read_workflow_cli.py submit` 持久接管，并仅在返回 `accepted` 后报告已接管？
+- [ ] 是否由 `long_read_workflow_cli.py submit-context-packs` 持久接管，并仅在双包附件送达读回确认后报告完成？
 - [ ] 分支输入是否隔离，Bridge 结果是否核对提交确认、`live-dom+snapshot`、URL、哈希和进程退出码？
 - [ ] 成功产物是否经输入版本、哈希和收据核验后复用？
 - [ ] 是否由程序完整装配成功分支，并保留原文内容，不做截断或生成后压缩？

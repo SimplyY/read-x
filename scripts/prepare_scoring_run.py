@@ -18,6 +18,7 @@ import threading
 from pathlib import Path
 
 import prepare_anchor_view
+from article_titles import TITLE_PENDING, choose_article_title, has_han
 
 
 SAVED_PREFIX = "✅ 已保存: "
@@ -36,9 +37,10 @@ def saved_path(output: str) -> Path:
     return path
 
 
-def article_metadata(source: str) -> dict[str, str]:
+def article_metadata(source: str, source_url: str = "") -> dict[str, str]:
     lines = source.splitlines()
-    title = lines[0][2:].strip() if lines and lines[0].startswith("# ") else ""
+    raw_title = lines[0][2:].strip() if lines and lines[0].startswith("# ") else ""
+    title = choose_article_title([raw_title], source_url) or TITLE_PENDING
     values = {}
     for line in lines[:12]:
         match = METADATA.match(line)
@@ -151,8 +153,10 @@ def main() -> int:
         "blind_source_parts": blind_parts(blind_path, blind_source),
         "url": args.url,
         "policy_source": "base" if base_config_path else "local",
-        **article_metadata(source),
+        **article_metadata(source, args.url),
     }
+    result["title_status"] = "needs_title" if result["title"] == TITLE_PENDING else "ready"
+    result["title_language"] = "unknown" if result["title"] == TITLE_PENDING else "zh" if has_han(result["title"]) else "source"
     if base_config_path:
         result["base_config"] = base_config_path
     elif config_error:

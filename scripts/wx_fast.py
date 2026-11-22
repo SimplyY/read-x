@@ -14,6 +14,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from article_titles import TITLE_PENDING, choose_article_title
+
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
@@ -24,6 +26,10 @@ class ArticleParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.meta: dict[str, str] = {}
+        self.document_title: list[str] = []
+        self.h1_titles: list[str] = []
+        self._in_title = False
+        self._h1_parts: list[str] | None = None
         self.parts: list[str] = []
         self.capture = False
         self.depth = 0
@@ -36,7 +42,11 @@ class ArticleParser(HTMLParser):
         if tag == "meta":
             key = values.get("property") or values.get("name")
             if key and values.get("content"):
-                self.meta.setdefault(key, values["content"])
+                self.meta.setdefault(key.lower(), values["content"])
+        if tag == "title":
+            self._in_title = True
+        elif tag == "h1":
+            self._h1_parts = []
         if not self.capture:
             if values.get("id") == "js_content":
                 self.capture, self.depth = True, 1
@@ -60,6 +70,13 @@ class ArticleParser(HTMLParser):
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self._in_title = False
+        elif tag == "h1" and self._h1_parts is not None:
+            value = re.sub(r"\s+", " ", "".join(self._h1_parts)).strip()
+            if value:
+                self.h1_titles.append(value)
+            self._h1_parts = None
         if not self.capture:
             return
         if tag == "a" and self._anchors:
@@ -79,6 +96,10 @@ class ArticleParser(HTMLParser):
                 self.capture = False
 
     def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.document_title.append(data)
+        if self._h1_parts is not None:
+            self._h1_parts.append(data)
         if not self.capture:
             return
         if self._anchors:
@@ -128,10 +149,17 @@ def _original_source_candidate(source_url: str, links: list[tuple[str, str]]) ->
     return None
 
 
-def parse_article(source: str, url: str) -> str:
+def parse_article(source: str, url: str, *, title_override: str | None = None) -> str:
     parser = ArticleParser()
     parser.feed(source)
-    title = parser.meta.get("og:title") or _js_string(source, "msg_title")
+    title = choose_article_title([
+        title_override,
+        parser.meta.get("og:title"),
+        _js_string(source, "msg_title"),
+        parser.meta.get("twitter:title"),
+        "".join(parser.document_title),
+        *parser.h1_titles,
+    ], url) or TITLE_PENDING
     author = parser.meta.get("og:article:author") or parser.meta.get("author") or _js_string(source, "nickname")
     published = parser.meta.get("article:published_time")
     if not published:
@@ -139,8 +167,6 @@ def parse_article(source: str, url: str) -> str:
         if timestamp.isdigit():
             published = datetime.fromtimestamp(int(timestamp), timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     body = parser.markdown()
-    if not title:
-        raise ValueError("no_title")
     if len(body) < 200:
         raise ValueError("no_content")
     metadata = [f"# {title}", ""]

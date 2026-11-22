@@ -15,6 +15,7 @@ import sys
 from archive_reading_context import BASE, TABLE, LarkBase
 from reading_intake import _open_database, normalize_url
 from reading_article_identity import score_request_id, identity_from_trusted_intake
+from article_titles import TITLE_PENDING, can_update_base_title, choose_article_title
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / 'state/reading-workbench'
@@ -190,7 +191,8 @@ def record_receipt(*, state=STATE, message_id, url, title, author, result, artic
     status = result.get('score_status')
     if status not in ('scored', 'needs_full_text', 'needs_review'):
         raise ValueError('invalid score state')
-    values = {'标题': str(title)[:200], '作者': str(author)[:200],
+    stored_title = choose_article_title([title], url) or TITLE_PENDING
+    values = {'标题': stored_title[:200], '作者': str(author)[:200],
               '评分状态': {'scored':'已评分', 'needs_full_text':'正文不完整', 'needs_review':'待复核'}[status],
               }
     # A scoring review can be caused by scoring evidence or calibration even
@@ -276,10 +278,10 @@ def sync_receipts(state=STATE):
                 record = matches[0]
                 metadata = json.loads(encoded)
                 fields = {key:value for key,value in metadata.items() if not key.startswith('_')}
-                # Do not write blank metadata or overwrite an established title
-                # or author with stale data. Base may read an unset field as
-                # None, which must not make an empty source author look mismatched.
-                if not fields.get('标题') or record['fields'].get('标题') not in (None, '', url):
+                # Replace only an empty/URL/pending title; keep established titles.
+                # Base may read an unset field as None, which must not make an
+                # empty source author look mismatched.
+                if not can_update_base_title(record['fields'].get('标题'), fields.get('标题'), url):
                     fields.pop('标题',None)
                 if not fields.get('作者') or record['fields'].get('作者'):
                     fields.pop('作者',None)
@@ -315,7 +317,7 @@ def sync_receipts(state=STATE):
                     raise ValueError('article record absent or ambiguous')
                 record=matches[0]
                 fields={k:v for k,v in json.loads(encoded).items() if not k.startswith('_')}
-                if not fields.get('标题') or record['fields'].get('标题') not in (None,'',url):
+                if not can_update_base_title(record['fields'].get('标题'), fields.get('标题'), url):
                     fields.pop('标题',None)
                 if not fields.get('作者') or record['fields'].get('作者'):
                     fields.pop('作者',None)

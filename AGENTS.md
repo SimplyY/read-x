@@ -21,7 +21,7 @@ README.md 保存项目事实；本文件保存 Agent 执行规则。
 **收到任何链接时，必须走 link-card 流程，以卡片 + bot 身份回复。禁止纯文本回复。**
 
 link-card 流程：
-1. **抓取**：按链接类型选择抓取方式；微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`，内部使用纯 HTTP，不启动或回退浏览器
+1. **抓取**：按链接类型选择抓取方式；微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`，正文仍使用纯 HTTP。若输出 `title_status=needs_title` 或 `title_language=source`，允许用 EGO Lite 只读页面标题/H1/中文 alternate；若无 alternate，可核对对应中文译文页，但译文页必须明确链接回同一原文 URL。不得用浏览器抓正文，也不得重复 HTTP 抓取
 2. **内容质量判断**：统一调 `content-scoring` v3.19（质量输出仍为 v3.16）；质量模型只读去身份正文与通用三维质量语义，并独立判断 `problem_significance`；不做权威解析、身份包生成或外部搜索，脚本固定按 70% 质量 + 30% 重要性计算决策分；只按脚本返回的 `score_status`、`route` 和 `quality_label` 分派
 3. **卡片输出**：所有结果以卡片格式发送，`--as bot`
 
@@ -39,7 +39,7 @@ link-card 流程：
 
 - **`score_status=needs_relevance`** -> 内部补相关性，不发卡、不分派
 - **`score_status=needs_full_text|needs_review`** -> 无数字状态卡
-- **`route=long_read`** -> long-read 全流程 -> 卡片
+- **`route=long_read`** -> 默认双上下文包 + 深读卡片路由；不启动完整精读文档链
 - **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片；快速阅读必须通过 `--quick-read` 提供速读内容，缺失或为空时失败关闭
 
 **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
@@ -52,7 +52,7 @@ link-card 流程：
 
 按 `.agents/skills/long-read/SKILL.md` 执行。复用 link-card 前置抓取生成的 `source.md`，不得重复抓取。文体规则、Evidence、评分路由和输出结构以对应 Skill 与校验器为准。
 
-确定 `route=long_read` 后，将同一轮原文、Evidence、`scoring_result`、评分卡凭据、可信触发上下文（含单消息批次的 `bridge_context.sourceMessageId`）和 0–3 个独立问题交给 `.agents/skills/long-read/scripts/long_read_workflow_cli.py submit`，并把该 ID 原样作为 `--source-message-id`。字段缺失或本轮合并多条消息时停止提交。只有输入校验、私有快照和状态登记均成功并返回 `accepted`，才能报告“已接管”。不得再把 `run_long_read_pipeline.py` 当作生产交付入口。
+确定 `route=long_read` 后，仍按“普通内容默认双上下文包”调用 `submit-context-packs`；`route` 原样记录为 `long_read`，不启动正文、图片或额外分析。旧 `long_read_workflow_cli.py submit` 已停用，任何新任务不得调用；字段缺失或本轮合并多条消息时停止提交。只有双包冻结和附件送达读回确认后，才能报告“上下文包：已完成 2/2”。不得再把 `run_long_read_pipeline.py` 当作生产交付入口。
 
 持久 Worker 负责独立运行 `article-decode`、文字 ljg 与芒格分支，程序装配完整主文档，通过 Document Compiler 发布和读回，再逐张处理核心图与芒格图的生成、插入、单独私聊发送及读回。保留全局并发 ≤3、请求错开 ≥10 秒、Bridge 提交确认、`verification=live-dom+snapshot`、会话 URL/hash 和非零退出码门禁。必跑分支失败时保留其他成功结果，但整体不得成功。
 

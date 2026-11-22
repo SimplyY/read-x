@@ -118,6 +118,8 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/build_authority_identity.py` | 从公开文章元数据生成 identity_packet v1，供独立搜索桥使用 |
 | `scripts/fetch_base_config.py` | 读取并校验精读配置 Base，生成运行级 JSON 快照 |
 | `scripts/wx_fast.py` | 微信文章抓取（httpx 直连，不启动浏览器） |
+| `scripts/apply_article_title.py` | 将浏览器核实的中文标题补写到隔离评分 Run |
+| `scripts/repair_reading_titles.py` | 只读历史核对后修复 Base 中 bot 创建的 URL 占位标题 |
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |

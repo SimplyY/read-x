@@ -70,6 +70,23 @@ class ScoreReceiptTests(unittest.TestCase):
         self.assertEqual(FakeBase.record['fields']['标题'],'标题')
         self.assertEqual(FakeBase.record['fields']['质量分'],6.5)
 
+    def test_url_title_is_replaced_by_pending_marker_until_a_real_title_arrives(self):
+        url='https://example.com/a'
+        FakeBase.record={'id':'rec1','fields':{'标题':url,'阅读状态':'待读'}}
+        score.record_receipt(state=self.state,message_id='om_message',url=url,title=url,author='',
+            result={'score_status':'needs_review'})
+        with patch.object(score,'ROOT',self.root), patch.object(score,'LarkBase',FakeBase):
+            self.assertEqual(score.sync_receipts(self.state),(1,0))
+        self.assertEqual(FakeBase.record['fields']['标题'],'标题待补采')
+
+    def test_score_sync_does_not_overwrite_an_established_manual_title(self):
+        FakeBase.record={'id':'rec1','fields':{'标题':'我手动整理的标题','阅读状态':'待读'}}
+        score.record_receipt(state=self.state,message_id='om_message',url='https://example.com/a',
+            title='自动抓取的新标题',author='',result={'score_status':'needs_review'})
+        with patch.object(score,'ROOT',self.root), patch.object(score,'LarkBase',FakeBase):
+            self.assertEqual(score.sync_receipts(self.state),(1,0))
+        self.assertEqual(FakeBase.record['fields']['标题'],'我手动整理的标题')
+
     def test_invalid_result_does_not_create_receipt(self):
         with self.assertRaises(ValueError):
             score.record_receipt(state=self.state,message_id='om_message',url='https://example.com/a',

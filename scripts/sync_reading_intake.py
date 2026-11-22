@@ -14,6 +14,7 @@ import sys
 from urllib.parse import urlsplit
 from archive_reading_context import BASE, TABLE, LarkBase, load_journal, save_journal
 from reading_intake import list_pending, normalize_url, _open_database
+from article_titles import TITLE_PENDING, is_source_url_title
 
 
 def find_source(base, canonical_url):
@@ -70,7 +71,7 @@ def sync_one(item, base, journal, persist):
     if not matches:
         if entry.get('create_attempted'):
             raise RuntimeError('record creation outcome unresolved')
-        fields = {'标题': item['originalUrl'], '文章键': key, '原文链接': item['originalUrl'],
+        fields = {'标题': TITLE_PENDING, '文章键': key, '原文链接': item['originalUrl'],
                   '阅读状态': '待读', '人工版本': 1, '抓取状态': '待处理',
                   '评分状态': '待处理', '双包状态': '不生成' if item.get('packPolicy') == 'score_only' else '待处理'}
         if item.get('createdAt'):
@@ -95,6 +96,8 @@ def sync_one(item, base, journal, persist):
         fields = {}
         if not record['fields'].get('来源'):
             fields['来源'] = urlsplit(item['originalUrl']).hostname or ''
+        if is_source_url_title(record['fields'].get('标题'), item['originalUrl']):
+            fields['标题'] = TITLE_PENDING
         if not record['fields'].get('入库时间') and item.get('createdAt'):
             created = datetime.strptime(item['createdAt'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             fields['入库时间'] = created.astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M')

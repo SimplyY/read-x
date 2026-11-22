@@ -19,6 +19,7 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 from reading_intake import normalize_url
+from article_titles import TITLE_PENDING, can_update_base_title, choose_article_title
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".agents/skills/long-read/scripts"))
@@ -61,7 +62,7 @@ def read_job(state_dir: Path, job_id: str) -> dict:
             or parsed_url.username or parsed_url.password):
         source_url = None
     return {"job_id": job_id, "app_id": row["app_id"], "message_id": row["source_message_id"],
-            "snapshot": payload["snapshot_sha256"], "title": payload.get("title") or "未命名文章",
+            "snapshot": payload["snapshot_sha256"], "title": choose_article_title([payload.get("title")], source_url or "") or TITLE_PENDING,
             "author": evidence.get("metadata", {}).get("author"), "source_url": source_url, "files": files,
             "article_key": payload.get('article_key','')}
 
@@ -291,7 +292,7 @@ def archive(job: dict, base: LarkBase, journal: dict, persist) -> dict:
         fields["抓取状态"] = "已完成"
     if old.get("双包状态") != "已就绪":
         fields["双包状态"] = "已就绪"
-    if job.get("title") and old.get("标题") in (None, "", job.get("source_url")):
+    if can_update_base_title(old.get("标题"), job.get("title"), job.get("source_url", "")):
         fields["标题"] = job["title"]
     if job.get("author") and not old.get("作者"):
         fields["作者"] = str(job["author"])[:200]

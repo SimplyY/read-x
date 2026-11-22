@@ -1054,7 +1054,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     commands = parser.add_subparsers(dest="command", required=True)
-    submit = commands.add_parser("submit", help="校验并持久接管输入，然后立即推进一次 Worker")
+    submit = commands.add_parser("submit", help="已停用：新任务必须走 submit-context-packs")
     for name in ("source", "evidence", "scoring-result", "score-gate", "trigger-context"):
         submit.add_argument("--" + name, type=Path, required=True)
     submit.add_argument("--app-id", required=True)
@@ -1148,19 +1148,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "submit":
-            result = submit_inputs(source=args.source, evidence=args.evidence, scoring_result=args.scoring_result,
-                                   score_gate=args.score_gate, trigger_context=args.trigger_context, app_id=args.app_id,
-                                   feishu_profile=args.feishu_profile,
-                                   source_message_id=args.source_message_id,
-                                   test_task=args.test_task,
-                                   profile_resolver=resolve_worker_profile_key,
-                                   canary_verifier=verify_canary_source,
-                                   state_dir=args.state_dir)
-            from long_read_workflow_worker import run_once
-            result["worker"] = run_once(
-                args.state_dir, job_id=result["job_id"], owner="read-x-admission-worker",
-                outcome_recorder=record_business_outcome,
-            )
+            raise ValueError("Read-X legacy full-flow submissions are disabled; use submit-context-packs")
         elif args.command == "submit-context-packs":
             result = submit_context_inputs(source=args.source, evidence=args.evidence,
                 trigger_context=args.trigger_context, title=args.title, title_source=args.title_source,

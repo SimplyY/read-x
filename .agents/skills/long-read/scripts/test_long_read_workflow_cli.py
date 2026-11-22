@@ -623,39 +623,32 @@ class SubmissionTests(unittest.TestCase):
         context = json.loads(self.context.read_text())
         context["readxCanary"] = True
         dump(self.context, context)
+        job = self.submit(test_task=True)
         args = ["submit", "--state-dir", str(self.state), "--source", str(self.source), "--evidence", str(self.evidence),
                 "--scoring-result", str(self.scoring), "--score-gate", str(self.gate), "--trigger-context", str(self.context),
                 "--app-id", "app_one", "--source-message-id", "om_source"]
         args.extend(["--feishu-profile", "app_one"])
         args.append("--test-task")
         output = StringIO()
-        with patch.object(cli, "resolve_worker_profile_key", return_value="app_one"), \
-                patch.object(cli, "verify_canary_source", side_effect=canary_proof), \
-                patch.object(long_read_workflow_worker, "run_once",
-                             return_value={"status": "idle", "job_id": "unused",
-                                           "delivery_complete": False}) as run_once, \
-                redirect_stdout(output):
-            self.assertEqual(cli.main(args), 0)
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(args), 2)
         result = json.loads(output.getvalue())
-        self.assertEqual(result["status"], "accepted")
-        self.assertEqual(result["worker"]["status"], "idle")
-        self.assertEqual(run_once.call_args.kwargs["job_id"], result["job_id"])
-        self.assertEqual(run_once.call_args.kwargs["owner"], "read-x-admission-worker")
-        self.assertTrue(result["test_task"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("use submit-context-packs", result["message"])
         output = StringIO()
         with redirect_stdout(output):
-            self.assertEqual(cli.main(["--state-dir", str(self.state), "status", "--job-id", result["job_id"]]), 0)
+            self.assertEqual(cli.main(["--state-dir", str(self.state), "status", "--job-id", job["job_id"]]), 0)
         self.assertEqual(len(json.loads(output.getvalue())["jobs"]), 1)
         output = StringIO()
         with redirect_stdout(output):
             self.assertEqual(cli.main(["--state-dir", str(self.state), "status", "--chat-id", "oc_group"]), 0)
         self.assertTrue(json.loads(output.getvalue())["has_nonterminal"])
         original = long_read_workflow_worker.run_once
-        long_read_workflow_worker.run_once = lambda *args, **kwargs: {"status": "waiting_for_delivery_stages", "job_id": result["job_id"], "delivery_complete": False}
+        long_read_workflow_worker.run_once = lambda *args, **kwargs: {"status": "waiting_for_delivery_stages", "job_id": job["job_id"], "delivery_complete": False}
         try:
             output = StringIO()
             with redirect_stdout(output):
-                self.assertEqual(cli.main(["--state-dir", str(self.state), "resume", "--job-id", result["job_id"]]), 0)
+                self.assertEqual(cli.main(["--state-dir", str(self.state), "resume", "--job-id", job["job_id"]]), 0)
             self.assertEqual(json.loads(output.getvalue())["status"], "waiting_for_delivery_stages")
         finally:
             long_read_workflow_worker.run_once = original

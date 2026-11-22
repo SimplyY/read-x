@@ -521,7 +521,7 @@ def test_runtime_contract_prevents_observed_shape_regressions():
 def test_repo_rules_keep_wechat_scoring_on_single_fetch_entrypoint():
     rules = (Path(cs.__file__).parents[1] / "AGENTS.md").read_text(encoding="utf-8")
     assert "微信公众号只调用一次 `scripts/prepare_scoring_run.py <URL>`" in rules
-    assert "内部使用纯 HTTP，不启动或回退浏览器" in rules
+    assert "正文仍使用纯 HTTP" in rules and "只读页面标题/H1/中文 alternate" in rules
     assert "复用 link-card 前置抓取生成的 `source.md`" in rules
 
 
@@ -529,7 +529,7 @@ def test_link_card_has_one_wechat_scoring_entrypoint():
     skill = (Path(cs.__file__).parents[1] / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
     assert "mp.weixin.qq.com → prepare_scoring_run.py（内部只抓取一次）" in skill
     assert "| `mp.weixin.qq.com` | `prepare_scoring_run.py`" in skill
-    assert "`wx_fast.py` 纯 HTTP" in skill and "不启动或回退任何浏览器" in skill
+    assert "`wx_fast.py` 纯 HTTP 抓取" in skill and "EGO Lite 仅补标题元数据" in skill
 
 
 def test_wechat_fetcher_has_no_browser_fallback():
