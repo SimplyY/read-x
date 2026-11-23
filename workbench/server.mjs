@@ -326,16 +326,20 @@ export function buildApp({ gatewayKey, adapter = createBaseAdapter(), bookQuery,
         (bookId && !/^[A-Za-z0-9_-]{1,200}$/.test(bookId)) || !['daily','weekly','biweekly','monthly'].includes(mode)) return reply.code(400).send({ error: '范围或模式无效' });
     const data = await queryBooks(from, to, bookId);
     if (!data.books.length) return reply.code(409).send({ error: '所选范围没有可用阅读资料' });
-    let prompt;
+    const promptId = mode === 'daily' ? 'learn-x.reading-daily' : 'learn-x.reading-weekly';
+    const result = await execFile('/opt/homebrew/bin/node', ['/Users/yuwei/code/skills/prompt-governance/scripts/fetch-prompt.mjs', promptId], {timeout:30000,maxBuffer:1024*1024});
+    const asset = JSON.parse(result.stdout);
+    if (asset.contract_version !== 'prompt-asset/v1' || asset.prompt_id !== promptId ||
+        !Number.isInteger(asset.prompt_revision) || typeof asset.content !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(asset.prompt_sha256 || '') ||
+        createHash('sha256').update(asset.content).digest('hex') !== asset.prompt_sha256) {
+      throw new Error('阅读 Prompt 校验失败');
+    }
+    let prompt = asset.content;
     if (mode === 'daily') {
-      const result = await execFile('/opt/homebrew/bin/node', ['/Users/yuwei/code/skills/prompt-governance/scripts/fetch-prompt.mjs','learn-x.reading-daily'], {timeout:30000,maxBuffer:1024*1024});
-      const asset = JSON.parse(result.stdout);
-      if (asset.prompt_id !== 'learn-x.reading-daily' || createHash('sha256').update(asset.content).digest('hex') !== asset.prompt_sha256) throw new Error('伴读 Prompt 校验失败');
       const part = asset.content.split('## ChatGPT 伴读 Prompt\n\n');
       if (part.length !== 2 || !part[1].includes('\n```')) throw new Error('伴读 Prompt 格式变化');
       prompt = part[1].split('\n```')[0];
-    } else {
-      prompt = await readFile('/Users/yuwei/code/learn-x/02_prompts/meta/chatgpt-reading-weekly.md', 'utf8');
     }
     const modeLabel = {daily:'日常伴读',weekly:'周度深读',biweekly:'双周深读',monthly:'月度深读'}[mode];
     const text = [`# 阅读资料`, `可用资料：以下是微信读书已离线保存的划线与个人想法，不含全书正文或独立书评。`, `模式：${modeLabel}`, `范围：${from} 至 ${to}（Asia/Shanghai）`, `未完整日期：${data.gaps.join('、') || '无'}`];
