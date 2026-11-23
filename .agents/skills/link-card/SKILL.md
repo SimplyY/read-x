@@ -11,29 +11,30 @@ metadata:
 
 群内收到任何链接，先抓取内容、做内容质量判断并发送评分卡。`route=card` 由本 Skill 生成结果卡；`route=long_read` 则转给持久工作流，后续进度、文档、图片和最终状态通知由 Worker 独占处理。**卡片必须以 bot 身份发送（`--as bot`）**，不要以 user 身份发送。
 
-每次处理链接的第一步都必须重新读取本文件当前版本；长会话不得沿用启动时缓存的旧流程。若已读版本仍包含评分过程消息，必须放弃该版本并重读。
+每次处理链接的第一步都必须重新读取本文件当前版本（本文件是入口，规则细节按下方索引从 references/ 按需加载）；长会话不得沿用启动时缓存的旧流程。若已读版本仍包含评分过程消息，必须放弃该版本并重读。
 
-## 第一性原理
+## 按需加载索引
 
-**为什么用卡片？**
+本文件是入口，只保留每次任务都需要的规则；下列细节从 references/ 按需读取：
 
-当前流程：链接 → 抓取 → 纯文本 Markdown → 群内回复。问题：
-1. 手机上看大段 Markdown 体验差——结构扁平、字体单一、信息密度不均匀
-2. 纯文本无法区分「这条消息是 bot 发的」和「群友发的」——身份模糊
-3. 每次回复都是新的消息气泡，群聊容易刷屏
+| 任务场景 | 读取 |
+|---------|------|
+| 想了解「为什么用卡片」的完整论证 | [references/first-principles.md](references/first-principles.md) |
+| 非微信 URL（即刻 / 其他）的抓取命令与准备细节 | [references/fetch-non-wechat.md](references/fetch-non-wechat.md) |
+| 专项文体快通道命中后的专项处理（阮一峰周刊 / 李继刚人生周报） | [references/genre-fast-path.md](references/genre-fast-path.md) |
+| 需要评分卡 JSON 示例 | [references/score-card-example.md](references/score-card-example.md) |
+| 生成或核对卡片 JSON 模板（高质量 / 中等 / 快速阅读 / 低质量 / 抓取失败） | [references/card-templates.md](references/card-templates.md) |
+| 明确 link-card 与 long-read 的职责分工 | [references/long-read-relation.md](references/long-read-relation.md) |
+| 修改本 Skill 后自测 | [references/self-test.md](references/self-test.md) |
 
-卡片的优势：
-1. **视觉分层**：header（标题+主题色）、body（核心内容）、底部（元数据/金句），一眼定位
-2. **身份清晰**：卡片自带 bot 发送者身份，与群友消息自然区分
-3. **信息密度可控**：卡片天然约束了长度，倒逼提炼精华
-4. **手机原生化**：飞书卡片在手机上渲染效果远好于 Markdown 块
+---
 
-**四个核心原则：**
+## 第一性原理（完整论证见 references/first-principles.md）
 
-1. **bot 身份发送** — 所有卡片用 `--as bot`，不用 user 身份。卡片是 bot 产出的内容，不是用户本人发的
-2. **内容质量决定分析深度** — 不因为链接来源不同而区别对待。一篇即刻深度长文值得精读，一篇公众号水文不值得。链接类型只影响「怎么抓取」，不影响「分析多深」。**已知专项文体例外**：阮一峰《科技爱好者周刊》等固定栏目跳过评分，直接走专项解析（见 [0.5] 快通道）——评分是为未知内容设计的路由决策器，已知栏目的质量和处理方式都已确定
-3. **卡片是展示层，不是分析层** — 卡片只负责格式化输出，不替代 long-read 的深度分析
-4. **抓取方式由链接类型决定** — 微信公众号评分只调用 `prepare_scoring_run.py`，正文由 `wx_fast.py` 纯 HTTP 抓取。若标题状态为 `needs_title`，或只有非中文原题，则允许用 EGO Lite 只读取页面标题、H1、Open Graph 标题和 `hreflang` 中文 alternate；没有 alternate 时，可检索对应中文译文页，但必须核对该页明确链接回同一原文 URL。EGO 不能替代正文抓取。即刻用 curl + `__NEXT_DATA__`，通用网页用 `read` skill。抓取方式不同，但抓取后的内容走同一套质量判断
+1. **bot 身份发送** — 所有卡片用 `--as bot`，不用 user 身份
+2. **内容质量决定分析深度** — 链接类型只影响抓取方式，不影响分析深度；已知专项文体（阮一峰周刊等固定栏目）跳过评分直接专项解析（见 [0.5]）
+3. **卡片是展示层，不是分析层** — 不替代 long-read 的深度分析
+4. **抓取方式由链接类型决定** — 公众号只调 `prepare_scoring_run.py`，正文由 `wx_fast.py` 纯 HTTP 抓取；即刻 curl + `__NEXT_DATA__`；通用网页 `read` skill；抓取后走同一套质量判断
 
 ---
 
@@ -77,7 +78,7 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
   │    └─ 未命中 -> 正常走 [1] 评分
   │
   ├─ [1] 调 content-scoring 评分（统一标准，不分来源）
-  │    ├─ needs_relevance -> 内部补相关性，不发卡、不分派
+  │    ├─ needs_relevance ->（补算默认暂停）--relevance-unavailable 回质量分路由
   │    ├─ needs_full_text|needs_review -> 无数字状态卡
   │    ├─ 完整原文 -> 持久双上下文包工作流（与评分路由解耦，不提交 ChatGPT）
   │    ├─ 用户明确选择自动产物 -> 持久自动工作流（仅选择的交付目标）
@@ -92,75 +93,35 @@ bridge 合并送达多条消息时（`user_input` 多段标注、`quoted_message
 
 非微信来源才先执行一次 `mktemp -d /tmp/readx-score.XXXXXX`，抓取后调用 `prepare_anchor_view.py --blind-only --article-source <source.md> --blind-output <blind-source.md>`，再运行 `python3 /Users/yuwei/code/read-x/scripts/fetch_base_config.py --output <run_dir>/base-config.json`。本次所有产物写入该目录；禁止固定共享路径或写入仓库。Base 读取失败时继续使用本地策略，并保留失败原因。
 
+非微信来源（即刻 / 其他 URL）的准备细节与抓取命令见 [references/fetch-non-wechat.md](references/fetch-non-wechat.md)；其他 URL → `read` skill。
+
 | 链接类型 | 抓取方式 |
 |---------|---------|
 | `mp.weixin.qq.com` | `prepare_scoring_run.py`（正文由 `wx_fast.py` 纯 HTTP 单次抓取；必要时 EGO Lite 仅补标题元数据） |
 | `m.okjike.com` | curl 模拟移动端 → 提取 `__NEXT_DATA__` JSON → 解析 `props.pageProps.post` |
 | 其他 URL | `read` skill |
 
-即刻抓取命令：
-```bash
-curl -s -L -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)" \
-  "<url>" | python3 -c "
-import sys, json, re
-html = sys.stdin.read()
-m = re.search(r'<script id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>', html, re.DOTALL)
-if m:
-    d = json.loads(m.group(1))
-    post = d['props']['pageProps']['post']
-    print(json.dumps({'content':post.get('content',''),'author':post.get('author',''),'time':post.get('createdAt',''),'title':post.get('title',''),'likeCount':post.get('likeCount',0)}, ensure_ascii=False))
-else:
-    print('{"error":"NEXT_DATA not found"}')
-"
-```
-
 ## [0.5] 专项文体快通道
 
-抓取完成后、调用 content-scoring 之前，先做一次专项文体识别。content-scoring 是为「质量未知、处理方式未知」的内容设计的路由决策器；阮一峰《科技爱好者周刊》这类固定栏目，质量稳定、处理方式已由 `long-read/references/genre-rules.md` 第1节写死（板块化解析、卡片输出、不走深度链路、不生成飞书文档），评分结果不参与任何决策。对已知栏目评分是空转，更会导致它被 `route=card` 挡在 long-read 门外、专项规则永远不触发。
+抓取完成后、调用 content-scoring 之前，先做一次专项文体识别。已知固定栏目跳过评分，直接按专项规则生成卡片——评分是为未知内容设计的路由决策器，对已知栏目评分是空转。完整识别标志、结构标志与命中后的处理见 [references/genre-fast-path.md](references/genre-fast-path.md)。
 
-### 识别标志
+识别标志（标题/作者判定条件，满足任一即命中）：
 
-满足任一即命中阮一峰《科技爱好者周刊》（见 genre-rules.md 第1节）：
+- 阮一峰《科技爱好者周刊》：标题含「科技爱好者周刊」或「阮一峰」，或作者为「阮一峰的网络日志」
+- 李继刚《人生周报》：标题含「人生周报」且作者为「李继刚」
 
-- 标题含「科技爱好者周刊」或「阮一峰」
-- 作者为「阮一峰的网络日志」
-- 正文结构含「科技动态」「文摘」「文章」「工具」「资源」「一句话新闻」等固定小标题
-
-`prepare_scoring_run.py` 输出的 JSON 已含 `title`/`author`，标题和作者两项在评分前即可确定性判断；结构标志需要读 `source.md` 确认。
-
-李继刚《人生周报》同样在快通道识别（见 genre-rules.md 第5节）：标题含「人生周报」且作者为「李继刚」，或标题含「人生周报」且正文含「## 读」「## 说」「## 书」固定小标题。
-
-### 命中后的处理
-
-1. **跳过 content-scoring**：不调 `generate_quality.py`、不调 `content_scoring.py`、不发评分过程消息、不发评分卡。
-2. **直接按 genre-rules 周刊专项生成卡片**：读 `source.md`，按周刊板块解析。USER.md 仅用于筛选层决定保留/去掉哪些板块，正文不逐条贴用户画像标签（见 genre-rules.md 第1节「相关性约束」）。
-3. **卡片输出**：`--as bot`，群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次；不生成飞书文档。
-4. **卡片不显示评分**：专项快通道不发评分卡，卡片 header 用「📖 《周刊标题》(第X期)」，body 直接是板块化解析内容 + 原文链接。
-
-### 命中李继刚《人生周报》后的处理
-
-1. **跳过 content-scoring**：同阮一峰周刊，固定栏目不评分。
-2. **按 genre-rules.md 第5节筛选解析**：读 `source.md`，按用户画像从读/说/书中挑相关句子，按主题分组重组，入选 ≤ 正文 50%，不生成飞书文档。
-3. **卡片输出**：`--as bot`，群聊私聊发 `senderId`，p2p 发 `chatId`，只发一次；header 用「📖 《人生周报vXXX：主题》」，body 分组句子 + 原文链接，不显示评分。
-
-### 未命中
-
-正常走 [1] content-scoring 评分，流程不变。
-
-### 仅评分入口与快通道
-
-`仅评分 <URL>` 对专项文体无效：若用户对阮一峰周刊发「仅评分」，仍走快通道（跳过评分、直接专项卡片），因为该文体没有评分环节可「仅」执行。如确需对周刊评分，用户需明确说明。
+命中即跳评分直接专项卡片：不调 content-scoring、不发评分卡，按 `long-read/references/genre-rules.md` 对应小节专项生成卡片（`--as bot` 私聊发送）。未命中正常走 [1] 评分。`仅评分 <URL>` 对专项文体无效：仍走快通道，因为该文体没有评分环节可「仅」执行。
 
 ## [1] 内容质量判断（统一标准）
 
-抓取后，不论来源，统一调用 `content-scoring` v3.19（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`。不做权威解析、身份包生成或外部搜索；七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入质量评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和逐条正文/manifest 哈希验证通过的 YWContext P1。`coverage.complete=false` 时继续使用有效本仓正文，并按固定提交的实时规则表和 `external_followups[].lookup_hints` 检查与文章相关的外围来源；记录读回版本/哈希和缺口，不把未查范围当成“无兴趣”。仅当路由无效、无任何可用本仓 P1 或远端提交不可验证时，才用 `--relevance-unavailable` 回到质量分。不读取旧 YWNext 文件或其他未授权个人材料。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。
+抓取后，不论来源，统一调用 `content-scoring` v3.19（质量输出仍为 v3.16）。质量阶段只读去身份正文和通用数值语义，并独立输出 `problem_significance`。不做权威解析、身份包生成或外部搜索；七篇锚点及目标分只用于评分后的外部闭卷回归，禁止进入质量评分上下文。脚本应用硬门并按 70% 质量 + 30% 重要性计算决策分。只有脚本返回 `needs_relevance` 后，相关性阶段才在独立上下文中读主张清单和逐条正文/manifest 哈希验证通过的 YWContext P1。`coverage.complete=false` 时继续使用有效本仓正文，并按固定提交的实时规则表和 `external_followups[].lookup_hints` 检查与文章相关的外围来源；记录读回版本/哈希和缺口，不把未查范围当成“无兴趣”。仅当路由无效、无任何可用本仓 P1 或远端提交不可验证时，才用 `--relevance-unavailable` 回到质量分。不读取旧 YWNext 文件或其他未授权个人材料。`scripts/content_scoring.py` 统一计算最终路由和深度。质量结果传给 long-read，long-read 不得重评。（2026-11-23 起：相关性补算默认暂停，统一 `--relevance-unavailable`，见第 4 步。）
 
 ### 调用 content-scoring
 
 1. 判断正文是否完整；片段或未知正文输出 `source_status=partial|unknown`，不得补造维度。抓取完成后的下一次模型响应直接执行第 2 步的闭卷质量命令，不发送评分过程消息。
 2. 同时运行 `python3 /Users/yuwei/code/read-x/scripts/generate_quality.py <blind_source_parts...> --output <run_dir>/quality-output.json`。它通过当前 Codex 模型完成一次闭卷评分，传输失败时在同一个总超时内对同一模型重试。不切换模型、不传推理覆盖；输入只有匿名正文与质量契约。主 Agent 禁止读取匿名正文和质量契约。每次尝试都必须通过同一 Schema 和脚本校验；全部尝试失败、超时或未生成文件时才失败关闭，禁止回退主上下文或启动子 Agent。
 3. 质量命令成功后，直接运行 `python3 scripts/content_scoring.py <quality_output.json> <source.md> --output <run_dir>/scoring-result.json`，拿 `scoring_result v3.19`。`base_config.json` 存在时必须在 `source.md` 后追加 `--config-from-base <base_config.json>`；不存在时省略并接受 `policy_source=local`。
-4. 若 `score_status=needs_relevance`，从 `/Users/yuwei/code/yw-context/scripts/context-route.mjs` 获取 P1 JSON，参数固定为 `--mode full --latest --consumer read-x.content-scoring`，输出存入本轮 `run_dir`。逐条核验本仓正文与 manifest 哈希；`coverage.complete=false` 时仍继续使用有效本仓 P1。生成绑定相同 commit/manifest 的 `external-followups.json`；哈希自洽只证明文件一致，最终评分还要复核权威源端。当前只有 `yw-context-rule-table` 可标 `verified`：内容必须是完整实时机读快照，revision 与真实 Base 读回一致；其他来源没有权威验证器时记录 `unavailable`，保留为未知，继续使用本仓 P1。`generate_relevance.py` 与最终 `content_scoring.py` 必须使用同一份收据文件；评分器会重读规则表（不可用时校验固定提交完整快照），复核来源版本、引用、正文和路由，并比对全部来源 ID。第二次运行必须复用同一个 `base_config.json` 并再次传 `--config-from-base`，同时传 `--relevance-output`、`--context` 和 `--external-context`。只有路由无效、没有可用本仓正文、远端不可验证、外部收据无效或相关性输出无效时才用 `--relevance-unavailable`；未验证来源会随评分结果保留为缺口，不读取任何旧 YWNext 文件。
+4. **相关性补算默认暂停（2026-11-23 用户裁决）**：不读取 P1、不运行 `generate_relevance.py`。首次 `content_scoring.py` 调用统一追加 `--relevance-unavailable`：路由与深度照常由质量分+重要性决定，相关性/兴趣显示「未计算（不影响本次路由）」，`score_status` 直接为 `scored`（正常流程不再出现 `needs_relevance` 分支）。用户明确要求补算相关性时，才按 [references/relevance-stage-paused.md](references/relevance-stage-paused.md) 的原协议执行并去掉该旗标重跑；恢复默认须更新本裁决。
 5. `needs_relevance` 不得发卡、不得传 long-read。只对 `scored`、`needs_full_text`、`needs_review` 生成用户卡片；`scored` 只据 `route` 分派。
 
 第 3 步不是“先评分、下轮再发卡”。质量 JSON 之后必须在同一次 `exec_command` 内按下列固定尾部执行；只替换路径、卡片元数据和发送目标，不改分支：
@@ -170,7 +131,7 @@ score_config_args=()
 if [ -f "<base_config.json>" ]; then
   score_config_args=(--config-from-base "<base_config.json>")
 fi
-python3 scripts/content_scoring.py <quality_output.json> <source.md> "${score_config_args[@]}" --output <scoring-result.json>
+python3 scripts/content_scoring.py <quality_output.json> <source.md> "${score_config_args[@]}" --relevance-unavailable --output <scoring-result.json>
 score_status_value=$(jq -r '.score_status' <scoring-result.json>)
 if [ "$score_status_value" = needs_relevance ]; then
   cat <scoring-result.json>
@@ -211,15 +172,8 @@ fi
 - `route=long_read`：评分卡作为进度卡，告知"正在精读，稍后发文档"，long-read 完成后再发交付卡。
 - `score_only=true`：不论脚本 `route`，评分卡都是最终卡，显示“本次仅评分，不进入精读”后结束。
 
-正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值和大问题思考分。不得展示私有上下文原文。示例：
+正式评分卡显示质量分、相关性（`< quality_floor` 显示“未计算（不影响本次路由）”，`≥ quality_floor` 不可用显示“不可用”，否则显示真实相关性分）、兴趣（同相关性规则）、决策分、质量档位、三维数值和大问题思考分。不得展示私有上下文原文。示例见 [references/score-card-example.md](references/score-card-example.md)。
 
-```json
-{
-  "schema": "2.0",
-  "header": {"title": {"tag": "plain_text", "content": "评分完成"}, "template": "indigo"},
-  "body": {"elements": [{"tag": "markdown", "content": "《标题》\n\n**质量 {quality_score}/10 · {quality_label}**\n**重要性 {importance_score}** · 大问题思考 {problem_significance_score} · 相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维质量**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n正在精读，稍后发文档。"}]}
-}
-```
 
 ### 分派
 
@@ -252,16 +206,7 @@ fi
 
 **执行**：抓取 -> 按「速读卡结构」提炼 -> 卡片输出（私聊发，群聊发 `senderId`，p2p 发 `chatId`，不生成飞书文档）。
 
-速读不是简略，是高密度的全文浓缩：让读者在手机上不点原文，也能吸收这篇 7 分文章的真正价值。速读卡结构（自上而下）：
-
-1. **一句话定位**：这篇文章在回答什么问题 / 核心张力。让读者先抓住「它到底在讲什么」。
-2. **核心观点 3-5 条**：每条观点不是标签式罗列，而是带一句论证或原文支撑，保留文章自身的推理逻辑。宁可少而准，不要空泛堆砌。
-3. **值得记住的细节/例子 1-2 个**：具体的案例、数据、画面，让观点落地、有记忆点。
-4. **可迁移启发 1 句**（有才写，不强凑）：这对我/我们能借鉴什么。
-5. **金句**（必选，见下方金句规则）：保留原文值得划线的表达。
-6. **阅读原文链接**。
-
-速读卡字数控制在 200-400 字（评分块不计入），信息密度优先；不要因为它「不需要精读」就只给三五行。若文章确实只有 1 个值得记的观点，就只写 1 个，不为了凑数拉长。
+速读不是简略，是高密度的全文浓缩：让读者在手机上不点原文，也能吸收这篇 7 分文章的真正价值。速读卡结构（一句话定位 → 核心观点带论证 → 值得记住的细节 → 可迁移启发 → 金句 → 原文链接）与 200-400 字细则见 [references/card-templates.md](references/card-templates.md)「速读卡结构」。
 
 ### 其他 scored card -> 一句话卡片
 
@@ -278,103 +223,9 @@ fi
 
 ## [2] 卡片模板
 
-所有卡片使用 CardKit 2.0 schema（`schema: "2.0"`），header 用 `indigo` 模板。
+所有卡片使用 CardKit 2.0 schema（`schema: "2.0"`），header 用 `indigo` 模板。完整 JSON 模板与高质量 long-read 状态卡规则见 [references/card-templates.md](references/card-templates.md)。
 
-### 高质量内容卡片（long-read 状态通知）
-
-long-read 的状态卡和全部文档/图片交付通知由持久工作流独占。入口只传递或展示工作流的已确认状态，不自行重新生成文档卡、图片或索引记录。
-
-主文档可先交付，但通知必须说明“主文档已交付，整体处理中”。只有工作流确认所有必跑分支、主文档、每张必需图片的插入与私聊发送后，才可显示最终成功。失败、缺失或待核实状态必须保留具体阶段，不得使用“精读完成”标题。
-
-芒格洞察成功时由工作流拼入主文档并在最终卡注明；失败时主文档仍可交付，但任务不得提前判成功。核心内容图每篇必需；芒格分支成功时芒格图也必需。图片失败不会取消剩余可用交付，但整体不能标记成功。
-
-卡片使用 CardKit 2.0 和真实换行，由工作流渲染、发送并读回；入口不得手工拼 JSON、重复发送或从分析完成推断交付成功。
-
-> ⚠️ `ljg_card` 仅是评分留档字段，不是图片或额外通知的触发条件。
-
-> ⚠️ **三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完（`relevance_score`/`interest_score` 为 `null`/「待计算」/「不可用」）时，不得提交 long-read 工作流或发送文档交付卡。先补算两轴，三档齐全后才继续。
-
-long-read 的 Card 2.0 内容由持久 Worker 根据进度、最终状态和已确认产物生成。此处不提供可复用的成功卡模板，避免入口误发“精读完成”。
-
-### 中等质量内容卡片
-
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "title": {"tag": "plain_text", "content": "标题（截断到 40 字）"},
-    "template": "indigo"
-  },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n---\n\n核心要点（1-3 条）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2"
-      }
-    ]
-  }
-}
-```
-
-### 快速阅读卡（quality_label=快速阅读）
-
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "title": {"tag": "plain_text", "content": "文章标题"},
-    "template": "indigo"
-  },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "**作者/来源** · 平台 · 时间\n\n---\n\n**一句话定位**：这篇文章在回答什么问题 / 核心张力\n\n**核心观点**\n1. 观点 + 一句论证\n2. 观点 + 一句论证\n3. 观点 + 一句论证\n\n**值得记住**\n- 具体例子/案例/数据 1\n- 具体例子/案例/数据 2\n\n**可迁移**：这对我/我们能借鉴什么（有才写）\n\n---\n\n💬 金句\n> 原文金句 1\n> 原文金句 2\n\n[阅读原文](链接)"
-      }
-    ]
-  }
-}
-```
-
-### 低质量内容卡片
-
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "title": {"tag": "plain_text", "content": "标题（截断到 40 字）"},
-    "template": "indigo"
-  },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "**来源**\n\n**质量 {quality_score}/10 · {quality_label}**\n相关性 {relevance_score 或 不可用} · 兴趣 {interest_score 或 不可用} · 决策 {decision_score}/10\n**三维**\n证据与论证 {quality_dimensions.evidence_quality.score} · 洞察解释 {quality_dimensions.insight_explanatory.score} · 长期迁移 {quality_dimensions.transfer_durability.score}\n{scoring_result.conclusion}\n\n---\n\n一句话摘要\n\n[查看原文](链接)"
-      }
-    ]
-  }
-}
-```
-
-### 抓取失败卡片
-
-```json
-{
-  "schema": "2.0",
-  "header": {
-    "title": {"tag": "plain_text", "content": "抓取失败"},
-    "template": "indigo"
-  },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "无法抓取内容\n\n原因：超时/反爬/404\n\n[查看原文](链接)"
-      }
-    ]
-  }
-}
-```
+路由 → 模板对照：`route=long_read` 的状态/交付通知由持久工作流独占渲染，入口不手工拼 JSON；`route=card` 中等质量 → 中等质量内容卡片；`quality_label=快速阅读` → 快速阅读卡；其他 scored → 低质量内容卡片（一句话）；抓取失败 → 抓取失败卡片。
 
 ---
 
@@ -448,7 +299,8 @@ lark-cli im +messages-send \
    - **格式**：卡片中以 `> 原文金句` 引用块呈现，每条金句不超过 60 字
    - **英文翻译（硬）**：原文为英文时，金句以中文译文呈现并遵守信达雅（忠实原意、通顺自然、文采得体），译文后附英文原句作溯源，格式 `> 中文译文（原文：English original）`；英文附注不计入 60 字限制。禁止只贴英文不译。
    - **低质量例外**：若原文确无值得划线的内容，不强行添加；但不能因为「懒」而跳过
-10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值；不展示权威性。`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。long-read 后续通知只由 Worker 依据持久状态生成，不重复评分。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得进入 long-read 工作流，先补算两轴再接管。
+10. **评分与重要性展示**：正式评分只在评分卡出现一次，展示质量、大问题思考、相关性、兴趣状态或分数、决策分和三维质量数值；不展示权威性。`needs_relevance` 不得展示；`needs_full_text`、`needs_review` 不显示数字。long-read 后续通知只由 Worker 依据持久状态生成，不重复评分。**三档齐全门**：`quality_score ≥ quality_floor`（6.0）的文章，相关性、兴趣两轴未算完不得进入 long-read 工作流，先补算两轴再接管。（2026-11-23 用户裁决：相关性补算默认暂停期间，`--relevance-unavailable` 产出的「未计算（不影响本次路由）」状态视作两轴暂缺的合规态，long-read 工作流照常接管与交付；恢复补算后本门恢复原语义。）
+
 
 ---
 
@@ -461,39 +313,3 @@ lark-cli im +messages-send \
 | 超长文章（>10000 字） | 仍走同一评分；长度不替代质量 |
 | 特殊字符/emoji | 正常保留，JSON 正确转义 |
 | 群内多发链接 | 每条链接独立处理，各自私聊发一张卡片 |
-
----
-
-## 与 long-read 的关系
-
-| 维度 | long-read | link-card |
-|------|-----------|-----------|
-| 职责 | 持久任务、隔离解码、程序装配、文档/图片交付与核验 | 抓取、评分路由、评分卡和中低质量卡片 |
-| 触发条件 | 由 link-card 的内容质量判断决定 | 所有链接的入口和出口 |
-| 关系 | 被 link-card 调度 | 调度 long-read（高质量内容）+ 自处理（中低质量） |
-
-**link-card 是入口，long-read 是持久交付工作流**：link-card 负责抓取、质量判断和评分卡；高质量任务只有在 long-read 返回持久接管后才移交。Worker 独占精读文档、图片、进度与最终状态通知。中低质量内容仍由 link-card 自己处理。
-
----
-
-## 自测清单
-
-每次修改 SKILL.md 后，用以下用例自测：
-
-- [ ] 阮一峰《科技爱好者周刊》-> [0.5] 快通道命中，跳过评分，直接周刊专项卡片（不评分、不发评分卡、不生成飞书文档）
-- [ ] 即刻深度长文（≥800字，有论点）→ 正确识别为高质量 → 走 long-read
-- [ ] 即刻短文（<300字，无观点）→ 正确识别为低质量 → 一句话卡片
-- [ ] 微信公众号长文 → 正确识别为高质量 → 走 long-read
-- [ ] 微信公众号水文 → 正确识别为低质量 → 一句话卡片
-- [ ] 通用网页（有深度）→ 正确识别为高质量 → 走 long-read
-- [ ] 抓取失败 → 卡片显示失败信息
-- [ ] 特殊字符（双引号、换行、emoji）→ JSON 正确转义
-- [ ] 标题超 40 字 → 正确截断
-- [ ] 所有卡片 `--as bot`，不出现 user 身份
-- [ ] 评分卡已发（所有路由必发，非 scored 状态没有伪数字）
-- [ ] `route=long_read` 时同轮评分结果、评分凭据和触发上下文传给持久工作流；只有返回 `accepted` 才显示已接管
-- [ ] long-read 接管后不由入口重复发最终卡、图片或索引记录；成功状态只来自唯一完成门
-- [ ] `ljg_card` 不额外触发图片，未知交付结果不盲目重发
-- [ ] 本 Skill 发送的评分卡和 route=card 结果按触发上下文选择目标；long-read 私聊交付由 Worker 核验目标并执行
-- [ ] p2p 场景：`chatId` 只发一次，未同时用 `--user-id` 重复发送
-- [ ] senderType=bot（bot-at-bot）：回退发原群

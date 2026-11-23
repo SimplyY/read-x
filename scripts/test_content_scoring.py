@@ -435,9 +435,12 @@ def test_base_snapshot_cli_contract_is_documented_for_all_sources():
     link_card = (root / ".agents/skills/link-card/SKILL.md").read_text(encoding="utf-8")
     rules = (root / "AGENTS.md").read_text(encoding="utf-8")
     schema = (root / ".agents/skills/content-scoring/references/schema.md").read_text(encoding="utf-8")
+    paused_ref = (root / ".agents/skills/link-card/references/relevance-stage-paused.md").read_text(encoding="utf-8")
+    assert "相关性补算默认暂停" in link_card
+    assert "--relevance-unavailable" in link_card
     assert "scripts/fetch_base_config.py" in link_card
     assert "--config-from-base" in link_card
-    assert "第二次运行必须复用同一个 `base_config.json`" in link_card
+    assert "第二次运行必须复用同一个 `base_config.json`" in paused_ref
     assert "运行级 Base 配置快照" in rules
     assert '"policy_source": "base|local"' in schema
     assert "--config-from-base <run_dir>/base-config.json" in schema

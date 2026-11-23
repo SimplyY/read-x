@@ -3,9 +3,17 @@ set -eu
 
 skill=.agents/skills/long-read/SKILL.md
 link_card=.agents/skills/link-card/SKILL.md
+periodic_reports=.agents/skills/long-read/references/periodic-reports.md
 
 require() {
   grep -Fq -- "$1" "$skill" || {
+    echo "missing long-read contract rule: $1" >&2
+    exit 1
+  }
+}
+
+require_any() {
+  grep -Fq -- "$1" "$skill" || grep -Fq -- "$1" "$periodic_reports" || {
     echo "missing long-read contract rule: $1" >&2
     exit 1
   }
@@ -36,18 +44,18 @@ require '最多两轮额外恢复'
 require '至少 240 秒'
 require '周报每周日 09:00'
 require '月报每月 1 日 09:00'
-require 'configure-report-target'
-require '首次写入后不可静默更改'
-require '只使用已保存目标'
-require '每次报告投递前'
-require '精确会话成员'
-require 'F/N > 10%'
-require 'Markdown 附件'
-require 'Card 2.0'
-require 'status --report-key'
-require '终态任务的输入快照与分析/图片产物保留 30 天'
-require '逐任务统计与已完成报告快照保留 180 天'
-require '未解决任务及其产物、未完成的报告投递保留至处理'
+require_any 'configure-report-target'
+require_any '首次写入后不可静默更改'
+require_any '只使用已保存目标'
+require_any '每次报告投递前'
+require_any '精确会话成员'
+require_any 'F/N > 10%'
+require_any 'Markdown 附件'
+require_any 'Card 2.0'
+require_any 'status --report-key'
+require_any '终态任务的输入快照与分析/图片产物保留 30 天'
+require_any '逐任务统计与已完成报告快照保留 180 天'
+require_any '未解决任务及其产物、未完成的报告投递保留至处理'
 require '值得研究的相关问题'
 require '正文第一个主章节必须是 `<h1>评分</h1>`'
 require '独立的问题列表'

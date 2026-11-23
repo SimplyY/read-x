@@ -42,7 +42,7 @@ link-card 流程：
 - **`route=long_read`** -> 默认双上下文包 + 深读卡片路由；不启动完整精读文档链
 - **`route=card`** -> 按 `quality_label` 生成轻量精读或一句话卡片；快速阅读必须通过 `--quick-read` 提供速读内容，缺失或为空时失败关闭
 
-**三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。
+**三档齐全门（硬性）**：`quality_score ≥ quality_floor`（6.0）的文章，进交付前必须 `relevance_score` 与 `interest_score` 都是实数；任一为 `null`/「待计算」/「不可用」时，禁止发精读完成卡或文档交付卡，先按 content-scoring 相关性隔离阶段补算两轴，三档算完才一起发卡，禁止只带质量分单发。（2026-11-23 用户裁决：相关性补算默认暂停期间，`--relevance-unavailable` 产出的「未计算（不影响本次路由）」状态视作两轴暂缺的合规态，精读接管与交付照常；恢复补算后本门恢复原语义。原协议见 link-card/references/relevance-stage-paused.md。）
 
 **评分卡凭据门（硬性）**：评分卡必须由 `send_score_card.py` 发送并生成 `<run_dir>/score-gate.json`；long-read 交付卡必须传该凭据和本轮 `scoring-result.json` 给渲染器，hash 不匹配或校验失败即失败关闭，不得手工造凭据。
 
