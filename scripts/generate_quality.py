@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import socket
@@ -12,11 +13,13 @@ from pathlib import Path
 
 import content_scoring as scoring
 import codex_model
+import quality_cache
 from codex_model import MODEL
 
 
 MODEL_CANDIDATES = (MODEL,)
 RUNTIME = Path(__file__).parents[1] / ".agents/skills/content-scoring/references/quality-runtime.md"
+GENERATOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 CLAIM_TYPE = {"evidence_quality": "empirical", "insight_explanatory": "causal", "transfer_durability": "method", "problem_significance": "normative"}
 
 
@@ -69,7 +72,7 @@ def dimension_schema(key: str) -> dict:
         "type": "object",
         "properties": {
             "level": {"type": "number", "enum": sorted(float(value) for value in scoring.DIMENSION_SCORES)},
-            "unit_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 5, "uniqueItems": True},
+            "unit_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 5},
             "disqualifiers": {"type": "array", "items": {"type": "string", "enum": allowed} if allowed else {"type": "string"}, "maxItems": len(allowed)},
         },
         "required": ["level", "unit_ids", "disqualifiers"], "additionalProperties": False,
@@ -91,7 +94,7 @@ def quality_run_schema(short_text: bool = False) -> dict:
             "problem_significance": {
                 "type": "object", "properties": {
                     "level": {"type": "number", "enum": sorted(float(value) for value in scoring.DIMENSION_SCORES)},
-                    "unit_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 5, "uniqueItems": True},
+                    "unit_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 5},
                 }, "required": ["level", "unit_ids"], "additionalProperties": False,
             },
         },
@@ -214,18 +217,53 @@ def generate(parts: list[Path], timeout: float) -> dict:
     }
 
 
+def _cache_lookup(parts: list[Path]) -> tuple[str | None, str | None]:
+    """Return (cache_key, cached_output); (None, None) on any cache failure."""
+    try:
+        source = "".join(path.read_text(encoding="utf-8") for path in parts)
+        runtime_md = RUNTIME.read_text(encoding="utf-8")
+        key = quality_cache.cache_key(source, runtime_md, GENERATOR_SHA256)
+        return key, quality_cache.get(key)
+    except Exception as exc:
+        print(json.dumps({"event": "quality_cache_error", "stage": "lookup", "error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
+        return None, None
+
+
+def _cache_store(key: str | None, parts: list[Path], text: str) -> None:
+    try:
+        if key is None:
+            source = "".join(path.read_text(encoding="utf-8") for path in parts)
+            runtime_md = RUNTIME.read_text(encoding="utf-8")
+            key = quality_cache.cache_key(source, runtime_md, GENERATOR_SHA256)
+        quality_cache.put(key, text)
+    except Exception as exc:
+        print(json.dumps({"event": "quality_cache_error", "stage": "store", "error": str(exc)[:200]}, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("parts", nargs="+", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--no-cache", action="store_true", help="skip the quality output cache for this run")
     # DeepSeek generation can take about a minute on a long article; keep the
     # whole deadline available to the current attempt and retry fast failures.
     parser.add_argument("--timeout", type=float, default=240)
     args = parser.parse_args()
-    run_dir = validated_parts(args.parts)[0].parent
+    parts = validated_parts(args.parts)
+    run_dir = parts[0].parent
     if args.output.resolve().parent != run_dir:
         parser.error("--output must be in the same scoring run directory as blind-source")
-    args.output.write_text(json.dumps(generate(args.parts, args.timeout), ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    key, cached = (None, None)
+    if not args.no_cache:
+        key, cached = _cache_lookup(parts)
+    if cached is not None:
+        args.output.write_text(cached, encoding="utf-8")
+        print(json.dumps({"event": "quality_cache_hit", "key": key[:12]}, ensure_ascii=False, separators=(",", ":")), flush=True)
+        return 0
+    text = json.dumps(generate(parts, args.timeout), ensure_ascii=False, separators=(",", ":"))
+    args.output.write_text(text, encoding="utf-8")
+    if not args.no_cache:
+        _cache_store(key, parts, text)
     return 0
 
 

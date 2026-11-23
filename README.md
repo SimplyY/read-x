@@ -39,7 +39,7 @@ bunx skills add lijigang/ljg-skills -g -a codex \
 ## 核心功能
 
 - **链接抓取**：微信公众号（`wx_fast.py` 纯 HTTP）、即刻、通用网页、飞书文档、纯文本
-- **内容质量评分**：`content-scoring` 评分结果 v3.18（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由当前 Codex 模型一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和程序固定的 `tvly` 真实搜索（最多 3 查询/4 页面，`query_count=0` 永远不会显示为已核验）生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；相关性和兴趣也在隔离上下文中由当前 Codex 模型计算；脚本按 `70%质量 + 30%重要性` 合成决策分
+- **内容质量评分**：`content-scoring` 评分结果 v3.19（质量输出仍为 v3.16）先删除标题、作者、日期、URL 与抓取器噪声，再由当前 Codex 模型一次完成证据、洞察、迁移三维质量与独立的大问题思考分；独立 authority resolver 用公开身份包和程序固定的 `tvly` 真实搜索（最多 3 查询/4 页面，`query_count=0` 永远不会显示为已核验）生成实体—专业性—主题匹配证据，权威性缺失时由大问题分承接完整 30% 重要性权重；脚本按 `70%质量 + 30%重要性` 合成决策分。2026-11-23 用户裁决后，相关性补算默认暂停，上游统一传 `--relevance-unavailable`；恢复默认须更新裁决
 - **运行时配置**：每次评分读取「ReadX 精读」多维表格的运行级快照；路由门槛组可配置芒格后处理门槛（兼容字段 `ChatGPT 芒格门槛`），缺失时回退 8.3；读取失败时回退本地策略，并在 `scoring_result.policy_source` 标明来源
 - **仅评分**：发送 `仅评分 <URL>` 仍执行真实评分与路由计算，但评分卡后不进入精读
 - **分层处理**：确定性脚本输出卡片 / 轻量精读 / 深度精读路由
@@ -114,6 +114,8 @@ content-scoring（quality -> 条件 relevance -> decision）
 | 脚本 | 作用 |
 |------|------|
 | `scripts/content_scoring.py` | content-scoring 评分计算 |
+| `scripts/quality_cache.py` | 评分产出的私有内容缓存，按源文、运行契约和生成器哈希生成键 |
+| `scripts/codex_usage_report.py` | 汇总 Codex 会话与 Turn 用量，供 Token 优化决策读取 |
 | `scripts/verify_source_authority.py` | 原始出处只读核验与权威性证据产物 |
 | `scripts/build_authority_identity.py` | 从公开文章元数据生成 identity_packet v1，供独立搜索桥使用 |
 | `scripts/fetch_base_config.py` | 读取并校验精读配置 Base，生成运行级 JSON 快照 |
@@ -121,6 +123,9 @@ content-scoring（quality -> 条件 relevance -> decision）
 | `scripts/apply_article_title.py` | 将浏览器核实的中文标题补写到隔离评分 Run |
 | `scripts/repair_reading_titles.py` | 只读历史核对后修复 Base 中 bot 创建的 URL 占位标题 |
 | `scripts/test_content_scoring.py` | 评分单元、对抗与 CLI 端到端测试 |
+| `scripts/test_quality_cache.py` | 质量缓存键、读写、损坏和不可写路径测试 |
+| `scripts/test_codex_model_usage.py` | 模型调用日志中的 token 指标测试 |
+| `scripts/test_codex_usage_report.py` | 用量报告聚合与边界测试 |
 | `scripts/prepare_anchor_view.py` | 生成外部校准审计视图；生产评分不读取 |
 | `scripts/validate_long_read_skill.sh` | long-read Skill 校验 |
 | `.agents/skills/long-read/scripts/long_read_workflow_cli.py` | 持久接管、Worker 推进、任务/报告只读状态、恢复、人工处置/修复证据记录与可靠性报告 CLI |
